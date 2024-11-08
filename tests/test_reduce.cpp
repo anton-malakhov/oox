@@ -7,21 +7,24 @@
 
 using namespace Reduce;
 
-TEST(Reduce, Works) {
-    {
-        auto serial = Serial::reduce(0, 100, 0, std::plus<int>{});
-        auto oox_recursive = OOX_recursive::reduce(0, 100, 0, std::plus<int>{});
-        ASSERT_EQ(serial, oox_recursive.get());
-    }
+TEST(Reduce, Ints) {
+    auto serial = Serial::reduce(0, 128, 0, std::plus<int>{});
+    auto oox_serial = OOX_serial::reduce(0, 128, 0, std::plus<int>{});
+    auto oox_parallel = OOX_parallel::reduce(0, 128, 0, std::plus<int>{}, std::plus<int>{}); 
+    ASSERT_EQ(serial, oox_serial.get());
+    ASSERT_EQ(serial, oox_parallel.get());
+}
 
-    {
-        auto v = std::vector{1, 2, 3};
-        auto plus = [](int val, decltype(v)::iterator it) -> int { return val + *it; };
+TEST(Reduce, Iterators) {
+    auto v = std::vector<int>();
+    for (int i = 0; i < 128; ++i) { v.push_back(i); }
+    auto plus = [](int val, decltype(v)::iterator it) -> int { return val + *it; };
 
-        auto serial = Serial::reduce(v.begin(), v.end(), 0, plus);
-        auto oox_recursive = OOX_recursive::reduce(v.begin(), v.end(), 0, plus);
-        ASSERT_EQ(serial, oox_recursive.get());
-    }
+    auto serial = Serial::reduce(v.begin(), v.end(), 0, plus);
+    auto oox_serial = OOX_serial::reduce(v.begin(), v.end(), 0, plus);
+    auto oox_parallel = OOX_parallel::reduce(v.begin(), v.end(), 0, plus, std::plus<int>{});
+    ASSERT_EQ(serial, oox_serial.get());
+    ASSERT_EQ(serial, oox_parallel.get());
 }
 
 int main(int argc, char** argv) {
