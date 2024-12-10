@@ -63,3 +63,48 @@ oox::var<Value> reduce(Iter start, Iter end, Value identity, Op op, Join join) {
 }
 
 } // namespace Reduce::OOX_parallel
+
+namespace Reduce::OOX_parallel_n {
+
+template <typename T>
+oox::var<std::vector<T>> wait_all(const std::vector<oox::var<T>>& vars) {
+    oox::var<std::vector<T>> res = std::vector<T>(vars.size());
+
+    for (size_t i = 0; i < vars.size(); ++i) {
+        res = oox::run([i](std::vector<T>&& r, const T& cur) {
+            r[i] = cur;
+            return r;
+        },
+        std::move(res), vars[i]);
+    }
+
+    return res;
+}
+
+template <size_t N, typename Iter, typename Value, typename Op, typename Join>
+oox::var<Value> reduce(Iter start, Iter end, Value identity, Op op, Join join) {
+    if (end - start < 10) {
+        return Reduce::Serial::reduce(start, end, identity, std::move(op));
+    } 
+    
+    auto chunk_sz = (end - start) / N;
+
+    std::vector<oox::var<Value>> v;
+    for (size_t i = 0; i < N; ++i) {
+        v.push_back(reduce<N>(start + i * chunk_sz, start + (i + 1) * chunk_sz, identity, op, join));
+    }
+
+    return oox::run(
+        [identity=std::move(identity), join = std::move(join)](std::vector<Value> vec) {
+            auto res = identity;
+            for (const auto& x : vec) {
+                res = join(res, x);
+            }
+            return res;
+        },
+        wait_all(v)
+    );
+
+}
+
+} // namespace Reduce::OOX_parallel_n

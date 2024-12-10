@@ -11,8 +11,10 @@ TEST(Reduce, Ints) {
     auto serial = Serial::reduce(0, 128, 0, std::plus<int>{});
     auto oox_serial = OOX_serial::reduce(0, 128, 0, std::plus<int>{});
     auto oox_parallel = OOX_parallel::reduce(0, 128, 0, std::plus<int>{}, std::plus<int>{}); 
+    auto oox_parallel_n = OOX_parallel_n::reduce<2>(0, 128, 0, std::plus<int>{}, std::plus<int>{});
     ASSERT_EQ(serial, oox_serial.get());
     ASSERT_EQ(serial, oox_parallel.get());
+    ASSERT_EQ(serial, oox_parallel_n.get());
 }
 
 TEST(Reduce, Iterators) {
@@ -23,6 +25,7 @@ TEST(Reduce, Iterators) {
     auto serial = Serial::reduce(v.begin(), v.end(), 0, plus);
     auto oox_serial = OOX_serial::reduce(v.begin(), v.end(), 0, plus);
     auto oox_parallel = OOX_parallel::reduce(v.begin(), v.end(), 0, plus, std::plus<int>{});
+    auto oox_parallel_n = OOX_parallel_n::reduce<2>(v.begin(), v.end(), 0, plus, std::plus<int>{});
     ASSERT_EQ(serial, oox_serial.get());
     ASSERT_EQ(serial, oox_parallel.get());
 }
