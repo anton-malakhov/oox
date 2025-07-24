@@ -103,6 +103,77 @@ TEST(OOX, Wavefront) {
     ASSERT_EQ(lcs0, lcs1);
 }
 
+int broken_func() {
+    throw std::runtime_error("exception in broken_func");
+    return 0;
+}
+
+TEST(OOX, Exception) {
+    #if OOX_SERIAL_DEBUG
+    ASSERT_THROW(auto exec = oox::run(broken_func), std::runtime_error);
+    #else
+    auto exec = oox::run(broken_func);
+    ASSERT_THROW(oox::wait_and_get(exec), std::runtime_error);
+    #endif
+}
+
+int empty_func() {
+    return 1;
+}
+
+TEST(OOX, Cancellation) {
+    auto exec = oox::run(empty_func);
+    oox::cancel(exec);
+    ASSERT_NO_THROW(oox::wait_and_get(exec));
+}
+
+std::vector<int> g_fib_levels;
+const int cancellation_index = 11;
+
+oox::var<int> Fib_with_exception(int n) {
+    g_fib_levels[n]++;
+    if (n <= cancellation_index) { throw std::runtime_error("detected n is 7"); }
+    if(n < 2) return n;
+    return oox::run(std::plus<int>(), oox::run(Fib_with_exception, n-1), oox::run(Fib_with_exception, n-2) );
+}
+
+TEST(OOX, Fib_Exception) {
+    int n = 28;
+    g_fib_levels.clear();
+    g_fib_levels.resize(n + 1, 0);
+    ASSERT_THROW(oox::wait_and_get(Fib_with_exception(n)), std::runtime_error);
+    for(int index = 0; index < cancellation_index - 1; index++){
+        ASSERT_EQ(g_fib_levels[index], 0);
+    }
+    if (cancellation_index == 0) {
+        ASSERT_TRUE(g_fib_levels[cancellation_index]);
+    } else {
+        ASSERT_TRUE(g_fib_levels[cancellation_index] + g_fib_levels[cancellation_index - 1]);
+    }
+}
+
+oox::var<int> Fib_with_cancellation(int n) {
+    g_fib_levels[n]++;
+    if (n <= cancellation_index) { oox::cancel(); }
+    if(n < 2) return n;
+    return oox::run(std::plus<int>(), oox::run(Fib_with_cancellation, n-1), oox::run(Fib_with_cancellation, n-2) );
+}
+
+TEST(OOX, Fib_Cancellation) {
+    int n = 28;
+    g_fib_levels.clear();
+    g_fib_levels.resize(n + 1, 0);
+    ASSERT_NO_THROW(oox::wait_and_get(Fib_with_cancellation(n)));
+    for(int index = 0; index < cancellation_index - 1; index++){
+        ASSERT_EQ(g_fib_levels[index], 0);
+    }
+    if (cancellation_index == 0) {
+        ASSERT_TRUE(g_fib_levels[cancellation_index]);
+    } else {
+        ASSERT_TRUE(g_fib_levels[cancellation_index] + g_fib_levels[cancellation_index - 1]);
+    }
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     for (int i = 1; i < argc; i++) {
