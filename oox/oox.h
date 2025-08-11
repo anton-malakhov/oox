@@ -187,7 +187,7 @@ std::optional<T> wait_optional(const var<T> &ov) {
     return *(ov.my_value); 
 }
 template<typename T>
-void wait(const var<T> &ov) {}
+void wait(const var<T> &ov) { ov.my_ctx->exception_wrapper.rethrow_exception(); }
 
 void wait_for_all(node &) {}
 
