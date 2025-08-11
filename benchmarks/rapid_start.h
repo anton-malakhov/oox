@@ -74,7 +74,6 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
         run_mask.store(0U, std::memory_order_relaxed);
         func_ptr = f;
         epoch.store(e+1, std::memory_order_release);
-        //tbb::atomic_fence();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         mask_t mask_snapshot = start_mask.load(std::memory_order_acquire);
         finish_mask.store(0, std::memory_order_relaxed);
