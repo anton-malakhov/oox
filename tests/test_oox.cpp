@@ -109,12 +109,8 @@ int broken_func() {
 }
 
 TEST(OOX, Exception) {
-    #if OOX_SERIAL_DEBUG
-    ASSERT_THROW(auto exec = oox::run(broken_func), std::runtime_error);
-    #else
     auto exec = oox::run(broken_func);
     ASSERT_THROW(oox::wait_and_get(exec), std::runtime_error);
-    #endif
 }
 
 int empty_func() {
@@ -124,7 +120,7 @@ int empty_func() {
 TEST(OOX, Cancellation) {
     auto exec = oox::run(empty_func);
     oox::cancel(exec);
-    ASSERT_NO_THROW(oox::wait_and_get(exec));
+    ASSERT_THROW(oox::wait_and_get(exec), std::runtime_error);
 }
 
 std::vector<int> g_fib_levels;
@@ -163,7 +159,7 @@ TEST(OOX, Fib_Cancellation) {
     int n = 28;
     g_fib_levels.clear();
     g_fib_levels.resize(n + 1, 0);
-    ASSERT_NO_THROW(oox::wait_and_get(Fib_with_cancellation(n)));
+    ASSERT_THROW(oox::wait_and_get(Fib_with_exception(n)), std::runtime_error);
     for(int index = 0; index < cancellation_index - 1; index++){
         ASSERT_EQ(g_fib_levels[index], 0);
     }
