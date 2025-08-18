@@ -3,6 +3,7 @@
 #include "../oox/oox.h"
 #include <benchmark/benchmark.h>
 #include <vector>
+#include <algorithm>
 
 constexpr int num_threads = 5;
 constexpr int num_parts = 20;
@@ -12,12 +13,11 @@ constexpr int pos_elem = 436587;
 std::vector<int> nums = [] { std::vector<int> tmp(size, 0); tmp[pos_elem] = element; return tmp; }();
 
 int DefaultLinSearchPart(int l_ind, int r_ind, int elem) {
+
     int index = -1;
-    while(l_ind < r_ind) {
-        if (nums[l_ind] == elem) {
-          return l_ind;
-        }
-        l_ind++;
+    auto iter = std::find(nums.begin() + l_ind, nums.begin() + r_ind, elem);
+    if (iter != nums.begin() + r_ind) {
+      index = std::distance(nums.begin(), iter);
     }
     return index;
 }
