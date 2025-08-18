@@ -36,34 +36,35 @@
 
 namespace oox {
 
-struct context;
-
 #if OOX_SERIAL_DEBUG //////////////////// Immediate execution //////////////////////////////////
+
 class node {
     node &operator=(const node &) = delete;
 };
 
+namespace internal {
+
 struct context {
 
-        class exception {
-private:
-    std::exception_ptr exception_ptr;
-public:
-    void store(std::exception_ptr ex) {
-        exception_ptr = ex;
-    }
+    class exception {
+    private:
+        std::exception_ptr exception_ptr;
+    public:
+        void store(std::exception_ptr ex) {
+            exception_ptr = ex;
+        }
 
-    std::exception_ptr load() const {
-        return exception_ptr;
-    }
+        std::exception_ptr load() const {
+            return exception_ptr;
+        }
 
-    void rethrow_exception() const {
-        if (exception_ptr) std::rethrow_exception(exception_ptr);
-    }
-    void reset() {
-        this->store(nullptr);
-    }
-};
+        void rethrow_exception() const {
+            if (exception_ptr) std::rethrow_exception(exception_ptr);
+        }
+        void reset() {
+            this->store(nullptr);
+        }
+    };
 
     exception exception_wrapper;
     bool cancel_status = false;
@@ -77,36 +78,37 @@ public:
 
 static context my_ctx;
 
+} // namespace internal
+
 template<typename T>
 struct var : public node {
     static_assert(std::is_same<T, typename std::decay<T>::type>::value,
                   "Specialize oox::var only by plain types."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
-    context* my_ctx = &(oox::my_ctx);
+    oox::internal::context* my_ctx = &(oox::internal::my_ctx);
     void* storage_value = aligned_alloc(alignof(T), sizeof(T));
-    T* my_value = reinterpret_cast<T*>(storage_value);
     var() {}
     ~var() {
         std::free(storage_value);
     }
     var(const T& t) noexcept { 
-        *my_value = t; 
+        *(T*)storage_value = t; 
     }
     var(T&& t) noexcept { 
-        *my_value = std::move(t); 
+        *(T*)storage_value = std::move(t); 
     }
     var(var<T>&& t) { 
-        *my_value = std::move(*(t.my_value));
+        *(T*)storage_value = std::move(*(T*)t.storage_value);
     }
     var& operator=(var<T>&& t) {
-        *my_value = std::move(*(t.my_value));
+        *(T*)storage_value = std::move(*(T*)t.storage_value);
         return *this; 
     }
     T get() { 
         my_ctx->exception_wrapper.rethrow_exception();
         if (my_ctx->is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
-        return *my_value; 
+        return *(T*)storage_value; 
     }
 };
 
@@ -120,17 +122,17 @@ typename std::decay<T>::type unoox(T&& t) { return typename std::decay<T>::type(
 
 template< typename T >
 const T& unoox(const var<T>& t) { 
-    return *(t.my_value);
+    return *(T*)t.storage_value;
 }
 
 template< typename T >
 T& unoox(var<T>& t) { 
-    return *(t.my_value);
+    return *(T*)t.storage_value;
 }
 
 template< typename T >
 T&& unoox(var<T>&& t) { 
-    return std::move(*(t.my_value));
+    return std::move(*(T*)t.storage_value);
 }
 
 template< typename T >
@@ -159,7 +161,7 @@ template< typename T> using var_type = typename gen_oox<T>::type;
 template< typename F, typename... Args >
 auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(args))...))>
 {
-    if (my_ctx.is_cancelled()) {
+    if (oox::internal::my_ctx.is_cancelled()) {
         return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
         ::create_by_default();
     }
@@ -167,8 +169,8 @@ auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(ar
     return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
     ::run(std::forward<F>(f), unoox(std::forward<Args>(args))...);
     } catch(...) {
-        my_ctx.cancel();
-        my_ctx.exception_wrapper.store(std::current_exception());
+        oox::internal::my_ctx.cancel();
+        oox::internal::my_ctx.exception_wrapper.store(std::current_exception());
         return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
         ::create_by_default();
     }
@@ -178,13 +180,13 @@ template<typename T>
 T wait_and_get(const var<T> &ov) { 
     ov.my_ctx->exception_wrapper.rethrow_exception();
     if (ov.my_ctx->is_cancelled()) { throw std::runtime_error("Task was cancelled"); }
-    return *(ov.my_value); 
+    return *(T*)ov.storage_value; 
 }
 template<typename T>
 std::optional<T> wait_optional(const var<T> &ov) {
     ov.my_ctx->exception_wrapper.rethrow_exception();
     if (ov.my_ctx->is_cancelled()) { return std::nullopt; }
-    return *(ov.my_value); 
+    return *(T*)ov.storage_value; 
 }
 template<typename T>
 void wait(const var<T> &ov) { ov.my_ctx->exception_wrapper.rethrow_exception(); }
@@ -192,9 +194,9 @@ void wait(const var<T> &ov) { ov.my_ctx->exception_wrapper.rethrow_exception(); 
 void wait_for_all(node &) {}
 
 template<typename T>
-void cancel(const var<T> &ov) { ov.my_ctx->cancel(); }
-void cancel () { my_ctx.cancel(); }
-void reset() { my_ctx.reset(); }
+void cancel(const var<T> &ov) { ov.my_ctx->cancel(); } // TODO
+void cancel () { oox::internal::my_ctx.cancel(); }
+void reset() { oox::internal::my_ctx.reset(); }
 
 
 #else ///////////////////////////////// Parallel execution  ///////////////////////////////////
@@ -1118,11 +1120,11 @@ void wait(var<T> &ov) { wait_for_all(ov); }
 template<typename T>
 void wait(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); }
 template<typename T>
-void cancel(var<T> &&ov) { ov.cancel(); }
+void cancel(var<T> &&ov) { ov.cancel(); } // TODO
 template<typename T>
-void cancel(var<T> &ov) { ov.cancel(); }
+void cancel(var<T> &ov) { ov.cancel(); } // TODO
 template<typename T>
-void cancel(const var<T> &ov) { (const_cast<var<T>&>(ov)).cancel(); }
+void cancel(const var<T> &ov) { (const_cast<var<T>&>(ov)).cancel(); } // TODO
 void cancel() { oox::internal::my_ctx.cancel(); }
 void reset() { oox::internal::my_ctx.reset(); }
 template<typename T>
