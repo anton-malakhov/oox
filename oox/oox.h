@@ -54,7 +54,7 @@ public:
     }
 
     std::exception_ptr load() const {
-        return exception_ptr ? exception_ptr : nullptr;
+        return exception_ptr;
     }
 
     void rethrow_exception() const {
