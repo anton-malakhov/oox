@@ -87,22 +87,26 @@ struct var : public node {
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
     oox::internal::context* my_ctx = &(oox::internal::my_ctx);
-    void* storage_value = aligned_alloc(alignof(T), sizeof(T));
-    var() {}
+    void* storage_value = std::aligned_alloc(alignof(T), sizeof(T));
+    bool is_constructed = true;
+    var() { is_constructed = false; }
     ~var() {
+        if (is_constructed) {
+            static_cast<T*>(storage_value)->~T();
+        }
         std::free(storage_value);
     }
-    var(const T& t) noexcept { 
-        *(T*)storage_value = t; 
+    var(const T& t) noexcept {
+        new (storage_value) T(t);
     }
     var(T&& t) noexcept { 
-        *(T*)storage_value = std::move(t); 
+        new (storage_value) T(std::move(t));
     }
     var(var<T>&& t) { 
-        *(T*)storage_value = std::move(*(T*)t.storage_value);
+        new (storage_value) T(std::move(*(static_cast<T*>(t.storage_value))));
     }
     var& operator=(var<T>&& t) {
-        *(T*)storage_value = std::move(*(T*)t.storage_value);
+        new (storage_value) T(std::move(*(static_cast<T*>(t.storage_value))));
         return *this; 
     }
     T get() { 
