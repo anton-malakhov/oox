@@ -6,7 +6,7 @@
 export SHELL=bash
 
 .PHONY: all
-all: release test bench_fib
+all: release test bench_fib bench_linsearch
 
 release:
 	cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo && make -C build -j$(shell nproc)
@@ -31,5 +31,6 @@ bench_loops:
 
 bench_fib:
 	numactl -N 0 build/benchmarks/bench_fib
-
-bench: bench_fib bench_loops
+bench_linsearch:
+	numactl -N 0 build/benchmarks/bench_linsearch
+bench: bench_fib bench_linsearch bench_loops

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-list(APPEND OOX_BENCHMARKS bench_fib)
+list(APPEND OOX_BENCHMARKS bench_fib bench_linsearch)
 
 find_package(benchmark REQUIRED)
 

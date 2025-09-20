@@ -103,6 +103,74 @@ TEST(OOX, Wavefront) {
     ASSERT_EQ(lcs0, lcs1);
 }
 
+int throw_std_runtime_error() {
+    throw std::runtime_error("exception in function");
+    return 0;
+}
+
+TEST(OOX, Exception) {
+    auto exec = oox::run(throw_std_runtime_error);
+    ASSERT_THROW(oox::wait_and_get(exec), std::runtime_error);
+    ASSERT_THROW(oox::wait_optional(exec), std::runtime_error);
+    ASSERT_THROW(oox::wait(exec), std::runtime_error);
+}
+
+int function_returns_zero() { return 0; }
+
+TEST(OOX, Cancellation) {
+    auto exec = oox::run(function_returns_zero);
+    oox::cancel();
+    ASSERT_THROW(oox::wait_and_get(exec), std::runtime_error);
+    ASSERT_NO_THROW(ASSERT_EQ(oox::wait_optional(exec), std::nullopt));
+    ASSERT_NO_THROW(oox::wait(exec));
+}
+
+// class for tests with cancellations and exceptions
+int n;
+int cancellation_index;
+std::vector<bool> fib_numbers_requested;
+class CAE : public ::testing::Test {
+protected:
+    void SetUp() override {
+        n = 28;
+        cancellation_index = 11;
+        fib_numbers_requested.clear();
+        fib_numbers_requested.resize(n + 1, false);
+    }
+    void TearDown() override {
+        for(int index = 0; index < cancellation_index - 1; index++) {
+            ASSERT_EQ(fib_numbers_requested[index], false);
+        }
+        if (cancellation_index == 0) {
+            ASSERT_TRUE(fib_numbers_requested[cancellation_index]);
+        } else {
+            ASSERT_TRUE(fib_numbers_requested[cancellation_index] || fib_numbers_requested[cancellation_index - 1]);
+        }
+    }
+};
+
+template<typename Func>
+oox::var<int> Fib_with_cancellation_or_exception(int n) {
+    fib_numbers_requested[n] = true;
+    if (n <= cancellation_index) { Func::cancellation_or_exception_function(); }
+    if(n < 2) return n;
+    return oox::run( std::plus<int>(), oox::run(Fib_with_cancellation_or_exception<Func>, n-1), oox::run(Fib_with_cancellation_or_exception<Func>, n-2) );
+}
+
+TEST_F(CAE, OOX_Fib_Exception) {
+    struct exception_function {
+        static void cancellation_or_exception_function() { throw std::runtime_error("detected n is cancellation_index"); }
+    };
+    ASSERT_THROW(oox::wait_and_get(Fib_with_cancellation_or_exception<exception_function>(n)), std::runtime_error);
+}
+
+TEST_F(CAE, OOX_Fib_Cancellation) {
+    struct cancellation_function {
+        static void cancellation_or_exception_function() { oox::cancel(); }
+    };
+    ASSERT_THROW(oox::wait_and_get(Fib_with_cancellation_or_exception<cancellation_function>(n)), std::runtime_error);
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     for (int i = 1; i < argc; i++) {
