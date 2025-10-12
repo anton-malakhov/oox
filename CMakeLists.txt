@@ -7,7 +7,6 @@ MESSAGE(STATUS "CMAKE_ROOT=" ${CMAKE_ROOT})
 
 # Project name
 project(OOX VERSION 0.2.0 LANGUAGES CXX)
-cmake_policy(SET CMP0167 OLD)
 set (CMAKE_CXX_STANDARD 20)
 
 # build options

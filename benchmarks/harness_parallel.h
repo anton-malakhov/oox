@@ -88,6 +88,7 @@
 
 #elif __USE_TF__
 #include <taskflow/taskflow.hpp>
+#include <taskflow/algorithm/for_each.hpp>
 #endif
 
 #include <sys/syscall.h>
