@@ -74,8 +74,7 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
         run_mask.store(0U, std::memory_order_relaxed);
         func_ptr = f;
         epoch.store(e+1, std::memory_order_release);
-        //tbb::atomic_fence();
-        __asm__ __volatile__("lock; addl $0,(%%rsp)":::"memory");
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         mask_t mask_snapshot = start_mask.load(std::memory_order_acquire);
         finish_mask.store(0, std::memory_order_relaxed);
         run_mask.store(mask_snapshot|1, std::memory_order_release);
@@ -101,7 +100,6 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
                     }
                     tbb::detail::spin_wait_while_eq(global.epoch, e);
                     e = global.epoch;
-                    _mm_prefetch((const char*)global.func_ptr, _MM_HINT_T0);
                     tbb::detail::spin_wait_while_eq(global.run_mask, 0U);
                     r = global.run_mask;
                 } while( (r&bit)==bit || global.mode == 2);
