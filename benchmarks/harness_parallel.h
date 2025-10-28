@@ -42,6 +42,7 @@
 #endif
 
 #define TF_FOR_EACH 30
+#define FOLLY_FOR_EACH 40
 
 #ifndef PARALLEL
 #define PARALLEL TBB_SIMPLE
@@ -51,8 +52,12 @@
 #define __USE_OPENMP__ 1
 #elif PARALLEL < TF_FOR_EACH
 #define __USE_TBB__ 1
-#else
+#elif PARALLEL < FOLLY_FOR_EACH
 #define __USE_TF__ 1
+#elif PARALLEL == FOLLY_FOR_EACH
+#define __USE_FOLLY__ 1
+#else
+#error Unrecognized PARALLEL mode
 #endif
 
 #include <algorithm>
@@ -88,6 +93,10 @@
 
 #elif __USE_TF__
 #include <taskflow/taskflow.hpp>
+#include <taskflow/algorithm/for_each.hpp>
+#elif __USE_FOLLY__
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/futures/Future.h>
 #endif
 
 #include <sys/syscall.h>
@@ -148,6 +157,10 @@ static int GetNumThreads() {
     return std::thread::hardware_concurrency();
 #endif
 }
+
+#if __USE_FOLLY__
+folly::CPUThreadPoolExecutor executor(GetNumThreads());
+#endif
 
 static int InitParallel(int n = 0)
 {
@@ -256,6 +269,11 @@ static int InitParallel(int n = 0)
     printf("Setting %d threads for TaskFlow\n", nThreads); fflush(0);
     taskflow.for_each_index(0, nThreads, 1, [](int _){});
     executor.run(taskflow).get();
+#elif __USE_FOLLY__
+    nThreads = n? n : GetNumThreads();
+    for (int i = 0; i < nThreads; i++)
+        executor.add([]{});
+    executor.join();
 #endif
     return nThreads;
 }
@@ -383,6 +401,10 @@ void parallel_for( Iter s, Iter e, Iter g, const Body &b) {
 #elif PARALLEL == TF_FOR_EACH
     taskflow.for_each_index(s, e, 1, executive_range);
     executor.run(taskflow).get();
+#elif PARALLEL == FOLLY_FOR_EACH
+    for (int i = s; i < e; i++)
+        executor.add([i, &b]{b(i);});
+    executor.join();
 
 #else // other TBB parallel_fors
 //  implied:  static tbb::task_group_context context(tbb::task_group_context::isolated, tbb::task_group_context::default_traits);

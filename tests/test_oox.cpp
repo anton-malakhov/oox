@@ -2,23 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+bool g_oox_verbose = false;
+#define oox_println(s, ...) fprintf(stderr, s "\n",  __VA_ARGS__)
+#define __OOX_TRACE if (g_oox_verbose) oox_println
+#define __OOX_ASSERT(b, m) if(!(b)) { oox_println("OOX assertion failed: " #b " at line %d: %s", __LINE__, m); abort(); }
+#define __OOX_ASSERT_EX(b, m) __OOX_ASSERT(b,m)
+
+#define REMARK oox_println
+#define ASSERT(b, m) ASSERT_TRUE(b) << (m)
+
+#include <oox/oox.h>
 #include <gtest/gtest.h>
 
 #include <iostream>
 #include <numeric>
 #include <vector>
-//#include <tbb/concurrent_vector.h>
-
-bool g_oox_verbose = false;
-#define println(s, ...) fprintf(stderr, s "\n",  __VA_ARGS__)
-#define __OOX_TRACE if (g_oox_verbose) println
-#define __OOX_ASSERT(b, m) if(!(b)) { println("OOX assertion failed: " #b " at line %d: %s", __LINE__, m); abort(); }
-#define __OOX_ASSERT_EX(b, m) __OOX_ASSERT(b,m)
-
-#include <oox/oox.h>
-
-#define REMARK println
-#define ASSERT(b, m) ASSERT_TRUE(b) << (m)
 
 /////////////////////////////////////// EXAMPLES ////////////////////////////////////////
 
@@ -50,6 +48,8 @@ namespace ArchSample {
 #define OOX OOX_TBB
 #elif HAVE_TF
 #define OOX OOX_TF
+#elif HAVE_FOLLY
+#define OOX OOX_FOLLY
 #else
 #define OOX OOX_STD
 #endif

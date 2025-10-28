@@ -4,3 +4,9 @@
 [submodule "thirdparty/taskflow"]
 	path = thirdparty/taskflow
 	url = https://github.com/taskflow/taskflow
+[submodule "thirdparty/folly"]
+	path = thirdparty/folly
+	url = https://github.com/facebook/folly.git
+[submodule "thirdparty/fastfloat"]
+	path = thirdparty/fastfloat
+	url = https://github.com/fastfloat/fast_float.git

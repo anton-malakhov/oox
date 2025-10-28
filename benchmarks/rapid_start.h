@@ -100,7 +100,6 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
                     }
                     tbb::detail::spin_wait_while_eq(global.epoch, e);
                     e = global.epoch;
-                    // _mm_prefetch((const char*)global.func_ptr, _MM_HINT_T0);
                     tbb::detail::spin_wait_while_eq(global.run_mask, 0U);
                     r = global.run_mask;
                 } while( (r&bit)==bit || global.mode == 2);

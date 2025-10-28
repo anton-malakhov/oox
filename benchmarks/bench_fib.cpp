@@ -79,8 +79,7 @@ BENCHMARK(Fib_TBB2)->Unit(benchmark::kMillisecond)->UseRealTime();
 #if HAVE_TF
 
 #include <taskflow/taskflow.hpp>
-#include <tbb/info.h>
-const int nThreads = tbb::info::default_concurrency(); // respect affinity mask
+const int nThreads = std::thread::hardware_concurrency(); // does not respect affinity mask
 
 namespace TF {
     int spawn(int n, tf::Subflow& sbf) {
