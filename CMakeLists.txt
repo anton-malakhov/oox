@@ -16,6 +16,8 @@ option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_LOCAL_TBB "Force local copy of TBB" OFF)
 option(OOX_ENABLE_TF "Enable Taskflow for threading" ON)
 option(OOX_LOCAL_TF "Force local copy of TaskFlow" OFF)
+option(OOX_ENABLE_FOLLY "Enable Folly for threading" ON)
+option(OOX_LOCAL_FOLLY "Force local copy of Folly" OFF)
 option(OOX_ENABLE_OMP "Enable OpenMP for comparison (if found)" ON)
 
 # Global features
@@ -27,7 +29,7 @@ if(OOX_SANITIZE)
 endif()
 
 # Turn on the verbose
-#set(CMAKE_VERBOSE_MAKEFILE ON)
+set(CMAKE_VERBOSE_MAKEFILE ON)
 
 # Include additional language check
 include(CheckLanguage)
@@ -73,6 +75,29 @@ if(OOX_ENABLE_OMP)
   find_package(OpenMP)
 endif()
 
+if(OOX_ENABLE_FOLLY)
+  add_definitions(-DGLOG_USE_GLOG_EXPORT)
+  find_package(Gflags CONFIG REQUIRED)
+  set_target_properties(gflags_shared PROPERTIES MAP_IMPORTED_CONFIG_DEBUG Release)
+  option(FOLLY_USE_STATIC ON)
+  if(NOT OOX_LOCAL_FOLLY)
+    find_package(folly QUIET)  # not REQUIRED
+  endif()
+  if(folly_FOUND)
+    add_library(folly INTERFACE)
+    target_link_libraries(folly INTERFACE Folly::folly Folly::folly_deps)
+  else()
+    execute_process(COMMAND git submodule update --init --depth=1 thirdparty/folly/ thirdparty/fastfloat/
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} )
+    set(FASTFLOAT_INCLUDE_DIR thirdparty/fastfloat/include)
+    include_directories(thirdparty/fastfloat/include)
+      # Replace install() to avoid fastfloat directory problem
+    macro(install)
+    endmacro()
+    add_subdirectory(thirdparty/folly folly)
+    set(folly_FOUND ON)
+  endif()
+endif()
 # Library
 add_library(${PROJECT_NAME} INTERFACE)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
