@@ -181,7 +181,6 @@ static int InitParallel(int n = 0)
     setenv("TBB_VERSION", "1", 1);
 #endif
     setenv("TBB_MALLOC_USE_HUGE_PAGES", "1", 1);
-    scalable_allocation_mode(USE_HUGE_PAGES, 1);
 
     printf("Setting %d threads for TBB\n", nThreads); fflush(0);
 
