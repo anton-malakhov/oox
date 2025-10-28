@@ -51,6 +51,11 @@ int Fib(int n, tf::Subflow& sbf) {  // TaskFlow: High-level blocking style progr
 - `oox::var<T>`: Basic representation of data in the OOX graph. In concept, a new form of `std::future` for continuations. It carries both: a value and dependency info
   - `using oox::node = oox::var<void>`: carries solely dependency info
 - `oox::var<T> oox::run(T(Func&)(...), Args...)`: Basic tasking API, spawns a task when arguments are ready and returns `oox::var` as a promise to provide the result of Func in future. If there are `oox::var` arguments, which are not ready yet (i.e. they are "promises" themselves), it makes a continuation task, which depends on completion of pending `oox::var` arguments.
+- `void oox::cancel()`: the method that cancels all existing tasks and does not allow creating new tasks.
+- `void oox::reset()`: the method that resets cancellation information and restores the ability to create new tasks.
+- `void oox::wait(oox::var)`: the method that waits for a task to complete and throws an exception if it occurs in the running task.
+- `T oox::wait_and_get(oox::var)`: the method that waits for a task to complete, returns the result of the task, and throws an exception if it occurs in the running task, it also throws an exception if the task was cancelled.
+- `std::optional<T> oox::wait_optional(oox::var)`: the method that waits for a task to complete returns the `std::optional` of the task's result and throws an exception if it occurred in the executing task, it returns `std::nullopt` if the task was cancelled.
 
 ## Design
 Pillars:

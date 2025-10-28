@@ -10,6 +10,8 @@
 #include <type_traits>
 #include <limits>
 #include <atomic>
+#include <exception>
+#include <optional>
 
 #if HAVE_TBB
 #define TBB_USE_ASSERT 0
@@ -41,9 +43,48 @@
 namespace oox {
 
 #if OOX_SERIAL_DEBUG //////////////////// Immediate execution //////////////////////////////////
+
 class node {
     node &operator=(const node &) = delete;
 };
+
+namespace internal {
+
+struct context {
+
+    class exception {
+    private:
+        std::exception_ptr exception_ptr;
+    public:
+        void store(std::exception_ptr ex) {
+            exception_ptr = ex;
+        }
+
+        std::exception_ptr load() const {
+            return exception_ptr;
+        }
+
+        void rethrow_exception() const {
+            if (exception_ptr) std::rethrow_exception(exception_ptr);
+        }
+        void reset() {
+            this->store(nullptr);
+        }
+    };
+
+    exception exception_wrapper;
+    bool cancel_status = false;
+    void cancel() { cancel_status = true; }
+    bool is_cancelled() { return cancel_status; }
+    void reset() {
+        exception_wrapper.reset();
+        cancel_status = false;
+    }
+};
+
+static context my_ctx;
+
+} // namespace internal
 
 template<typename T>
 struct var : public node {
@@ -51,13 +92,34 @@ struct var : public node {
                   "Specialize oox::var only by plain types."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
-    T my_value;
-    var() : my_value() {}
-    var(const T& t) noexcept : my_value( t ) {}
-    var(T&& t)      noexcept : my_value( std::move(t) ) { }
-    var(var<T>&& t) : my_value( std::move(t.my_value) ) { }
-    var& operator=(var<T>&& t) { my_value = std::move(t.my_value); return *this; }
-    T get() { return my_value; }
+    oox::internal::context* my_ctx = &(oox::internal::my_ctx);
+    void* storage_value = std::aligned_alloc(alignof(T), sizeof(T));
+    bool is_constructed = true;
+    var() { is_constructed = false; }
+    ~var() {
+        if (is_constructed) {
+            static_cast<T*>(storage_value)->~T();
+        }
+        std::free(storage_value);
+    }
+    var(const T& t) noexcept {
+        new (storage_value) T(t);
+    }
+    var(T&& t) noexcept { 
+        new (storage_value) T(std::move(t));
+    }
+    var(var<T>&& t) { 
+        new (storage_value) T(std::move(*(static_cast<T*>(t.storage_value))));
+    }
+    var& operator=(var<T>&& t) {
+        new (storage_value) T(std::move(*(static_cast<T*>(t.storage_value))));
+        return *this; 
+    }
+    T get() { 
+        my_ctx->exception_wrapper.rethrow_exception();
+        if (my_ctx->is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
+        return *(T*)storage_value; 
+    }
 };
 
 template<>
@@ -69,45 +131,83 @@ template< typename T > // create temporary copies to simulate parallel implement
 typename std::decay<T>::type unoox(T&& t) { return typename std::decay<T>::type(std::forward<T>(t)); }
 
 template< typename T >
-const T& unoox(const var<T>& t) { return t.my_value; }
+const T& unoox(const var<T>& t) { 
+    return *(T*)t.storage_value;
+}
 
 template< typename T >
-T& unoox(var<T>& t) { return t.my_value; }
+T& unoox(var<T>& t) { 
+    return *(T*)t.storage_value;
+}
 
 template< typename T >
-T&& unoox(var<T>&& t) { return std::move(t.my_value); }
+T&& unoox(var<T>&& t) { 
+    return std::move(*(T*)t.storage_value);
+}
 
 template< typename T >
 struct gen_oox {
     typedef var<typename std::decay<T>::type> type;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { return type(std::forward<F>(f)(std::forward<Args>(args)...)); }
+    static type create_by_default() { return type(); }
 };
 template< typename VT >
 struct gen_oox<var<VT> > {
     typedef var<VT> type;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { return std::forward<F>(f)(std::forward<Args>(args)...); }
+    static type create_by_default() { return type(); }
 };
 template<>
 struct gen_oox<void> {
     typedef node type;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { std::forward<F>(f)(std::forward<Args>(args)...); return node(); }
+    static type create_by_default() { return node(); }
 };
 template< typename T> using var_type = typename gen_oox<T>::type;
 
 template< typename F, typename... Args >
 auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(args))...))>
 {
+    if (oox::internal::my_ctx.is_cancelled()) {
+        return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
+        ::create_by_default();
+    }
+    try {
     return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
     ::run(std::forward<F>(f), unoox(std::forward<Args>(args))...);
+    } catch(...) {
+        oox::internal::my_ctx.cancel();
+        oox::internal::my_ctx.exception_wrapper.store(std::current_exception());
+        return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
+        ::create_by_default();
+    }
 }
 
 template<typename T>
-T wait_and_get(const var<T> &ov) { return ov.my_value; }
+T wait_and_get(const var<T> &ov) { 
+    ov.my_ctx->exception_wrapper.rethrow_exception();
+    if (ov.my_ctx->is_cancelled()) { throw std::runtime_error("Task was cancelled"); }
+    return *(T*)ov.storage_value; 
+}
+template<typename T>
+std::optional<T> wait_optional(const var<T> &ov) {
+    ov.my_ctx->exception_wrapper.rethrow_exception();
+    if (ov.my_ctx->is_cancelled()) { return std::nullopt; }
+    return *(T*)ov.storage_value; 
+}
+template<typename T>
+void wait(const var<T> &ov) { ov.my_ctx->exception_wrapper.rethrow_exception(); }
 
 void wait_for_all(node &) {}
+
+template<typename T>
+void cancel(const var<T> &ov) { ov.my_ctx->cancel(); } // TODO
+void cancel () { oox::internal::my_ctx.cancel(); }
+void reset() { oox::internal::my_ctx.reset(); }
+
 
 #else ///////////////////////////////// Parallel execution  ///////////////////////////////////
 
@@ -145,8 +245,23 @@ struct task_life {
 using tbb::detail::d1::execution_data;
 using tbb_task = tbb::detail::d1::task;
 using tbb::detail::d1::small_object_allocator;
-static tbb::task_group_context tbb_context;
 #define TASK_EXECUTE_METHOD tbb_task* execute(execution_data&) override
+#define TASK_CANCEL_METHOD virtual tbb_task* cancel(execution_data&) override
+
+struct context {
+    tbb::task_group_context tbb_context;
+    void cancel() {
+        tbb_context.cancel_group_execution();
+    }
+    bool is_cancelled() {
+        return tbb_context.is_group_execution_cancelled();
+    }
+    void reset() {
+        tbb_context.reset();
+    }
+};
+
+static context my_ctx;
 
 struct task : public tbb_task, task_life {
     tbb::detail::d1::wait_context waiter{1};
@@ -156,7 +271,7 @@ struct task : public tbb_task, task_life {
 #if TBB_USE_ASSERT
     std::atomic<bool> is_spawned{false};
     virtual ~task() {
-        if(!is_spawned.load(std::memory_order_acquire);)
+        if(!is_spawned.load(std::memory_order_acquire))
             waiter.release();
     }
 #else
@@ -167,7 +282,7 @@ struct task : public tbb_task, task_life {
         __OOX_ASSERT(false, "");
         return nullptr;
     }
-    virtual tbb_task* cancel(execution_data& ed) override {
+    TASK_CANCEL_METHOD {
         __OOX_ASSERT(false, "");
         return nullptr;
     }
@@ -196,19 +311,30 @@ struct task : public tbb_task, task_life {
 #if TBB_USE_ASSERT
         is_spawned.store(true, std::memory_order_release);
 #endif
-        tbb::detail::d1::spawn(*this, tbb_context);
+        tbb::detail::d1::spawn(*this, my_ctx.tbb_context);
     }
     void wait() {
         __OOX_ASSERT(life_get_count(), "");
-        tbb::detail::d1::wait(waiter, tbb_context);
+        tbb::detail::d1::wait(waiter, my_ctx.tbb_context);
     }
     void wakeup() {
         waiter.release();
+    }
+    void my_cancel() {
+        my_ctx.cancel();
     }
 };
 #elif HAVE_TF /////////////////////// Taskflow ///////////////////////////////////////
 #define OOX_USING_TF
 #define TASK_EXECUTE_METHOD void* execute() override
+
+struct context { // TODO
+    void cancel() {}
+    bool is_cancelled() { return false; }
+    void reset() {}
+};
+
+static context my_ctx;
 
 tf::Executor tf_pool; // TODO :)
 
@@ -230,11 +356,15 @@ struct task : task_life {
     void spawn() {
         tf_pool.silent_async([this]{this->execute();});
     }
+
     void wait() {
         waiter.get_future().wait();
     }
     void wakeup() {
         waiter.set_value();
+    }
+    void my_cancel() {
+        my_ctx.cancel();
     }
 };
 #elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
@@ -288,12 +418,51 @@ struct task : task_life {
 #else /////////////////////////////// plain STD impl /////////////////////////////////
 #define OOX_USING_STD
 #define TASK_EXECUTE_METHOD void* execute() override
+#define TASK_CANCEL_METHOD void* cancel() override
+
+class exception {
+private:
+    std::shared_ptr<std::exception_ptr> exception_ptr;
+public:
+    void store(std::exception_ptr ex) {
+        auto new_ex = std::make_shared<std::exception_ptr>(std::move(ex));
+        std::atomic_store_explicit(&exception_ptr, new_ex, std::memory_order_release);
+    }
+
+    std::exception_ptr load() const {
+        auto ex = std::atomic_load_explicit(&exception_ptr, std::memory_order_acquire);
+        return ex ? *ex : nullptr;
+    }
+
+    void rethrow_exception() const {
+        auto ex = this->load();
+        if (ex) { std::rethrow_exception(ex); }
+    }
+    
+    void reset() {
+        this->store(nullptr);
+    }
+};
+
+struct context {
+    exception exception_wrapper;
+    std::atomic<bool> cancel_status{false};
+    void cancel() { cancel_status.store(true, std::memory_order_release); }
+    bool is_cancelled() { return cancel_status.load(std::memory_order_acquire); }
+    void reset() {
+        exception_wrapper.reset();
+        cancel_status.store(false, std::memory_order_release);
+    }
+};
+
+static context my_ctx;
 
 struct task : task_life {
     std::promise<void> waiter;
 
     virtual ~task() {}
     virtual void* execute() = 0;
+    virtual void* cancel() = 0;
 
     void release( int n = 1 ) {
         if(life_release(n))
@@ -303,14 +472,36 @@ struct task : task_life {
     static T* allocate(Args && ... args) {
         return new T(std::forward<Args>(args)...);
     }
+
     void spawn() {
-        std::async(std::launch::async, &task::execute, this);
+        if(!my_ctx.is_cancelled()) {
+            static_cast<void>(std::async(std::launch::async, [this] {
+                try {
+                    this->execute();
+                } catch (...) {
+                    if (!my_ctx.exception_wrapper.load()) {
+                        my_ctx.exception_wrapper.store(std::current_exception());
+                    }
+                    my_ctx.cancel();
+                    this->cancel();
+                }
+            }));
+        }
     }
+
     void wait() {
-        waiter.get_future().wait();
+        if(!my_ctx.is_cancelled()) {
+            waiter.get_future().wait();
+        }
+        my_ctx.exception_wrapper.rethrow_exception();
     }
+
     void wakeup() {
         waiter.set_value();
+    }
+
+    void my_cancel() {
+        my_ctx.cancel();
     }
 };
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
@@ -579,6 +770,11 @@ template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots> {
     T my_precious;
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
+    TASK_CANCEL_METHOD { 
+        __OOX_TRACE("%p do_cancel: start",this);
+        task_node::notify_successors<slots>();
+        return nullptr;
+    }
     storage_task() = default;
     storage_task(T&& t) : my_precious(std::move(t)) {}
     storage_task(const T& t) : my_precious(t) {}
@@ -609,6 +805,9 @@ struct oox_var_base {
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
         current_task->wait();
+    }
+    void cancel() {
+        current_task->my_cancel();
     }
     void release() {
         if( current_task ) {
@@ -707,6 +906,7 @@ public:
     ~var() { release(); }
     T get() {
         wait();
+        if (oox::internal::my_ctx.is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
         return *(T*)storage_ptr;
     }
 };
@@ -846,7 +1046,9 @@ struct alignas(64) functional_task : storage_task<slots, F> {
         return nullptr;
     }
     ~functional_task() {
-        reinterpret_cast<R*>(&my_result)->~R(); // TODO: what if it was canceled?
+        if (!my_ctx.is_cancelled()) {
+            reinterpret_cast<R*>(&my_result)->~R(); // TODO: what if it was canceled?
+        }
     }
 };
 
@@ -891,7 +1093,9 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
 #endif
     }
     ~functional_task() {
-        reinterpret_cast<var<VT>*>(&my_result)->~var<VT>(); // current_task is finished in forward_successors
+        if (!my_ctx.is_cancelled()) {
+            reinterpret_cast<var<VT>*>(&my_result)->~var<VT>(); // current_task is finished in forward_successors
+        }
     }
 };
 
@@ -967,12 +1171,57 @@ void wait_for_all(internal::oox_var_base& on ) {
 }
 
 template<typename T>
-T wait_and_get(var<T> &&ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+void wait(var<T> &&ov) { wait_for_all(ov); }
 template<typename T>
-T wait_and_get(var<T> &ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+void wait(var<T> &ov) { wait_for_all(ov); }
 template<typename T>
-T wait_and_get(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); return *(T*)ov.storage_ptr; }
+void wait(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); }
+template<typename T>
+void cancel(var<T> &&ov) { ov.cancel(); } // TODO
+template<typename T>
+void cancel(var<T> &ov) { ov.cancel(); } // TODO
+template<typename T>
+void cancel(const var<T> &ov) { (const_cast<var<T>&>(ov)).cancel(); } // TODO
+void cancel() { oox::internal::my_ctx.cancel(); }
+void reset() { oox::internal::my_ctx.reset(); }
+template<typename T>
+std::optional<T> wait_optional(var<T> &ov) {
+    wait_for_all(ov);  
+    if (oox::internal::my_ctx.is_cancelled()) { return std::nullopt; } 
+    return *(T*)ov.storage_ptr; 
+}
+template<typename T>
+std::optional<T> wait_optional(var<T> &&ov) {
+    wait_for_all(ov);  
+    if (oox::internal::my_ctx.is_cancelled()) { return std::nullopt; } 
+    return *(T*)ov.storage_ptr; 
+}
+template<typename T>
+std::optional<T> wait_optional(const var<T> &ov) {
+    wait_for_all(const_cast<var<T>&>(ov));
+    if (oox::internal::my_ctx.is_cancelled()) { return std::nullopt; } 
+    return *(T*)ov.storage_ptr; 
+}
+template<typename T>
+T wait_and_get(var<T> &ov) {
+    wait_for_all(ov); 
+    if (oox::internal::my_ctx.is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
+    return *(T*)ov.storage_ptr; 
+}
+template<typename T>
+T wait_and_get(var<T> &&ov) {
+    wait_for_all(ov); 
+    if (oox::internal::my_ctx.is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
+    return *(T*)ov.storage_ptr; 
+}
+template<typename T>
+T wait_and_get(const var<T> &ov) {
+    wait_for_all(const_cast<var<T>&>(ov));
+    if (oox::internal::my_ctx.is_cancelled()) { throw std::runtime_error("Task was cancelled"); } 
+    return *(T*)ov.storage_ptr; 
+}
 
+#undef TASK_CANCEL_METHOD
 #undef TASK_EXECUTE_METHOD
 
 #endif // !OOX_SERIAL
