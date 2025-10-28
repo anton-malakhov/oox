@@ -28,7 +28,7 @@ jobs:
       matrix:
         os: [ubuntu-latest] #, windows-latest
         build_type: [Release, Debug]
-        c_compiler: [gcc, clang, cl]
+        c_compiler: [gcc, clang-19, cl]
         include:
           # - os: windows-latest
           #   c_compiler: cl
@@ -37,8 +37,8 @@ jobs:
             c_compiler: gcc
             cpp_compiler: g++
           - os: ubuntu-latest
-            c_compiler: clang
-            cpp_compiler: clang++
+            c_compiler: clang-19
+            cpp_compiler: clang++-19
         exclude:
           - os: windows-latest
             c_compiler: gcc
@@ -56,7 +56,7 @@ jobs:
       shell: bash
       run: |
         echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
-        sudo apt install make cmake libbenchmark-dev libgtest-dev
+        sudo apt install make cmake clang-19 libbenchmark-dev libgtest-dev libgflags-dev libboost-all-dev libdouble-conversion-dev libfmt-dev libgoogle-glog-dev
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
