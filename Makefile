@@ -30,6 +30,6 @@ bench_loops:
 	@for x in $(shell ls -1 build/benchmarks/bench_loops_*) ; do numactl -N 0 $$x --benchmark_format=csv 2>/dev/null | grep /real_time | tr /, '\t'; done
 
 bench_fib:
-	numactl -N 0 build/benchmarks/bench_fib
+	numactl -N 0 build/benchmarks/bench_fib_TBB.exe
 
 bench: bench_fib bench_loops
