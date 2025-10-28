@@ -29,6 +29,30 @@ static void Fib_OOX2(benchmark::State& state) {
 }
 BENCHMARK(Fib_OOX2)->Unit(benchmark::kMillisecond)->UseRealTime();
 
+#if HAVE_OMP
+namespace OMP {
+    int Fib(int n) {
+        if(n < 2) return n;
+        int left, right;
+        #pragma omp task untied shared(left) firstprivate(n)
+        left = Fib(n-1);
+        //#pragma omp task untied shared(right) firstprivate(n)
+        right = Fib(n-2);
+        #pragma omp taskwait
+        return left + right;
+    }
+}
+
+static void Fib_OMP(benchmark::State& state) {
+  for (auto _ : state) {
+    #pragma omp parallel
+    #pragma omp single
+    OMP::Fib(FibN);
+  }
+}
+BENCHMARK(Fib_OMP)->Unit(benchmark::kMillisecond)->UseRealTime();
+#endif
+
 #if HAVE_TBB
 #include <tbb/tbb.h>
 namespace TBB1 {
