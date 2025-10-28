@@ -17,6 +17,12 @@
 #include <oneapi/tbb/task_group.h>
 #elif HAVE_TF
 #include <taskflow/taskflow.hpp>
+#elif HAVE_FOLLY
+#include <folly/fibers/Baton.h>
+#include <folly/fibers/FiberManager.h>
+#include <folly/fibers/FiberManagerMap.h>
+#include <folly/fibers/FiberManagerInternal.h>
+#include <folly/fibers/SimpleLoopController.h>
 #else
 #include <future>
 #endif
@@ -231,7 +237,54 @@ struct task : task_life {
         waiter.set_value();
     }
 };
+#elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
+#define OOX_USING_FOLLY
+#define TASK_EXECUTE_METHOD void* execute() override
 
+folly::fibers::FiberManager& get_fiber_manager() {
+    static folly::fibers::FiberManager* fiber_manager = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto evb = std::make_unique<folly::EventBase>();
+        auto loopController = std::make_unique<folly::fibers::EventBaseLoopController>();
+        loopController->attachEventBase(*evb);
+        fiber_manager = new folly::fibers::FiberManager(std::move(loopController));
+
+        // Запускаем цикл обработки в отдельном потоке
+        std::thread([evb = std::move(evb)]() {
+            evb->loopForever();
+        }).detach();
+    });
+    return *fiber_manager;
+}
+
+struct task : task_life {
+
+    folly::fibers::Baton baton;
+
+    virtual ~task() {}
+    virtual void* execute() = 0;
+
+    void release( int n = 1 ) {
+        if(life_release(n))
+            delete this;
+    }
+    template<typename T, typename... Args>
+    static T* allocate(Args && ... args) {
+        return new T(std::forward<Args>(args)...);
+    }
+    void spawn() {
+         get_fiber_manager().add([this] {
+            this->execute();
+        });
+    }
+    void wait() {
+       baton.wait();
+    }
+    void wakeup() {
+        baton.post();
+    }
+};
 #else /////////////////////////////// plain STD impl /////////////////////////////////
 #define OOX_USING_STD
 #define TASK_EXECUTE_METHOD void* execute() override

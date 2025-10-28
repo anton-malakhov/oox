@@ -7,3 +7,9 @@
 [submodule "thirdparty/stdexec"]
 	path = thirdparty/stdexec
 	url = https://github.com/NVIDIA/stdexec
+[submodule "thirdparty/folly"]
+	path = thirdparty/folly
+	url = https://github.com/facebook/folly.git
+[submodule "thirdparty/fastfloat"]
+	path = thirdparty/fastfloat
+	url = https://github.com/fastfloat/fast_float.git
