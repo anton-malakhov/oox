@@ -11,6 +11,9 @@
 #include <limits>
 #include <atomic>
 
+#if HAVE_OMP
+#include <omp.h>
+#include <setjmp.h>
 #if HAVE_TBB
 #define TBB_USE_ASSERT 0
 #include <oneapi/tbb/detail/_task.h>
@@ -140,7 +143,44 @@ struct task_life {
     }
 };
 
-#if HAVE_TBB ///////////////////////// TBB ///////////////////////////////////////////
+#if HAVE_OMP ///////////////////////// OpenMP ///////////////////////////////////////////
+#define OOX_USING_OMP
+#define TASK_EXECUTE_METHOD void* execute() override
+jmp_buf __openmp_ctx;
+struct __openmp_initializer_t {
+    __openmp_initializer_t() {
+        if(setjmp(__openmp_ctx)) {
+            #pragma omp parallel
+            #pragma omp masked
+            longjmp(__openmp_ctx, 1);
+        }
+    }
+} __openmp_initializer_t;
+
+struct task : task_life {
+    
+    virtual ~task() {}
+    virtual void* execute() = 0;
+
+    void release( int n = 1 ) {
+        if(life_release(n))
+            delete this;
+    }
+    template<typename T, typename... Args>
+    static T* allocate(Args && ... args) {
+        return new T(std::forward<Args>(args)...);
+    }
+    void spawn() {
+        #pragma omp task firstprivate(this)
+        [this]{this->execute();};
+    }
+    void wait() {
+        #pragma omp taskwait
+    }
+    void wakeup() {
+    }
+};
+#elif HAVE_TBB ///////////////////////// TBB ///////////////////////////////////////////
 #define OOX_USING_TBB
 using tbb::detail::d1::execution_data;
 using tbb_task = tbb::detail::d1::task;
