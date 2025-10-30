@@ -4,8 +4,10 @@
 
 #define TBB_PREVIEW_TASK_GROUP_EXTENSIONS 1
 
+#undef NDEBUG
 #include <benchmark/benchmark.h>
 #include "../examples/fibonacci.h"
+#include <cassert>
 using namespace Fibonacci;
 
 constexpr int FibN=28;
@@ -18,14 +20,20 @@ static void Fib_Serial(benchmark::State& state) {
 BENCHMARK(Fib_Serial)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 static void Fib_OOX1(benchmark::State& state) {
-  for (auto _ : state)
-    oox::wait_and_get(OOX1::Fib(FibN));
+  auto fib = Serial::Fib(FibN);
+  for (auto _ : state) {
+    auto x = oox::wait_and_get(OOX1::Fib(FibN));
+    assert(x == fib);
+  }
 }
 BENCHMARK(Fib_OOX1)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 static void Fib_OOX2(benchmark::State& state) {
-  for (auto _ : state)
-    oox::wait_and_get(OOX2::Fib(FibN));
+  auto fib = Serial::Fib(FibN);
+  for (auto _ : state) {
+    auto x = oox::wait_and_get(OOX2::Fib(FibN));
+    assert(x == fib);
+  }
 }
 BENCHMARK(Fib_OOX2)->Unit(benchmark::kMillisecond)->UseRealTime();
 

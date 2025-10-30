@@ -14,7 +14,7 @@
 #if HAVE_OMP
 #include <omp.h>
 #include <setjmp.h>
-#if HAVE_TBB
+#elif HAVE_TBB
 #define TBB_USE_ASSERT 0
 #include <oneapi/tbb/detail/_task.h>
 #include <oneapi/tbb/task_group.h>
@@ -171,8 +171,9 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        #pragma omp task firstprivate(this)
-        [this]{this->execute();};
+        auto t = this;
+        #pragma omp task firstprivate(t)
+        t->execute();
     }
     void wait() {
         #pragma omp taskwait
