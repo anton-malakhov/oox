@@ -12,6 +12,7 @@ set (CMAKE_CXX_STANDARD 20)
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
 option(OOX_BUILD_TESTS "Enables builds of tests" ON)
+option(OOX_BUILD_STDEXEC_EXAMPLES "Enable builds of stdexec examples" ON)
 option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_LOCAL_TBB "Force local copy of TBB" OFF)
 option(OOX_ENABLE_TF "Enable Taskflow for threading" ON)
@@ -116,6 +117,11 @@ endif(OOX_BUILD_TESTS)
 if(OOX_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
 endif(OOX_BUILD_BENCHMARKS)
+
+if(OOX_BUILD_STDEXEC_EXAMPLES)
+  add_subdirectory(thirdparty/stdexec)
+  add_subdirectory(stdexec_examples)
+endif(OOX_BUILD_STDEXEC_EXAMPLES)
 
 # -----------------------------------------------------------------------------
 # create find_package(OOX CONFIG)
