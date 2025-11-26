@@ -9,6 +9,15 @@ MESSAGE(STATUS "CMAKE_ROOT=" ${CMAKE_ROOT})
 project(OOX VERSION 0.2.0 LANGUAGES CXX)
 set (CMAKE_CXX_STANDARD 20)
 
+include(FetchContent)
+
+FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.17.0
+)
+FetchContent_MakeAvailable(googletest)
+
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
 option(OOX_BUILD_TESTS "Enables builds of tests" ON)
@@ -78,8 +87,48 @@ endif()
 if(OOX_ENABLE_FOLLY)
   add_definitions(-DGLOG_USE_GLOG_EXPORT)
   find_package(Gflags CONFIG REQUIRED)
-  set_target_properties(gflags_shared PROPERTIES MAP_IMPORTED_CONFIG_DEBUG Release)
-  option(FOLLY_USE_STATIC ON)
+
+  # --- Make gflags_shared workable for Debug builds with CMake 4 + Ninja ---
+  # Some gflags packages only export a single imported configuration (e.g.
+  # Release or "NOCONFIG"). For a Debug build, CMake 4.0 will complain if
+  # gflags_shared(Debug) has no IMPORTED_LOCATION_*. We copy any existing
+  # location to IMPORTED_LOCATION_DEBUG and *avoid* MAP_IMPORTED_CONFIG_DEBUG.
+  if(TARGET gflags_shared)
+    get_target_property(_gflags_imported gflags_shared IMPORTED)
+    if(_gflags_imported)
+      set(_gflags_src_loc "")
+
+      # Try to reuse an existing config-specific location if present.
+      foreach(cfg Release RelWithDebInfo MinSizeRel)
+        get_target_property(_loc gflags_shared IMPORTED_LOCATION_${cfg})
+        if(_loc)
+          set(_gflags_src_loc "${_loc}")
+          break()
+        endif()
+      endforeach()
+
+      # Fall back to config-less IMPORTED_LOCATION (NOCONFIG) if that's how
+      # the package was exported.
+      if(NOT _gflags_src_loc)
+        get_target_property(_loc gflags_shared IMPORTED_LOCATION)
+        if(_loc)
+          set(_gflags_src_loc "${_loc}")
+        endif()
+      endif()
+
+      if(_gflags_src_loc)
+        get_target_property(_dbg_loc gflags_shared IMPORTED_LOCATION_DEBUG)
+        if(NOT _dbg_loc)
+          set_target_properties(gflags_shared PROPERTIES
+                  IMPORTED_LOCATION_DEBUG "${_gflags_src_loc}"
+          )
+        endif()
+      endif()
+    endif()
+  endif()
+
+  option(FOLLY_USE_STATIC "Use static Folly" ON)
+
   if(NOT OOX_LOCAL_FOLLY)
     find_package(folly QUIET)  # not REQUIRED
   endif()
@@ -87,17 +136,22 @@ if(OOX_ENABLE_FOLLY)
     add_library(folly INTERFACE)
     target_link_libraries(folly INTERFACE Folly::folly Folly::folly_deps)
   else()
-    execute_process(COMMAND git submodule update --init --depth=1 thirdparty/folly/ thirdparty/fastfloat/
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} )
+    execute_process(
+            COMMAND git submodule update --init --depth=1 thirdparty/folly/ thirdparty/fastfloat/
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
     set(FASTFLOAT_INCLUDE_DIR thirdparty/fastfloat/include)
     include_directories(thirdparty/fastfloat/include)
-      # Replace install() to avoid fastfloat directory problem
+
+    # Replace install() to avoid fastfloat directory problem
     macro(install)
     endmacro()
+
     add_subdirectory(thirdparty/folly folly)
     set(folly_FOUND ON)
   endif()
 endif()
+
 # Library
 add_library(${PROJECT_NAME} INTERFACE)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
