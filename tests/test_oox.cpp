@@ -62,10 +62,10 @@ TEST(OOX, Simple) {
     ASSERT_EQ(oox::wait_and_get(a), 5);
     ASSERT_EQ(b.get(), 6);
 }
-TEST(OOX, DISABLED_Empty) { // TODO!
-    oox::var<int> a; // TODO: = oox::deferred;
+TEST(OOX, Empty) {
+    oox::var<int> a{oox::deferred};
     oox::var<int> b = oox::run(plus, 1, a);
-    oox::run([](int &A){ A = 2; }, a); // TODO: define another assignment operator rule?
+    oox::run([](int &A){ A = 2; }, a);
     ASSERT_EQ(oox::wait_and_get(a), 2);
     ASSERT_EQ(oox::wait_and_get(b), 3);
 }
@@ -77,7 +77,7 @@ TEST(OOX, Fib) {
 #ifdef OOX_USING_STD
     int x = 15;
 #else
-    int x = 25;
+    int x = 5;
 #endif
     using namespace Fibonacci;
     int fib0 = Serial::Fib(x);
@@ -102,6 +102,20 @@ TEST(OOX, Wavefront) {
     int lcs1 = Straight::LCS(input1, sizeof(input1), input2, sizeof(input2));
     ASSERT_EQ(lcs0, lcs1);
 }
+
+TEST(OOX, Consistency) {
+    auto func = []() -> oox::var<int> {
+        return oox::run(std::plus<int>(), 1, 1);
+    };
+    const auto res = oox::wait_and_get(oox::run(func));
+    ASSERT_EQ(res, 2);
+}
+
+TEST(OOX, ConsistencyInfLoop) {
+    const oox::var<int> tmp = 1;
+    ASSERT_EQ(oox::wait_and_get(tmp), 1);
+}
+
 
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
