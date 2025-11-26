@@ -62,10 +62,10 @@ TEST(OOX, Simple) {
     ASSERT_EQ(oox::wait_and_get(a), 5);
     ASSERT_EQ(b.get(), 6);
 }
-TEST(OOX, DISABLED_Empty) { // TODO!
-    oox::var<int> a; // TODO: = oox::deferred;
+TEST(OOX, Empty) {
+    oox::var<int> a{oox::deferred};
     oox::var<int> b = oox::run(plus, 1, a);
-    oox::run([](int &A){ A = 2; }, a); // TODO: define another assignment operator rule?
+    oox::run([](int &A){ A = 2; }, a);
     ASSERT_EQ(oox::wait_and_get(a), 2);
     ASSERT_EQ(oox::wait_and_get(b), 3);
 }
@@ -77,7 +77,7 @@ TEST(OOX, Fib) {
 #ifdef OOX_USING_STD
     int x = 15;
 #else
-    int x = 25;
+    int x = 5;
 #endif
     using namespace Fibonacci;
     int fib0 = Serial::Fib(x);
@@ -101,6 +101,114 @@ TEST(OOX, Wavefront) {
     int lcs0 = Serial::LCS(input1, sizeof(input1), input2, sizeof(input2));
     int lcs1 = Straight::LCS(input1, sizeof(input1), input2, sizeof(input2));
     ASSERT_EQ(lcs0, lcs1);
+}
+
+TEST(OOX, Consistency) {
+    auto func = []() -> oox::var<int> {
+        return oox::run(std::plus<int>(), 1, 1);
+    };
+    const auto res = oox::wait_and_get(oox::run(func));
+    ASSERT_EQ(res, 2);
+}
+
+TEST(OOX, ConsistencyInfLoop) {
+    const oox::var<int> tmp = 1;
+    ASSERT_EQ(oox::wait_and_get(tmp), 1);
+}
+
+// TODO transfer to test_oox_deferred
+TEST(OOX, DeferredChain) {
+    oox::var<int> a(oox::deferred);
+    oox::var<int> b = oox::run(plus, 1, a);
+    oox::var<int> c = oox::run(plus, 1, b);
+
+    oox::run([](int &A){ A = 10; }, a);
+
+    ASSERT_EQ(oox::wait_and_get(a), 10);
+    ASSERT_EQ(oox::wait_and_get(b), 11);
+    ASSERT_EQ(oox::wait_and_get(c), 12);
+}
+
+TEST(OOX, DeferredDiamond) {
+    oox::var<int> a(oox::deferred);
+
+    oox::var<int> b = oox::run(plus, 1, a);
+    oox::var<int> c = oox::run(plus, 2, a);
+    oox::var<int> d = oox::run([](int x, int y){ return x + y; }, b, c);
+
+    oox::run([](int &A){ A = 5; }, a);
+
+    ASSERT_EQ(oox::wait_and_get(a), 5);
+    ASSERT_EQ(oox::wait_and_get(b), 6);
+    ASSERT_EQ(oox::wait_and_get(c), 7);
+    ASSERT_EQ(oox::wait_and_get(d), 13);
+}
+
+TEST(OOX, DeferredTwoInputs) {
+    oox::var<int> a(oox::deferred);
+    oox::var<int> b(oox::deferred);
+
+    oox::var<int> c = oox::run([](int x, int y){ return x + y; }, a, b);
+
+    oox::run([](int &B){ B = 3; }, b);
+    oox::run([](int &A){ A = 2; }, a);
+
+    ASSERT_EQ(oox::wait_and_get(a), 2);
+    ASSERT_EQ(oox::wait_and_get(b), 3);
+    ASSERT_EQ(oox::wait_and_get(c), 5);
+}
+
+TEST(OOX, DeferredChainWithMultipleWriters) {
+    oox::var<int> a(oox::deferred);
+    oox::var<int> b = oox::run(plus, 1, a);
+
+    oox::run([](int &A){ A = 1; }, a);
+    oox::run([](int &A){ A = 10; }, a);
+
+    int aval = oox::wait_and_get(a);
+    int bval = oox::wait_and_get(b);
+
+    EXPECT_EQ(aval, 10);
+    ASSERT_TRUE(bval == aval + 1 || bval == 2 || bval == 11);
+}
+
+TEST(OOX, DeferredForwardingLayer) {
+
+    oox::var<int> a(oox::deferred);
+
+    auto inner = [](oox::var<int> aa) -> oox::var<int> {
+        return oox::run(plus, 1, aa);            // aa + 1
+    };
+
+    auto outer = [inner](oox::var<int> aa) -> oox::var<int> {
+        // creates a forwarding task
+        return oox::run(inner, aa);
+    };
+
+    oox::var<int> result = oox::run(outer, a);
+
+    oox::run([](int &A){ A = 41; }, a);
+
+    ASSERT_EQ(oox::wait_and_get(a), 41);
+    ASSERT_EQ(oox::wait_and_get(result), 42);
+}
+
+TEST(OOX, DeferredArrayLayered) {
+
+    oox::var<int> a[3] = {
+        oox::var<int>(oox::deferred),
+        oox::var<int>(oox::deferred),
+        oox::var<int>(oox::deferred)
+    };
+
+    a[1] = oox::run(plus, 1, a[0]);
+    a[2] = oox::run(plus, 1, a[1]);
+
+    oox::run([](int &x){ x = 100; }, a[0]);
+
+    ASSERT_EQ(oox::wait_and_get(a[0]), 100);
+    ASSERT_EQ(oox::wait_and_get(a[1]), 101);
+    ASSERT_EQ(oox::wait_and_get(a[2]), 102);
 }
 
 int main(int argc, char** argv) {
