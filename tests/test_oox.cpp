@@ -26,7 +26,7 @@ bool g_oox_verbose = false;
 
 namespace ArchSample {
     // example from original OOX
-    using T = int;
+    typedef int T;
     T f() { return 1; }
     T g() { return 2; }
     T h() { return 3; }
@@ -62,8 +62,8 @@ TEST(OOX, Simple) {
     ASSERT_EQ(oox::wait_and_get(a), 5);
     ASSERT_EQ(b.get(), 6);
 }
-TEST(OOX, DISABLED_Empty) {
-    oox::var<int> a;
+TEST(OOX, Empty) {
+    oox::var<int> a{oox::deferred};
     oox::var<int> b = oox::run(plus, 1, a);
     oox::run([](int &A){ A = 2; }, a);
     ASSERT_EQ(oox::wait_and_get(a), 2);
@@ -103,7 +103,7 @@ TEST(OOX, Wavefront) {
     ASSERT_EQ(lcs0, lcs1);
 }
 
-TEST(OOX, DISABLED_Consistency) {
+TEST(OOX, Consistency) {
     auto func = []() -> oox::var<int> {
         return oox::run(std::plus<int>(), 1, 1);
     };
@@ -111,7 +111,7 @@ TEST(OOX, DISABLED_Consistency) {
     ASSERT_EQ(res, 2);
 }
 
-TEST(OOX, DISABLED_ConsistencyInfLoop) {
+TEST(OOX, ConsistencyInfLoop) {
     const oox::var<int> tmp = 1;
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
 }
