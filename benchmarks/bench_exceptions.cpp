@@ -1,0 +1,136 @@
+#include <string>
+#include <benchmark/benchmark.h>
+
+#define STR_(x) #x
+#define STR(x) STR_(x)
+const std::string parallel_str = STR(PARALLEL);
+
+#include "harness_parallel.h"
+
+#include <oox/oox.h>
+#include <exception>
+#include <stdexcept>
+#include <functional>
+
+namespace {
+
+struct dummy_throw : std::exception {
+    const char* what() const noexcept override { return "dummy throw"; }
+};
+
+const std::plus<int> plus{};
+
+constexpr int kMaxN = 65536;
+
+void OOX_Single_NoExcept(benchmark::State& state) {
+    for (auto _ : state) {
+        oox::var<int> a = oox::run([]() -> int { return 1; });
+        benchmark::DoNotOptimize(oox::wait_and_get(a));
+    }
+}
+
+void OOX_Single_Throw(benchmark::State& state) {
+    for (auto _ : state) {
+        oox::var<int> a = oox::run([]() -> int { throw dummy_throw{}; });
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(a));
+        } catch (...) {
+        }
+    }
+}
+
+void OOX_Chain_NoExcept(benchmark::State& state) {
+    const auto N = static_cast<int>(state.range(0));
+    for (auto _ : state) {
+        oox::var<int> x = oox::run([]() -> int { return 1; });
+        for (int i = 0; i < N; ++i) {
+            x = oox::run(plus, 1, x);
+        }
+        benchmark::DoNotOptimize(oox::wait_and_get(x));
+    }
+    state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(N) + 1));
+}
+
+void OOX_Chain_RootThrows(benchmark::State& state) {
+    const auto N = static_cast<int>(state.range(0));
+    for (auto _ : state) {
+        oox::var<int> x = oox::run([]() -> int { throw dummy_throw{}; });
+        for (int i = 0; i < N; ++i) {
+            x = oox::run(plus, 1, x);
+        }
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(x));
+        } catch (...) {
+        }
+    }
+    state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(N) + 1));
+}
+
+void OOX_Diamond_NoExcept(benchmark::State& state) {
+    const auto N = static_cast<int>(state.range(0));
+    for (auto _ : state) {
+        oox::var<int> a = oox::run([]() -> int { return 1; });
+        for (int i = 0; i < N; ++i) {
+            oox::var<int> b = oox::run(plus, 1, a);
+            oox::var<int> c = oox::run(plus, 2, a);
+            a = oox::run([](int x, int y) -> int { return x + y; }, b, c);
+        }
+        benchmark::DoNotOptimize(oox::wait_and_get(a));
+    }
+    state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(3) * N + 1));
+}
+
+void OOX_Diamond_ThrowMiddle(benchmark::State& state) {
+    const auto N = static_cast<int>(state.range(0));
+    const int throw_at = (N > 0) ? (N / 2) : 0;
+
+    for (auto _ : state) {
+        oox::var<int> a = oox::run([]() -> int { return 1; });
+        for (int i = 0; i < N; ++i) {
+            oox::var<int> b = oox::run(plus, 1, a);
+            oox::var<int> c = oox::run(plus, 2, a);
+
+            const bool should_throw = (i == throw_at);
+            a = oox::run([should_throw](int x, int y) -> int {
+                if (should_throw) throw dummy_throw{};
+                return x + y;
+            }, b, c);
+        }
+
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(a));
+        } catch (...) {
+        }
+    }
+    state.SetItemsProcessed(state.iterations() * (3LL * N + 1));
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    benchmark::Initialize(&argc, argv);
+    if (benchmark::ReportUnrecognizedArguments(argc, argv))
+        return 1;
+
+    Harness::InitParallel();
+    printf("Initialized for %d threads\n", Harness::nThreads);
+
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Single_NoExcept").c_str(), OOX_Single_NoExcept)
+        ->UseRealTime()->Unit(benchmark::kNanosecond);
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Single_Throw").c_str(), OOX_Single_Throw)
+        ->UseRealTime()->Unit(benchmark::kNanosecond);
+
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Chain_NoExcept").c_str(), OOX_Chain_NoExcept)
+        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN);
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Chain_RootThrows").c_str(), OOX_Chain_RootThrows)
+        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN);
+
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Diamond_NoExcept").c_str(), OOX_Diamond_NoExcept)
+        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN);
+    benchmark::RegisterBenchmark((parallel_str + ",OOX_Diamond_ThrowMiddle").c_str(), OOX_Diamond_ThrowMiddle)
+        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN);
+
+    benchmark::RunSpecifiedBenchmarks();
+    Harness::DestroyParallel();
+    return 0;
+}
