@@ -772,8 +772,8 @@ std::string get_type(const char *m = "T") {
         s += "const ";
     }
     s += m;
-    if constexpr (std::is_lvalue_reference_v<T>) s.append( "&" );
-    if constexpr (std::is_rvalue_reference_v<T>) s.append( "&&" );
+    if constexpr (std::is_lvalue_reference_v<T>) s += "&";
+    if constexpr (std::is_rvalue_reference_v<T>) s += "&&";
     return s;
 }
 
