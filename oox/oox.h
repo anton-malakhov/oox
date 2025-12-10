@@ -647,6 +647,13 @@ struct oox_var_base {
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
+        // if head == 1, the producer is already "done":
+        // - either a constant storage_task, or
+        // - a completed functional_task.
+        arc* h = current_task->head.load(std::memory_order_acquire);
+        if (h == (arc*)uintptr_t(1)) {
+            return;
+        }
         current_task->wait();
     }
     void release() {
@@ -1008,11 +1015,27 @@ void wait_for_all(internal::oox_var_base& on ) {
 }
 
 template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &&ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(const var<T> &ov) {
+    auto &v = const_cast<var<T>&>(ov);
+    wait_for_all(v);
+
+    // Follow forwarding chain until we reach a non-forward var
+    internal::oox_var_base* base = &v;
+    while (base->is_forward) {
+        __OOX_ASSERT_EX(base->storage_ptr,
+                        "forwarded var has null storage_ptr in wait_and_get");
+        base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
+    }
+
+    __OOX_ASSERT_EX(base->storage_ptr,
+                    "var has null storage_ptr in wait_and_get");
+    return *(T*)base->storage_ptr;
+}
+
 template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 template<typename T>
-[[nodiscard]] T wait_and_get(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
 
