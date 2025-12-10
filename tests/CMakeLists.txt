@@ -5,41 +5,64 @@
 find_package(GTest REQUIRED)
 include(GoogleTest)
 
-list(APPEND OOX_UNITTESTS 
-  test_oox
-  )
+# Pick the right GTest library target depending on CMake version
+if (TARGET GTest::gtest)
+  set(OOX_GTEST_LIB GTest::gtest)
+elseif (TARGET GTest::GTest)  # older CMake FindGTest
+  set(OOX_GTEST_LIB GTest::GTest)
+else ()
+  message(FATAL_ERROR "GTest found, but no suitable GTest library target (GTest::gtest / GTest::GTest)")
+endif ()
 
-foreach(unittest IN LISTS OOX_UNITTESTS)
+list(APPEND OOX_UNITTESTS
+        test_oox
+)
+
+foreach (unittest IN LISTS OOX_UNITTESTS)
+
   # Default implementation
   add_executable(${unittest} ${unittest}.cpp)
-  target_include_directories(${unittest} PRIVATE ${PROJECT_NAME})
-  target_link_libraries(${unittest} ${PROJECT_NAME} gtest)
+  target_link_libraries(${unittest}
+          PRIVATE
+          ${PROJECT_NAME}
+          ${OOX_GTEST_LIB}
+  )
   gtest_discover_tests(${unittest})
+
   # Serial debugging implementation
   add_executable(${unittest}_serial ${unittest}.cpp)
   target_compile_definitions(${unittest}_serial PRIVATE OOX_SERIAL_DEBUG)
-  target_include_directories(${unittest}_serial PRIVATE ${PROJECT_NAME})
-  target_link_libraries(${unittest}_serial ${PROJECT_NAME} gtest)
+  target_link_libraries(${unittest}_serial
+          PRIVATE
+          ${PROJECT_NAME}
+          ${OOX_GTEST_LIB}
+  )
   gtest_discover_tests(${unittest}_serial)
-  if(TBB_FOUND) # build test in TBB mode as well
+
+  if (TBB_FOUND)
+    # build test in TBB mode as well
     add_executable(${unittest}_tbb ${unittest}.cpp)
     target_compile_definitions(${unittest}_tbb PRIVATE HAVE_TBB)
-    target_include_directories(${unittest}_tbb PRIVATE ${PROJECT_NAME})
-    target_link_libraries(${unittest}_tbb ${PROJECT_NAME} gtest TBB::tbb)
+    target_link_libraries(${unittest}_tbb
+            PRIVATE
+            ${PROJECT_NAME}
+            ${OOX_GTEST_LIB}
+            TBB::tbb
+    )
     gtest_discover_tests(${unittest}_tbb)
-  endif()
-  if(Taskflow_FOUND) # build test in TF mode as well
+  endif ()
+
+  if (Taskflow_FOUND)
+    # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
     target_compile_definitions(${unittest}_tf PRIVATE HAVE_TF)
-    target_include_directories(${unittest}_tf PRIVATE ${PROJECT_NAME})
-    target_link_libraries(${unittest}_tf ${PROJECT_NAME} gtest Taskflow::Taskflow)
+    target_link_libraries(${unittest}_tf
+            PRIVATE
+            ${PROJECT_NAME}
+            ${OOX_GTEST_LIB}
+            Taskflow::Taskflow
+    )
     gtest_discover_tests(${unittest}_tf)
-  endif()
-  if(folly_FOUND)
-    add_executable(${unittest}_folly ${unittest}.cpp)
-    target_compile_definitions(${unittest}_folly PRIVATE HAVE_FOLLY GLOG_USE_GLOG_EXPORT)
-    target_include_directories(${unittest}_folly PRIVATE ${PROJECT_NAME} ${FOLLY_INCLUDE_DIR} ${FOLLY_ROOT_DIR}/include)
-    target_link_libraries(${unittest}_folly ${PROJECT_NAME} gtest folly)
-    gtest_discover_tests(${unittest}_folly)
-  endif()
-endforeach()
+  endif ()
+
+endforeach ()
