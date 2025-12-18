@@ -7,7 +7,8 @@ include(GoogleTest)
 
 list(APPEND OOX_UNITTESTS 
   test_oox
-  )
+  test_reduce
+)
 
 foreach(unittest IN LISTS OOX_UNITTESTS)
   # Default implementation

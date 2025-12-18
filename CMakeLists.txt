@@ -7,7 +7,7 @@ MESSAGE(STATUS "CMAKE_ROOT=" ${CMAKE_ROOT})
 
 # Project name
 project(OOX VERSION 0.2.0 LANGUAGES CXX)
-set (CMAKE_CXX_STANDARD 20)
+SET(CMAKE_CXX_STANDARD 20)
 
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
