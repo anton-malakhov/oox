@@ -39,8 +39,6 @@
 #define __OOX_ASSERT_EX(a, b) __OOX_ASSERT(a, b)
 #endif
 
-#define __OOX_AUTO_TYPE_FUNC(expr) ->decltype(expr) { return expr; }
-
 namespace oox {
 
 #if OOX_SERIAL_DEBUG //////////////////// Immediate execution //////////////////////////////////
@@ -50,7 +48,7 @@ class node {
 
 template<typename T>
 struct var : public node {
-    static_assert(std::is_same<T, typename std::decay<T>::type>::value,
+    static_assert(std::is_same_v<T, std::decay_t<T>>,
                   "Specialize oox::var only by plain types."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
@@ -60,7 +58,7 @@ struct var : public node {
     var(T&& t)      noexcept : my_value( std::move(t) ) { }
     var(var<T>&& t) : my_value( std::move(t.my_value) ) { }
     var& operator=(var<T>&& t) { my_value = std::move(t.my_value); return *this; }
-    T get() { return my_value; }
+    [[nodiscard]] T get() { return my_value; }
 };
 
 template<>
@@ -69,7 +67,7 @@ struct var<void> : public node {
 };
 
 template< typename T > // create temporary copies to simulate parallel implementation
-typename std::decay<T>::type unoox(T&& t) { return typename std::decay<T>::type(std::forward<T>(t)); }
+std::decay_t<T> unoox(T&& t) { return std::decay_t<T>(std::forward<T>(t)); }
 
 template< typename T >
 const T& unoox(const var<T>& t) { return t.my_value; }
@@ -82,33 +80,33 @@ T&& unoox(var<T>&& t) { return std::move(t.my_value); }
 
 template< typename T >
 struct gen_oox {
-    typedef var<typename std::decay<T>::type> type;
+    using type = var<std::decay_t<T>>;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { return type(std::forward<F>(f)(std::forward<Args>(args)...)); }
 };
 template< typename VT >
 struct gen_oox<var<VT> > {
-    typedef var<VT> type;
+    using type = var<VT>;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { return std::forward<F>(f)(std::forward<Args>(args)...); }
 };
 template<>
 struct gen_oox<void> {
-    typedef node type;
+    using type = node;
     template< typename F, typename... Args >
     static type run(F&& f, Args&&... args) { std::forward<F>(f)(std::forward<Args>(args)...); return node(); }
 };
 template< typename T> using var_type = typename gen_oox<T>::type;
 
 template< typename F, typename... Args >
-auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(args))...))>
+[[nodiscard]] auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(args))...))>
 {
     return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
     ::run(std::forward<F>(f), unoox(std::forward<Args>(args))...);
 }
 
 template<typename T>
-T wait_and_get(const var<T> &ov) { return ov.my_value; }
+[[nodiscard]] T wait_and_get(const var<T> &ov) { return ov.my_value; }
 
 void wait_for_all(node &) {}
 
@@ -119,7 +117,7 @@ namespace internal {
 struct task_life {
     // Pointers to this structure and live output nodes
     std::atomic<int> life_count;
-    virtual ~task_life() {}
+    virtual ~task_life() = default;
 
     void life_set_count(int lifetime) {
         life_count.store(lifetime, std::memory_order_release);
@@ -158,8 +156,8 @@ struct __openmp_initializer_t {
 } __openmp_initializer_t;
 
 struct task : task_life {
-    
-    virtual ~task() {}
+
+    virtual ~task() = default;
     virtual void* execute() = 0;
 
     void release( int n = 1 ) {
@@ -201,7 +199,7 @@ struct task : public tbb_task, task_life {
             waiter.release();
     }
 #else
-    virtual ~task() {}
+    virtual ~task() = default;
 #endif
 
     TASK_EXECUTE_METHOD {
@@ -254,10 +252,10 @@ struct task : public tbb_task, task_life {
 tf::Executor tf_pool; // TODO :)
 
 struct task : task_life {
-    
+
     std::promise<void> waiter;
 
-    virtual ~task() {}
+    virtual ~task() = default;
     virtual void* execute() = 0;
 
     void release( int n = 1 ) {
@@ -303,7 +301,7 @@ struct task : task_life {
 
     folly::fibers::Baton baton;
 
-    virtual ~task() {}
+    virtual ~task() = default;
     virtual void* execute() = 0;
 
     void release( int n = 1 ) {
@@ -333,7 +331,7 @@ struct task : task_life {
 struct task : task_life {
     std::promise<void> waiter;
 
-    virtual ~task() {}
+    virtual ~task() = default;
     virtual void* execute() = 0;
 
     void release( int n = 1 ) {
@@ -382,7 +380,7 @@ struct arc {
         flow_copy,    //< call consumer to copy its value when producer is completed
         forward_copy  //< copy a pointer to the var storage found by producer to consumer
     };
-    typedef short int port_int;
+    using port_int = short int;
     arc*       next;
     task_node* node;
     port_int   port;
@@ -407,7 +405,7 @@ struct task_node : public task, arc_list {
     // TODO: exception storage here?
 
     task_node() { } // prepare the task for waiting on it directly
-    virtual ~task_node() {}
+    virtual ~task_node() = default;
 
     // Result output node
     inline output_node& out(int n) const;
@@ -611,7 +609,7 @@ struct task_node_slots : task_node {
 __attribute__((no_sanitize("undefined")))
 #endif
 output_node& task_node::out(int n) const {
-    typedef task_node_slots<1024> self_t;
+    using self_t = task_node_slots<1024>;
     auto self = const_cast<self_t*>(reinterpret_cast<const self_t*>(this));
     return self->output_nodes[n];
 }
@@ -718,13 +716,13 @@ template< typename T > struct gen_oox;
 
 template< typename T >
 class var : public internal::oox_var_base {
-    static_assert(std::is_same<T, typename std::decay<T>::type>::value,
+    static_assert(std::is_same_v<T, std::decay_t<T>>,
                   "Specialize oox::var only by plain types and pointers."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
 
     void* allocate_new() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, typename std::aligned_storage<sizeof(T), alignof(T)>::type >>();
+        auto *v = internal::task::allocate<internal::storage_task<1, std::aligned_storage_t<sizeof(T), alignof(T)>>>();
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         v->head.store((internal::arc*)uintptr_t(1), std::memory_order_release);
@@ -746,7 +744,7 @@ public:
         return *this;
     }
     ~var() { release(); }
-    T get() {
+    [[nodiscard]] T get() {
         wait();
         return *(T*)storage_ptr;
     }
@@ -764,16 +762,18 @@ public:
     }
 };
 
-typedef var<void> node;
+using node = var<void>;
 
 namespace internal {
 template< typename T >
 std::string get_type(const char *m = "T") {
-    std::string s = (std::is_const<typename std::remove_reference<T>::type>::value
-            || std::is_const<T>::value)? "const " : "";
-    s.append( m );
-    if(std::is_lvalue_reference<T>::value) s.append( "&" );
-    if(std::is_rvalue_reference<T>::value) s.append( "&&" );
+    std::string s;
+    if constexpr (std::is_const_v<std::remove_reference_t<T>> || std::is_const_v<T>) {
+        s += "const ";
+    }
+    s += m;
+    if constexpr (std::is_lvalue_reference_v<T>) s += "&";
+    if constexpr (std::is_rvalue_reference_v<T>) s += "&&";
     return s;
 }
 
@@ -790,12 +790,12 @@ template< typename IgnoredTypes > struct base_args<IgnoredTypes> {
 
 template< typename T, typename... Types, typename A, typename... Args >
 struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Args...> {
-    typedef base_args<types<Types...>, Args...> base_type;
+    using base_type = base_args<types<Types...>, Args...>;
 
-    typename std::decay<A>::type my_value;
+    std::decay_t<A> my_value;
 
     base_args( A&& a, Args&&... args ) : base_type( std::forward<Args>(args)... ), my_value(std::forward<A>(a)) {}
-    typename std::decay<A>::type&& consume() { return std::move(my_value); }
+    std::decay_t<A>&& consume() { return std::move(my_value); }
     static constexpr int write_nodes_count = base_type::write_nodes_count;
     int setup( int port, internal::task_node *self, A&& a, Args&&... args ) {
         //__OOX_ASSERT(my_value == a, "");
@@ -806,15 +806,15 @@ struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Ar
 template< typename Types, typename... Args > struct oox_var_args;
 template< typename T, typename... Types, typename C, typename... Args >
 struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>, Args...> {
-    typedef base_args<types<Types...>, Args...> base_type;
-    typedef typename  std::decay<C>::type      ooxed_type;
-    typedef var<ooxed_type>                var_type;
+    using base_type = base_args<types<Types...>, Args...>;
+    using ooxed_type = std::decay_t<C>;
+    using var_type = var<ooxed_type>;
 
     uintptr_t my_ptr;
     // TODO: copy-based optimizations
     oox_var_args( const var_type& cov, Args&&... args ) : base_type( std::forward<Args>(args)... ) {}
-    static constexpr int is_writer = (std::is_rvalue_reference<C>::value
-        || (std::is_lvalue_reference<T>::value && !std::is_const<typename std::remove_reference<T>::type>::value))? 1 : 0;
+    static constexpr int is_writer = (std::is_rvalue_reference_v<C>
+        || (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>))? 1 : 0;
     static constexpr int write_nodes_count = base_type::write_nodes_count + is_writer;
 
     int setup( int port, internal::task_node *self, const var_type& cov, Args&&... args ) {
@@ -832,7 +832,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             my_ptr = 1|(uintptr_t)&next.storage_ptr;
         } else
             my_ptr = (uintptr_t)cov.storage_ptr;
-        //TODO: broken? if( !std::is_lvalue_reference<C>::value ) // consume oox::var
+        //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
         //    ov.~var(); // TODO: no need in sync for not yet published task
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
@@ -856,30 +856,30 @@ struct base_args<types<T, Types...>, var<A>&&, Args...> : oox_var_args<types<T, 
 };
 
 template< typename F, typename... Preceding, typename Args >
-auto apply_args( F&& f, Args&& pack, Preceding&&... params )
-__OOX_AUTO_TYPE_FUNC((
-    apply_args( std::forward<F>(f), std::forward<typename Args::base_type>(pack),
-                std::forward<Preceding>(params)..., pack.consume() )
-))
+auto apply_args( F&& f, Args&& pack, Preceding&&... params ) {
+    return apply_args(std::forward<F>(f),
+                      std::forward<typename Args::base_type>(pack),
+                      std::forward<Preceding>(params)...,
+                      pack.consume());
+}
 
 template< typename F, typename... Preceding, typename Last >
-auto apply_args( F&& f, base_args<Last>&&/*pack*/, Preceding&&... params )
-__OOX_AUTO_TYPE_FUNC((
-    std::forward<F>( f )( std::forward<Preceding>(params)... )
-))
+auto apply_args( F&& f, base_args<Last>&& /*pack*/, Preceding&&... params ) {
+    return std::forward<F>(f)(std::forward<Preceding>(params)...);
+}
 
 template< typename F, typename Args >
 struct oox_bind {
     F my_func;
     Args my_args;
     oox_bind(F&& f, Args&& a) : my_func(std::forward<F>(f)), my_args(std::move(a)) {}
-    auto operator()() __OOX_AUTO_TYPE_FUNC(( apply_args(std::move(my_func), std::move(my_args))  ))
+    auto operator()() { return apply_args(std::move(my_func), std::move(my_args)); }
 };
 
 template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
-    typename std::aligned_storage<sizeof(R), alignof(R)>::type my_result;
+    std::aligned_storage_t<sizeof(R), alignof(R)> my_result;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
         new(&my_result) R( this->my_precious() );
@@ -906,7 +906,7 @@ template<int slots, typename F, typename VT> // forwarding task
 struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
     using storage_task<slots, F>::storage_task;
-    typename std::aligned_storage< sizeof(var<VT>), alignof(var<VT>) >::type my_result;
+    std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed = false;
     TASK_EXECUTE_METHOD {
 #if 0
@@ -938,7 +938,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
 
 template< typename T >
 struct gen_oox {
-    typedef var<T> type;
+    using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
         type oox; oox.bind_to( t, &t->my_result, slots+1 ); return oox;
@@ -946,7 +946,7 @@ struct gen_oox {
 };
 template<>
 struct gen_oox<void> {
-    typedef var<void> type;
+    using type = var<void>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, void> * t) {
         type oox; oox.bind_to( t, t, slots ); return oox;
@@ -954,7 +954,7 @@ struct gen_oox<void> {
 };
 template< typename VT >
 struct gen_oox<var<VT> > {
-    typedef var<VT> type;
+    using type = var<VT>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
         type oox; oox.bind_to( t, &t->my_result, slots+1, true ); return oox;
@@ -965,8 +965,8 @@ using var_type = typename gen_oox<T>::type;
 
 template< typename R, typename... Types >
 struct functor_info {
-    typedef R result_type;
-    typedef types<Types...> args_list_type;
+    using result_type = R;
+    using args_list_type = types<Types...>;
 };
 template< typename R, typename... Args >
 functor_info<R, Args...> get_functor_info(R (&)(Args...)) { return functor_info<R, Args...>(); }
@@ -975,7 +975,7 @@ functor_info<R, Args...> get_functor_info(R (C::*)(Args...)) { return functor_in
 template< typename R, typename C, typename... Args >
 functor_info<R, Args...> get_functor_info(R (C::*)(Args...) const) { return functor_info<R, Args...>(); }
 template< typename F >
-auto get_functor_info(F&&) __OOX_AUTO_TYPE_FUNC(( get_functor_info( &std::remove_reference<F>::type::operator() ) ))
+auto get_functor_info(F&&) { return get_functor_info( &std::remove_reference_t<F>::operator() ); }
 template< typename F >
 using result_type_of = typename decltype( get_functor_info(std::declval<F>()) )::result_type;
 template< typename F >
@@ -984,13 +984,13 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 } //namespace internal
 
 template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+[[nodiscard]] auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
 {
-    typedef internal::result_type_of<F>                      r_type;
-    typedef internal::args_list_of<F>                call_args_type;
-    typedef internal::base_args<call_args_type, Args&&...> args_type;
-    typedef internal::oox_bind<F, args_type>           functor_type;
-    typedef internal::functional_task<args_type::write_nodes_count, functor_type, r_type> task_type;
+    using r_type = internal::result_type_of<F>;
+    using call_args_type = internal::args_list_of<F>;
+    using args_type = internal::base_args<call_args_type, Args&&...>;
+    using functor_type = internal::oox_bind<F, args_type>;
+    using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
@@ -1008,11 +1008,11 @@ void wait_for_all(internal::oox_var_base& on ) {
 }
 
 template<typename T>
-T wait_and_get(var<T> &&ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &&ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
 template<typename T>
-T wait_and_get(var<T> &ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
 template<typename T>
-T wait_and_get(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); return *(T*)ov.storage_ptr; }
 
 #undef TASK_EXECUTE_METHOD
 

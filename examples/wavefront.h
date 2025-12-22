@@ -13,8 +13,7 @@ const char input2[] = "has 100 line input, and each line has ave 60k chars. It n
 namespace Serial {
 int LCS( const char* x, size_t xlen, const char* y, size_t ylen )
 {
-    int F[MAX_LEN+1][MAX_LEN+1];
-
+    int F[MAX_LEN+1][MAX_LEN+1] = {};
     for( size_t i=1; i<=xlen; ++i )
         for( size_t j=1; j<=ylen; ++j )
             F[i][j] = x[i-1]==y[j-1] ? F[i-1][j-1]+1 : std::max(F[i][j-1],F[i-1][j]);
