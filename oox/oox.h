@@ -41,76 +41,8 @@
 
 namespace oox {
 
-#if OOX_SERIAL_DEBUG //////////////////// Immediate execution //////////////////////////////////
-class node {
-    node &operator=(const node &) = delete;
-};
-
-template<typename T>
-struct var : public node {
-    static_assert(std::is_same_v<T, std::decay_t<T>>,
-                  "Specialize oox::var only by plain types."
-                  "For references, use reference_wrapper,"
-                  "for const types use shared_ptr<T>.");
-    T my_value;
-    var() : my_value() {}
-    var(const T& t) noexcept : my_value( t ) {}
-    var(T&& t)      noexcept : my_value( std::move(t) ) { }
-    var(var<T>&& t) : my_value( std::move(t.my_value) ) { }
-    var& operator=(var<T>&& t) { my_value = std::move(t.my_value); return *this; }
-    [[nodiscard]] T get() { return my_value; }
-};
-
-template<>
-struct var<void> : public node {
-    var() {}
-};
-
-template< typename T > // create temporary copies to simulate parallel implementation
-std::decay_t<T> unoox(T&& t) { return std::decay_t<T>(std::forward<T>(t)); }
-
-template< typename T >
-const T& unoox(const var<T>& t) { return t.my_value; }
-
-template< typename T >
-T& unoox(var<T>& t) { return t.my_value; }
-
-template< typename T >
-T&& unoox(var<T>&& t) { return std::move(t.my_value); }
-
-template< typename T >
-struct gen_oox {
-    using type = var<std::decay_t<T>>;
-    template< typename F, typename... Args >
-    static type run(F&& f, Args&&... args) { return type(std::forward<F>(f)(std::forward<Args>(args)...)); }
-};
-template< typename VT >
-struct gen_oox<var<VT> > {
-    using type = var<VT>;
-    template< typename F, typename... Args >
-    static type run(F&& f, Args&&... args) { return std::forward<F>(f)(std::forward<Args>(args)...); }
-};
-template<>
-struct gen_oox<void> {
-    using type = node;
-    template< typename F, typename... Args >
-    static type run(F&& f, Args&&... args) { std::forward<F>(f)(std::forward<Args>(args)...); return node(); }
-};
-template< typename T> using var_type = typename gen_oox<T>::type;
-
-template< typename F, typename... Args >
-[[nodiscard]] auto run(F&& f, Args&&... args)->var_type<decltype(f(unoox(std::forward<Args>(args))...))>
-{
-    return gen_oox<decltype(f(unoox(std::forward<Args>(args))...))>
-    ::run(std::forward<F>(f), unoox(std::forward<Args>(args))...);
-}
-
-template<typename T>
-[[nodiscard]] T wait_and_get(const var<T> &ov) { return ov.my_value; }
-
-void wait_for_all(node &) {}
-
-#else ///////////////////////////////// Parallel execution  ///////////////////////////////////
+struct deferred_t { explicit constexpr deferred_t(int = 0) {} };
+inline constexpr deferred_t deferred{};
 
 namespace internal {
 
@@ -141,7 +73,44 @@ struct task_life {
     }
 };
 
-#if HAVE_OMP ///////////////////////// OpenMP ///////////////////////////////////////////
+#if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
+
+#define OOX_USING_SERIAL
+#define TASK_EXECUTE_METHOD void* execute() override
+
+    struct task : task_life {
+
+        virtual ~task() {}
+        virtual void* execute() = 0;
+
+        void release(int n = 1) {
+            if (life_release(n)) {
+                delete this;
+            }
+        }
+
+        template<typename T, typename... Args>
+        static T* allocate(Args&&... args) {
+            return new T(std::forward<Args>(args)...);
+        }
+
+        // SERIAL: run synchronously in the current thread
+        void spawn() {
+            this->execute();
+        }
+
+        // SERIAL: nothing to wait for, execute() already ran in spawn()
+        void wait() {
+
+        }
+
+        void wakeup() {
+
+        }
+    };
+
+///////////////////////////////// Parallel execution  ///////////////////////////////////
+#elif HAVE_OMP ///////////////////////// OpenMP ///////////////////////////////////////////
 #define OOX_USING_OMP
 #define TASK_EXECUTE_METHOD void* execute() override
 jmp_buf __openmp_ctx;
@@ -603,6 +572,7 @@ void task_node::notify_successors() {
 template<int slots>
 struct task_node_slots : task_node {
     output_node output_nodes[slots];
+    TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
 };
 
 #if defined(__clang__)
@@ -633,9 +603,28 @@ struct oox_var_base {
     int         storage_offset; // task_node* original = ptr - offset
     short int   current_port = 0; // the problem can arise from concurrent accesses to oox::var, TODO: check
     bool        is_forward = false;  // indicate if it refers to another oox::var recursively
+    bool        is_deferred = false; // created via oox::deferred and not yet “bound” to a writer
 
     void set_next_writer( int output_port, task_node* d ) {
         __OOX_ASSERT(current_task, "empty oox::var");
+
+        // If this var was created as deferred, tasks may already be waiting on the
+        // deferred storage node (current_task/current_port). The first real writer
+        // must inherit those waiting arcs, otherwise readers would never be notified.
+        //
+        // Also, we must retarget arc->port to the writer's output port, so that
+        // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
+        if (is_deferred) {
+            arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            while(r && r != (arc*)uintptr_t(1)) {
+                    arc* j = r;
+                    r = j->next;
+                    j->port = arc::port_int(output_port);
+                    bool ok = d->add_arc(j);
+                    __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
+                }
+            is_deferred = false;
+        }
         current_task->set_next_writer( current_port, d );
         current_task = d, current_port = output_port;
     }
@@ -647,6 +636,13 @@ struct oox_var_base {
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
+        // if head == 1, the producer is already "done":
+        // - either a constant storage_task, or
+        // - a completed functional_task.
+        arc* h = current_task->head.load(std::memory_order_acquire);
+        if (h == (arc*)uintptr_t(1)) {
+            return;
+        }
         current_task->wait();
     }
     void release() {
@@ -731,8 +727,22 @@ class var : public internal::oox_var_base {
         return storage_ptr;
     }
 
+    void* allocate_deferred() noexcept {
+        using dummy_t = std::byte;
+        auto *v = internal::task::allocate<internal::storage_task<1, std::aligned_storage_t<sizeof(dummy_t), alignof(dummy_t)>>>();
+        __OOX_TRACE("%p oox::var(deferred)", v);
+        // Make writers behave like for a normal initial value (next_writer=1),
+        // BUT do NOT mark the node completed (head stays nullptr), so readers block.
+        v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
+        // v->head is intentionally left as nullptr (not ready)
+        this->bind_to(v, &v->my_precious, 2);
+        this->is_deferred = true;
+        return storage_ptr;
+    }
+
 public:
     var()                    { } // allocates default value lazily for sake of optimization
+    var(deferred_t)          { new(allocate_deferred()) T(); } // storage exists, but value is not ready
     var(const T& t) noexcept { new(allocate_new()) T( t ); } // TODO: add exception-safe
     var(T&& t)      noexcept { new(allocate_new()) T( std::move(t) ); }
     var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
@@ -1008,15 +1018,27 @@ void wait_for_all(internal::oox_var_base& on ) {
 }
 
 template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &&ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(const var<T> &ov) {
+    auto &v = const_cast<var<T>&>(ov);
+    wait_for_all(v);
+
+    // Follow forwarding chain until we reach a non-forward var
+    internal::oox_var_base* base = &v;
+    while (base->is_forward) {
+        __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
+        base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
+    }
+
+    __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
+    return *static_cast<T *>(base->storage_ptr);
+}
+
 template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &ov) { wait_for_all(ov); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 template<typename T>
-[[nodiscard]] T wait_and_get(const var<T> &ov) { wait_for_all(const_cast<var<T>&>(ov)); return *(T*)ov.storage_ptr; }
+[[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
-
-#endif // !OOX_SERIAL
 
 } // namespace oox
 #endif // __OOX_H__

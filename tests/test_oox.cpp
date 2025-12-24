@@ -17,6 +17,7 @@ bool g_oox_verbose = false;
 #include <iostream>
 #include <numeric>
 #include <vector>
+#include <functional>
 
 /////////////////////////////////////// EXAMPLES ////////////////////////////////////////
 
@@ -54,7 +55,7 @@ namespace ArchSample {
 #define OOX OOX_STD
 #endif
 
-int plus(int a, int b) { return a+b; }
+auto plus = std::plus<int>();
 
 TEST(OOX, Simple) {
     const oox::var<int> a = oox::run(plus, 2, 3);
@@ -103,7 +104,7 @@ TEST(OOX, Wavefront) {
     ASSERT_EQ(lcs0, lcs1);
 }
 
-TEST(OOX, DISABLED_Consistency) {
+TEST(OOX, Consistency) {
     auto func = []() -> oox::var<int> {
         return oox::run(std::plus<int>(), 1, 1);
     };
@@ -111,11 +112,10 @@ TEST(OOX, DISABLED_Consistency) {
     ASSERT_EQ(res, 2);
 }
 
-TEST(OOX, DISABLED_ConsistencyInfLoop) {
+TEST(OOX, ConsistencyInfLoop) {
     const oox::var<int> tmp = 1;
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
 }
-
 
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
