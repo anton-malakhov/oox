@@ -103,7 +103,7 @@ TEST(OOX, Wavefront) {
     ASSERT_EQ(lcs0, lcs1);
 }
 
-TEST(OOX, DISABLED_Consistency) {
+TEST(OOX, Consistency) {
     auto func = []() -> oox::var<int> {
         return oox::run(std::plus<int>(), 1, 1);
     };
@@ -111,11 +111,10 @@ TEST(OOX, DISABLED_Consistency) {
     ASSERT_EQ(res, 2);
 }
 
-TEST(OOX, DISABLED_ConsistencyInfLoop) {
+TEST(OOX, ConsistencyInfLoop) {
     const oox::var<int> tmp = 1;
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
 }
-
 
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
