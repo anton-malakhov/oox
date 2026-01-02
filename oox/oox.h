@@ -742,9 +742,17 @@ class var : public internal::oox_var_base {
 
 public:
     var()                    { } // allocates default value lazily for sake of optimization
-    var(deferred_t)          { new(allocate_deferred()) std::optional<T>(); } // storage exists, but value is not ready
-    var(const T& t) noexcept { new(allocate_new()) std::optional<T>( t ); } // TODO: add exception-safe
-    var(T&& t)      noexcept { new(allocate_new()) std::optional<T>( std::move(t) ); }
+    var(deferred_t) {
+        allocate_deferred(); // storage exists, but value is not ready
+    }
+    var(const T& t) noexcept {
+        auto* opt = static_cast<std::optional<T>*>(allocate_new());
+        opt->emplace(t); // TODO: add exception-safe
+    }
+    var(T&& t)      noexcept {
+        auto* opt = static_cast<std::optional<T>*>(allocate_new());
+        opt->emplace(std::move(t));
+    }
     var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
     var& operator=(var<T>&& t) {
         release();
