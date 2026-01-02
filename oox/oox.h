@@ -617,13 +617,13 @@ struct oox_var_base {
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (is_deferred) {
             arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
-            while(r && r != (arc*)uintptr_t(1)) {
-                    arc* j = r;
-                    r = j->next;
-                    j->port = arc::port_int(output_port);
-                    bool ok = d->add_arc(j);
-                    __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
-                }
+            while(r > (arc*)uintptr_t(1)) {
+                arc* j = r;
+                r = j->next;
+                j->port = arc::port_int(output_port);
+                bool ok = d->add_arc(j);
+                __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
+            }
             is_deferred = false;
         }
         current_task->set_next_writer( current_port, d );
@@ -756,7 +756,7 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
-        return **static_cast<std::optional<T>*>(storage_ptr);
+        return static_cast<std::optional<T>*>(storage_ptr)->value();
     }
 };
 
@@ -847,9 +847,24 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        if( my_ptr&1 ) // is forwarded?
-             return static_cast<C&&>(**(ooxed_type**)(my_ptr^1));
-        else return static_cast<C&&>(*(ooxed_type*)my_ptr);
+        std::optional<ooxed_type>* opt = nullptr;
+        if( my_ptr & 1 ) {
+            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
+            opt = static_cast<std::optional<ooxed_type>*>(p);
+        } else {
+            opt = reinterpret_cast<std::optional<ooxed_type>*>(my_ptr);
+        }
+        __OOX_ASSERT_EX(opt, "null optional storage");
+
+        if constexpr (
+            std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+            if(!opt->has_value()) {
+                opt->emplace(); // requires default-constructible T
+            }
+        } else {
+            __OOX_ASSERT_EX(opt->has_value(), "read from empty optional");
+        }
+        return static_cast<C&&>(opt->value());
     }
 };
 template< typename T, typename... Types, typename A, typename... Args >
@@ -889,16 +904,14 @@ struct oox_bind {
 template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
-    std::aligned_storage_t<sizeof(R), alignof(R)> my_result;
+    std::optional<R> my_result;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        new(&my_result) R( (*this->my_precious)() );
+        my_result.emplace(this->my_precious.value()());
         task_node::notify_successors<slots>();
         return nullptr;
     }
-    ~functional_task() {
-        reinterpret_cast<R*>(&my_result)->~R(); // TODO: what if it was canceled?
-    }
+    ~functional_task() = default;
 };
 
 template<int slots, typename F>
@@ -906,7 +919,7 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        (*this->my_precious)();
+        this->my_precious.value()();
         task_node::notify_successors<slots>();
         return nullptr;
     }
@@ -926,7 +939,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
 #else
         if( !is_executed ) {
             __OOX_TRACE("%p do_run: start forward",this);
-            new(&my_result) var<VT>( (*this->my_precious)() );
+            new(&my_result) var<VT>( this->my_precious.value()() );
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
@@ -1007,7 +1020,7 @@ template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args
     int protect_count = std::numeric_limits<int>::max();
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
-    protect_count -= (*t->my_precious).my_args.setup( 1, t, std::forward<Args>(args)...);
+    protect_count -= t->my_precious.value().my_args.setup( 1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
@@ -1030,8 +1043,7 @@ template<typename T>
     }
 
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
-    auto opt = *static_cast<std::optional<T>*>(base->storage_ptr);
-    return *opt;
+    return static_cast<std::optional<T>*>(base->storage_ptr)->value();
 }
 
 template<typename T>
