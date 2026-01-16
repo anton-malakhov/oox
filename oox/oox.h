@@ -630,8 +630,8 @@ struct oox_var_base {
     void*       storage_ptr{};
     int         storage_offset{}; // task_node* original = ptr - offset
     short int   current_port = 0; // the problem can arise from concurrent accesses to oox::var, TODO: check
-    bool        is_forward = false;  // indicate if it refers to another oox::var recursively
-    bool        is_deferred = false; // created via oox::deferred and not yet “bound” to a writer
+    bool        is_forward : 1 = false; // indicate if it refers to another oox::var recursively
+    bool        is_deferred: 1 = false; // created via oox::deferred and not yet “bound” to a writer
 
     void set_next_writer( int output_port, task_node* d ) {
         __OOX_ASSERT(current_task, "empty oox::var");
@@ -1053,7 +1053,7 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 } //namespace internal
 
 template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-[[nodiscard]] auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
 {
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
