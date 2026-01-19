@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 find_package(GTest REQUIRED)
-set(CMAKE_CTEST_ARGUMENTS --output-on-failure)
 include(GoogleTest)
 
 # Pick the right GTest library target depending on CMake version
