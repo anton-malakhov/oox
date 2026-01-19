@@ -38,6 +38,7 @@ endif ()
 
 # Turn on the verbose
 set(CMAKE_VERBOSE_MAKEFILE ON)
+set(CMAKE_CTEST_ARGUMENTS --output-on-failure)
 
 # Include additional language check
 include(CheckLanguage)
