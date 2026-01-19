@@ -9,10 +9,10 @@
 #include <cassert>
 #include <oox/oox.h>
 
-constexpr int FibN = 28;
-constexpr int max_cutoff = 16;
+constexpr int FibN = 30;
+int cutoff = 8;
+constexpr int max_cutoff = 20;
 constexpr int cutoff_step = 2;
-int cutoff = 2;
 
 namespace Serial { // Original problem statement
 
@@ -37,7 +37,6 @@ namespace OOX2 { // Optimized number and order of tasks
         auto right = oox::run(Fib, n-2);                               // spawn right child
         return oox::run(std::plus<int>(), Fib(n-1), std::move(right)); // assign continuation
     }
-
 }
 
 static void Fib_Serial(benchmark::State& state) {
@@ -172,7 +171,7 @@ namespace TF {
             res = spawn(N, sbf);  
         }); //.name(std::to_string(N));
 
-        executor.run(taskflow).wait();        
+        executor.run(taskflow).wait();
     }
 }
 static void Fib_TF(benchmark::State& state) {
