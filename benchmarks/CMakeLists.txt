@@ -30,7 +30,7 @@ endif()
 if(TBB_FOUND)
   message(STATUS "Building with TBB ${TBB_DIR}")
   list(APPEND OOX_BACKENDS TBB)
-  list(APPEND TBB_LIBS TBB::tbb)
+  list(APPEND TBB_LIBS TBB::tbb TBB::tbbmalloc)
   list(APPEND TBB_LOOP_MODES TBB_SIMPLE TBB_AUTO TBB_AFFINITY TBB_RAPID)
 endif()
 
