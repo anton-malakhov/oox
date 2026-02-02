@@ -1200,7 +1200,7 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> 
 
 inline void wait_for_all(const internal::oox_var_base& on) {
     on.wait();
-    if (on.current_task && on.current_task->has_exception()) {
+    if (on.current_task->has_exception()) {
         std::rethrow_exception(on.current_task->get_exception());
     }
 }
