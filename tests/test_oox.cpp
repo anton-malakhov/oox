@@ -336,7 +336,8 @@ TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {
 
     oox::run([](int& A) { A = 2; }, a);
 
-    ASSERT_EQ(oox::wait_and_get(a), 2);}
+    ASSERT_EQ(oox::wait_and_get(a), 2);
+}
 
 
 int main(int argc, char** argv) {
