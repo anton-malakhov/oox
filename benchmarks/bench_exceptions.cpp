@@ -6,11 +6,8 @@
 const std::string parallel_str = STR(PARALLEL);
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
-#include "harness_parallel.h"
-
 #include <oox/oox.h>
 #include <exception>
-#include <stdexcept>
 #include <functional>
 
 namespace {
@@ -32,20 +29,6 @@ namespace {
 
     constexpr int kMaxN = 65536;
     constexpr int kMinIterations = 10;
-
-    struct ParallelHarnessGuard {
-        ParallelHarnessGuard() {
-            Harness::InitParallel();
-            printf("Initialized for %d threads\n", Harness::nThreads);
-        }
-
-        ~ParallelHarnessGuard() {
-            Harness::DestroyParallel();
-        }
-    };
-
-    const ParallelHarnessGuard kParallelHarness;
-
 
     void OOX_Single_NoExcept(benchmark::State &state) {
         for (auto _: state) {
