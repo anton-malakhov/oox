@@ -7,7 +7,12 @@
 #undef NDEBUG
 #include <benchmark/benchmark.h>
 #include <cassert>
+#include <string>
 #include <oox/oox.h>
+
+#define STR_(x) #x
+#define STR(x) STR_(x)
+const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 constexpr int FibN = 30;
 int cutoff = 8;
