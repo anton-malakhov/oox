@@ -151,22 +151,22 @@ namespace {
 #endif
 } // namespace
 
-BENCHMARK(OOX_Single_NoExcept)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations);
+BENCHMARK(OOX_Single_NoExcept)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
 #if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Single_Throw)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations);
+BENCHMARK(OOX_Single_Throw)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
 #endif
 
-BENCHMARK(OOX_Chain_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN)->
+BENCHMARK(OOX_Chain_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Chain_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN)->
+BENCHMARK(OOX_Chain_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #endif
 
-BENCHMARK(OOX_Diamond_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN)->
+BENCHMARK(OOX_Diamond_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, kMaxN)->
+BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #endif
 

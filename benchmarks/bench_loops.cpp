@@ -40,8 +40,8 @@ int main(int argc, char** argv) {
     Harness::InitParallel();
     //printf("Initialized for %d threads\n", Harness::nThreads);
 
-    benchmark::RegisterBenchmark((parallel_str + "," + policy_str + ",Loop1").c_str(), Loop1)
-        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, 262144);
+benchmark::RegisterBenchmark((parallel_str + "," + policy_str + ",Loop1").c_str(), Loop1)
+        ->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, 262144);
     //benchmark::RegisterBenchmark((parallel_str+",Loop2").c_str(), Loop2)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(64, 262144);
 
     benchmark::RunSpecifiedBenchmarks();
