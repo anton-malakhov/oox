@@ -10,8 +10,9 @@
 #include <type_traits>
 #include <limits>
 #include <atomic>
-#include <optional>
+#include <exception>
 #include <thread>
+#include <variant>
 
 #if HAVE_OMP
 #include <omp.h>
@@ -72,6 +73,71 @@ struct task_life {
             __OOX_ASSERT(k >= 0, "invalid life_count detected while removing prerequisite");
             return (k == 0);          // double-check after atomic
         }
+    }
+};
+
+struct result_state_base {
+    virtual ~result_state_base() = default;
+    virtual void set_exception(std::exception_ptr ep) noexcept = 0;
+    virtual bool has_exception() const noexcept = 0;
+    virtual std::exception_ptr get_exception() const noexcept = 0;
+};
+
+template<typename T>
+struct result_state : result_state_base {
+    using value_type = T;
+    using variant_type = std::variant<std::monostate, T, std::exception_ptr>;
+
+    variant_type state;
+
+    void set_exception(std::exception_ptr ep) noexcept override {
+        state.template emplace<std::exception_ptr>(std::move(ep));
+    }
+    bool has_exception() const noexcept override {
+        return std::holds_alternative<std::exception_ptr>(state);
+    }
+    std::exception_ptr get_exception() const noexcept override {
+        if (std::holds_alternative<std::exception_ptr>(state)) {
+            return std::get<std::exception_ptr>(state);
+        }
+        return std::exception_ptr{};
+    }
+
+    template<typename... Args>
+    void emplace(Args&&... args) {
+        state.template emplace<T>(std::forward<Args>(args)...);
+    }
+    bool has_value() const noexcept {
+        return std::holds_alternative<T>(state);
+    }
+    T& value() {
+        __OOX_ASSERT_EX(has_value(), "read from empty result_state");
+        return std::get<T>(state);
+    }
+    const T& value() const {
+        __OOX_ASSERT_EX(has_value(), "read from empty result_state");
+        return std::get<T>(state);
+    }
+};
+
+template<>
+struct result_state<void> : result_state_base {
+    using variant_type = std::variant<std::monostate, std::exception_ptr>;
+
+    variant_type state;
+
+    void set_value() noexcept {}
+    void set_exception(std::exception_ptr ep) noexcept override {
+        state.template emplace<std::exception_ptr>(std::move(ep));
+    }
+    bool has_exception() const noexcept override {
+        return std::holds_alternative<std::exception_ptr>(state);
+    }
+    std::exception_ptr get_exception() const noexcept override {
+        if (std::holds_alternative<std::exception_ptr>(state)) {
+            return std::get<std::exception_ptr>(state);
+        }
+        return std::exception_ptr{};
     }
 };
 
@@ -374,25 +440,61 @@ struct task_node : public task, arc_list {
     // Prerequisites to start the task
     std::atomic<int> start_count;
 
-    std::exception_ptr exception_;
-    std::atomic<unsigned char> exc_state{0};
-    // 0 = no exception, 1 = being set, 2 = set
+    std::atomic<uintptr_t> result_ptr_tagged{0};
+    static constexpr uintptr_t exception_tag_mask = 0x3;
+    static constexpr uintptr_t exception_tag_setting = 0x1;
+    static constexpr uintptr_t exception_tag_set = 0x2;
+
+    static uintptr_t strip_exception_tag(uintptr_t value) noexcept {
+        return value & ~exception_tag_mask;
+    }
+
+    template<typename ResultState>
+    void bind_result_state(ResultState* state) noexcept {
+        result_state_base* base = state;
+        uintptr_t raw = reinterpret_cast<uintptr_t>(base);
+        __OOX_ASSERT_EX((raw & exception_tag_mask) == 0, "result_state pointer not aligned for tagging");
+        result_ptr_tagged.store(raw, std::memory_order_release);
+    }
 
     void set_exception(const std::exception_ptr& ep) noexcept {
-        unsigned char expected = 0;
-        if (exc_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
-            exception_ = ep;
-            exc_state.store(2, std::memory_order_release);
+        uintptr_t current = result_ptr_tagged.load(std::memory_order_acquire);
+        if (strip_exception_tag(current) == 0) {
+            return;
+        }
+        while ((current & exception_tag_mask) == 0) {
+            uintptr_t desired = current | exception_tag_setting;
+            if (result_ptr_tagged.compare_exchange_strong(current, desired, std::memory_order_acq_rel)) {
+                uintptr_t raw = strip_exception_tag(desired);
+                auto* base = reinterpret_cast<result_state_base*>(raw);
+                base->set_exception(ep);
+                result_ptr_tagged.store(raw | exception_tag_set, std::memory_order_release);
+                return;
+            }
         }
     }
 
     bool has_exception() const noexcept {
-        return exc_state.load(std::memory_order_acquire) != 0;
+        if (strip_exception_tag(result_ptr_tagged.load(std::memory_order_acquire)) == 0) {
+            return false;
+        }
+        return (result_ptr_tagged.load(std::memory_order_acquire) & exception_tag_mask) != 0;
     }
 
     std::exception_ptr get_exception() const noexcept {
-        while (exc_state.load(std::memory_order_acquire) == 1) { std::this_thread::yield(); }
-        return (exc_state.load(std::memory_order_acquire) == 2) ? exception_ : std::exception_ptr{};
+        uintptr_t current = result_ptr_tagged.load(std::memory_order_acquire);
+        if (strip_exception_tag(current) == 0) {
+            return std::exception_ptr{};
+        }
+        while ((current & exception_tag_mask) == exception_tag_setting) {
+            std::this_thread::yield();
+            current = result_ptr_tagged.load(std::memory_order_acquire);
+        }
+        if ((current & exception_tag_mask) == exception_tag_set) {
+            auto* base = reinterpret_cast<result_state_base*>(strip_exception_tag(current));
+            return base->get_exception();
+        }
+        return std::exception_ptr{};
     }
 
     task_node() = default; // prepare the task for waiting on it directly
@@ -614,11 +716,19 @@ output_node& task_node::out(int n) const {
 
 template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots> {
-    std::optional<T> my_precious;
+    result_state<T> my_precious;
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
-    storage_task() = default;
-    explicit storage_task(T&& t) : my_precious(std::move(t)) {}
-    explicit storage_task(const T& t) : my_precious(t) {}
+    storage_task() {
+        this->bind_result_state(&my_precious);
+    }
+    explicit storage_task(T&& t) {
+        this->bind_result_state(&my_precious);
+        my_precious.emplace(std::move(t));
+    }
+    explicit storage_task(const T& t) {
+        this->bind_result_state(&my_precious);
+        my_precious.emplace(t);
+    }
 };
 
 struct oox_var_base {
@@ -773,12 +883,12 @@ public:
         allocate_deferred(); // storage exists, but value is not ready
     }
     var(const T& t) noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(t); // TODO: add exception-safe
+        auto* state = static_cast<internal::result_state<T>*>(allocate_new());
+        state->emplace(t); // TODO: add exception-safe
     }
     var(T&& t)      noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(std::move(t));
+        auto* state = static_cast<internal::result_state<T>*>(allocate_new());
+        state->emplace(std::move(t));
     }
     var(var<T>&& t)  noexcept : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
     var& operator=(var<T>&& t)  noexcept {
@@ -791,7 +901,7 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
-        return static_cast<std::optional<T>*>(storage_ptr)->value();
+        return static_cast<internal::result_state<T>*>(storage_ptr)->value();
     }
 };
 
@@ -873,8 +983,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         } else
             count = self->assign_prerequisite( cov.current_task, cov.current_port );
         if( cov.is_forward ) {
-            oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = 1|(uintptr_t)&next.storage_ptr;
+            my_ptr = 1 | (uintptr_t)cov.storage_ptr;
         } else
             my_ptr = (uintptr_t)cov.storage_ptr;
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
@@ -882,24 +991,29 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        std::optional<ooxed_type>* opt = nullptr;
+        internal::result_state<ooxed_type>* state = nullptr;
         if( my_ptr & 1 ) {
-            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
-            opt = static_cast<std::optional<ooxed_type>*>(p);
+            auto* forward_state = reinterpret_cast<internal::result_state<var_type>*>(my_ptr ^ 1);
+            oox_var_base* next = static_cast<oox_var_base*>(&forward_state->value());
+            while(next->is_forward) {
+                auto* next_state = static_cast<internal::result_state<var_type>*>(next->storage_ptr);
+                next = static_cast<oox_var_base*>(&next_state->value());
+            }
+            state = static_cast<internal::result_state<ooxed_type>*>(next->storage_ptr);
         } else {
-            opt = reinterpret_cast<std::optional<ooxed_type>*>(my_ptr);
+            state = reinterpret_cast<internal::result_state<ooxed_type>*>(my_ptr);
         }
-        __OOX_ASSERT_EX(opt, "null optional storage");
+        __OOX_ASSERT_EX(state, "null result_state storage");
 
         if constexpr (
             std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-            if(!opt->has_value()) {
-                opt->emplace(); // requires default-constructible T
+            if(!state->has_value()) {
+                state->emplace(); // requires default-constructible T
             }
         } else {
-            __OOX_ASSERT_EX(opt->has_value(), "read from empty optional");
+            __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         }
-        return static_cast<C&&>(opt->value());
+        return static_cast<C&&>(state->value());
     }
 };
 template< typename T, typename... Types, typename A, typename... Args >
@@ -938,8 +1052,11 @@ struct oox_bind {
 
 template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
-    std::optional<R> my_result;
+    result_state<R> my_result;
+    template<typename... Args>
+    explicit functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {
+        this->bind_result_state(&my_result);
+    }
     TASK_EXECUTE_METHOD {
         if (!this->has_exception()) {
             try {
@@ -956,12 +1073,17 @@ struct alignas(64) functional_task : storage_task<slots, F> {
 
 template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
+    result_state<void> my_result;
+    template<typename... Args>
+    explicit functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {
+        this->bind_result_state(&my_result);
+    }
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
         if (!this->has_exception()) {
             try {
                 this->my_precious.value()();
+                my_result.set_value();
             } catch(...) {
                 this->set_exception(std::current_exception());
             }
@@ -973,20 +1095,24 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
 
 template<int slots, typename F, typename VT>
 struct functional_task<slots, F, var<VT>> : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
-    var<VT> my_result;       // always constructed, optional is under the hood inside storage task
+    result_state<var<VT>> my_result;
     bool is_executed = false;
+    template<typename... Args>
+    explicit functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {
+        this->bind_result_state(&my_result);
+    }
     TASK_EXECUTE_METHOD {
     if(!this->has_exception()) {
         try {
             if ( !is_executed ) {
                 __OOX_TRACE("%p do_run: start forward",this);
-                my_result = this->my_precious.value()();
+                my_result.emplace(this->my_precious.value()());
                 is_executed = true;
                 this->start_count.store(1, std::memory_order_release);
                 arc* j = new arc(this, 0, arc::flow_only);  // TODO: embed into the task
-                __OOX_ASSERT_EX(my_result.current_task, "forwarding functor returned empty var");
-                if(my_result.current_task->add_arc(j)) {
+                auto& result = my_result.value();
+                __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
+                if(result.current_task->add_arc(j)) {
                     __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
                     return nullptr;
                 } else {
@@ -1089,14 +1215,15 @@ template<typename T>
         if (base->current_task && base->current_task->has_exception()) {
             std::rethrow_exception(base->current_task->get_exception());
         }
-        base = static_cast<internal::oox_var_base*>(base->storage_ptr);
+        auto* forward_state = static_cast<internal::result_state<var<T>>*>(base->storage_ptr);
+        base = static_cast<internal::oox_var_base*>(&forward_state->value());
     }
 
-    // have to rethrow before trying to access optionals value, so we have actual error and not bad optional access
+    // have to rethrow before trying to access result_state value, so we have actual error and not bad access
     if (base->current_task && base->current_task->has_exception()) {
         std::rethrow_exception(base->current_task->get_exception());
     }
-    return static_cast<std::optional<T>*>(base->storage_ptr)->value();
+    return static_cast<internal::result_state<T>*>(base->storage_ptr)->value();
 }
 
 template<typename T>
