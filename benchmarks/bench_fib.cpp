@@ -14,6 +14,13 @@
 #define STR(x) STR_(x)
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
+namespace {
+    const bool kBenchmarkContext = []() {
+        benchmark::AddCustomContext("policy", policy_str);
+        return true;
+    }();
+}
+
 constexpr int FibN = 30;
 int cutoff = 8;
 constexpr int max_cutoff = 20;

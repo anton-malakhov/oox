@@ -7,7 +7,9 @@ const std::string parallel_str = STR(PARALLEL);
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 #include <oox/oox.h>
+#if defined(__cpp_exceptions)
 #include <exception>
+#endif
 #include <functional>
 
 namespace {

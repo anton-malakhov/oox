@@ -10,7 +10,9 @@
 #include <type_traits>
 #include <limits>
 #include <atomic>
+#if defined(__cpp_exceptions)
 #include <exception>
+#endif
 #include <optional>
 #include <thread>
 #include <variant>
@@ -47,6 +49,14 @@ namespace oox {
 
 struct deferred_t { explicit constexpr deferred_t(int = 0) {} };
 inline constexpr deferred_t deferred{};
+
+#if defined(__cpp_exceptions)
+struct cancelled_by_exception final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_exception";
+    }
+};
+#endif
 
 #if defined(OOX_DEFAULT_EXCEPTION_POLICY)
 inline constexpr bool default_exception_policy = (OOX_DEFAULT_EXCEPTION_POLICY != 0);
@@ -85,15 +95,24 @@ struct task_life {
     }
 };
 
+#if defined(__cpp_exceptions)
+inline std::exception_ptr cancelled_exception_ptr() noexcept {
+    static const std::exception_ptr cancelled =
+        std::make_exception_ptr(cancelled_by_exception{});
+    return cancelled;
+}
+#endif
+
+template<typename T, bool CanThrow>
+struct result_state;
+
+#if defined(__cpp_exceptions)
 struct result_state_base {
     virtual ~result_state_base() = default;
     virtual void set_exception(std::exception_ptr ep) noexcept = 0;
     virtual bool has_exception() const noexcept = 0;
     virtual std::exception_ptr get_exception() const noexcept = 0;
 };
-
-template<typename T, bool CanThrow>
-struct result_state;
 
 template<typename T>
 struct result_state<T, true> : result_state_base {
@@ -131,6 +150,7 @@ struct result_state<T, true> : result_state_base {
         return std::get<T>(state);
     }
 };
+#endif
 
 template<typename T>
 struct result_state<T, false> {
@@ -157,6 +177,7 @@ struct result_state<T, false> {
 template<bool CanThrow>
 struct result_state<void, CanThrow>;
 
+#if defined(__cpp_exceptions)
 template<>
 struct result_state<void, true> : result_state_base {
     using variant_type = std::variant<std::monostate, std::exception_ptr>;
@@ -177,6 +198,7 @@ struct result_state<void, true> : result_state_base {
         return std::exception_ptr{};
     }
 };
+#endif
 
 template<>
 struct result_state<void, false> {
@@ -482,6 +504,7 @@ struct task_node : public task, arc_list {
     // Prerequisites to start the task
     std::atomic<int> start_count;
 
+#if defined(__cpp_exceptions)
     std::atomic<uintptr_t> result_ptr_tagged{0};
     static constexpr uintptr_t exception_tag_mask = 0x3;
     static constexpr uintptr_t exception_tag_setting = 0x1;
@@ -490,9 +513,11 @@ struct task_node : public task, arc_list {
     static uintptr_t strip_exception_tag(uintptr_t value) noexcept {
         return value & ~exception_tag_mask;
     }
+#endif
 
     template<typename ResultState>
-    void bind_result_state(ResultState* state) noexcept {
+    void bind_result_state([[maybe_unused]] ResultState* state) noexcept {
+#if defined(__cpp_exceptions)
         if constexpr (std::is_base_of_v<result_state_base, ResultState>) {
             result_state_base* base = state;
             uintptr_t raw = reinterpret_cast<uintptr_t>(base);
@@ -501,8 +526,10 @@ struct task_node : public task, arc_list {
         } else {
             result_ptr_tagged.store(0, std::memory_order_release);
         }
+#endif
     }
 
+#if defined(__cpp_exceptions)
     void set_exception(const std::exception_ptr& ep) noexcept {
         uintptr_t current = result_ptr_tagged.load(std::memory_order_acquire);
         if (strip_exception_tag(current) == 0) {
@@ -542,6 +569,18 @@ struct task_node : public task, arc_list {
         }
         return std::exception_ptr{};
     }
+
+    std::exception_ptr exception_for_port([[maybe_unused]] int port) const noexcept {
+        if (port > 0) {
+            return cancelled_exception_ptr();
+        }
+        return get_exception();
+    }
+#else
+    bool has_exception() const noexcept {
+        return false;
+    }
+#endif
 
     task_node() = default; // prepare the task for waiting on it directly
     ~task_node() override = default;
@@ -597,9 +636,11 @@ inline int task_node::assign_prerequisite( task_node *n, int req_port ) {
         return 1; // Prerequisite n will decrement start_count when it produces a value
     } else {
         // Prerequisite n already produced a value. Add this as a consumer of n.
+#if defined(__cpp_exceptions)
         if (n->has_exception()) {
-            this->set_exception(n->get_exception());
+            this->set_exception(n->exception_for_port(req_port));
         }
+#endif
         int k = ++n->out(req_port).countdown;
         __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
         __OOX_ASSERT_EX(k>1,"risk that a prerequisite might be prematurely destroyed");
@@ -640,9 +681,11 @@ inline void task_node::do_notify_arcs( arc* r, int *count ) {
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
+#if defined(__cpp_exceptions)
             if (this->has_exception()) {
-                n->set_exception(this->get_exception());
+                n->set_exception(this->exception_for_port(j->port));
             }
+#endif
             n->remove_prerequisite();
         }
     } while( r );
@@ -1116,14 +1159,15 @@ struct alignas(64) functional_task : storage_task<slots, F, CanThrow> {
     TASK_EXECUTE_METHOD {
         if (!this->has_exception()) {
             if constexpr (CanThrow) {
-#if !defined(__cpp_exceptions)
-                static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
-#endif
+#if defined(__cpp_exceptions)
                 try {
                     my_result.emplace(this->my_precious.value()());
                 } catch(...) {
                     this->set_exception(std::current_exception());
                 }
+#else
+                static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
+#endif
             } else {
                 my_result.emplace(this->my_precious.value()());
             }
@@ -1145,15 +1189,16 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F, CanThr
         __OOX_TRACE("%p do_run: start",this);
         if (!this->has_exception()) {
             if constexpr (CanThrow) {
-#if !defined(__cpp_exceptions)
-                static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
-#endif
+#if defined(__cpp_exceptions)
                 try {
                     this->my_precious.value()();
                     my_result.set_value();
                 } catch(...) {
                     this->set_exception(std::current_exception());
                 }
+#else
+                static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
+#endif
             } else {
                 this->my_precious.value()();
                 my_result.set_value();
@@ -1177,9 +1222,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     TASK_EXECUTE_METHOD {
     if(!this->has_exception()) {
         if constexpr (CanThrow) {
-#if !defined(__cpp_exceptions)
-            static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
-#endif
+#if defined(__cpp_exceptions)
             try {
                 if ( !is_executed ) {
                     __OOX_TRACE("%p do_run: start forward",this);
@@ -1199,6 +1242,9 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             } catch(...) {
                 this->set_exception(std::current_exception());
             }
+#else
+            static_assert(CanThrow == false, "Exceptions are disabled by the compiler");
+#endif
         } else {
             if ( !is_executed ) {
                 __OOX_TRACE("%p do_run: start forward",this);
@@ -1298,7 +1344,7 @@ inline void wait_for_all(const internal::oox_var_base& on) {
     on.wait();
 #if defined(__cpp_exceptions)
     if (on.current_task->has_exception()) {
-        std::rethrow_exception(on.current_task->get_exception());
+        std::rethrow_exception(on.current_task->exception_for_port(on.current_port));
     }
 #endif
 }
@@ -1309,7 +1355,7 @@ inline void wait_for_all(const var<T, CanThrow>& on) {
     if constexpr (CanThrow) {
 #if defined(__cpp_exceptions)
         if (on.current_task->has_exception()) {
-            std::rethrow_exception(on.current_task->get_exception());
+            std::rethrow_exception(on.current_task->exception_for_port(on.current_port));
         }
 #endif
     }
@@ -1325,7 +1371,7 @@ template<typename T, bool CanThrow>
         if constexpr (CanThrow) {
 #if defined(__cpp_exceptions)
             if (base->current_task->has_exception()) {
-                std::rethrow_exception(base->current_task->get_exception());
+                std::rethrow_exception(base->current_task->exception_for_port(base->current_port));
             }
 #endif
         }
@@ -1337,7 +1383,7 @@ template<typename T, bool CanThrow>
     if constexpr (CanThrow) {
 #if defined(__cpp_exceptions)
         if (base->current_task->has_exception()) {
-            std::rethrow_exception(base->current_task->get_exception());
+            std::rethrow_exception(base->current_task->exception_for_port(base->current_port));
         }
 #endif
     }

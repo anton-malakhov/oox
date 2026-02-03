@@ -18,7 +18,9 @@ bool g_oox_verbose = false;
 #include <numeric>
 #include <vector>
 #include <functional>
+#if defined(__cpp_exceptions)
 #include <stdexcept>
+#endif
 #include <atomic>
 
 
@@ -221,6 +223,7 @@ TEST(OOX, DeferredArrayLayered) {
 
 /////////////////////////////////////// EXCEPTIONS ////////////////////////////////////////
 
+#if defined(__cpp_exceptions)
 struct dummy_exception final : std::exception {
     [[nodiscard]] const char* what() const noexcept override { return "dummy throw"; }
 };
@@ -283,8 +286,22 @@ TEST(OOX, ExceptionDeferredWriterPoison) {
         throw dummy_exception{};
     }, a);
 
-    EXPECT_THROW(oox::wait_and_get(a), dummy_exception);
-    EXPECT_THROW(oox::wait_and_get(b), dummy_exception);
+    EXPECT_THROW(oox::wait_and_get(a), oox::cancelled_by_exception);
+    EXPECT_THROW(oox::wait_and_get(b), oox::cancelled_by_exception);
+}
+
+TEST(OOX, ExceptionLateConsumerAfterOutputVarCancelled) {
+    oox::var<int> a(oox::deferred);
+
+    oox::run([](int& A) {
+        A = 1;
+        throw dummy_exception{};
+    }, a);
+
+    EXPECT_THROW(oox::wait_for_all(a), oox::cancelled_by_exception);
+
+    oox::var<int> b = oox::run(plus, 1, a);
+    EXPECT_THROW(oox::wait_and_get(b), oox::cancelled_by_exception);
 }
 
 TEST(OOX, ExceptionMultiOutputWriterAndReturn) {
@@ -295,7 +312,34 @@ TEST(OOX, ExceptionMultiOutputWriterAndReturn) {
     }, a);
 
     EXPECT_THROW(oox::wait_and_get(r), dummy_exception);
-    EXPECT_THROW(oox::wait_and_get(a), dummy_exception);
+    EXPECT_THROW(oox::wait_and_get(a), oox::cancelled_by_exception);
+}
+
+TEST(OOX, ExceptionConstRefInputNotCancelled) {
+    oox::var<int> a(oox::deferred);
+
+    oox::run([](int& A) { A = 7; }, a);
+
+    oox::var<int> r = oox::run([]([[maybe_unused]] const int& A) -> int {
+        throw dummy_exception{};
+    }, a);
+
+    EXPECT_THROW(oox::wait_and_get(r), dummy_exception);
+    EXPECT_EQ(oox::wait_and_get(a), 7);
+}
+
+TEST(OOX, ExceptionConstRefReaderWithWriterCancelsOnlyOutput) {
+    oox::var<int> input = oox::run([]() -> int { return 3; });
+    oox::var<int> output(oox::deferred);
+
+    oox::var<int> r = oox::run([](int& Out, const int& In) -> int {
+        Out = In + 1;
+        throw dummy_exception{};
+    }, output, input);
+
+    EXPECT_THROW(oox::wait_and_get(r), dummy_exception);
+    EXPECT_THROW(oox::wait_and_get(output), oox::cancelled_by_exception);
+    EXPECT_EQ(oox::wait_and_get(input), 3);
 }
 
 TEST(OOX, ExceptionDiamondJoinSkipped) {
@@ -338,6 +382,7 @@ TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {
 
     ASSERT_EQ(oox::wait_and_get(a), 2);
 }
+#endif
 
 
 int main(int argc, char** argv) {
@@ -348,10 +393,14 @@ int main(int argc, char** argv) {
     }
 
     int err{0};
+#if defined(__cpp_exceptions)
     try {
         err = RUN_ALL_TESTS();
     } catch (const std::exception& e) {
         REMARK("Error: %s", e.what());
     }
+#else
+    err = RUN_ALL_TESTS();
+#endif
     return err;
 }
