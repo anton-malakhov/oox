@@ -342,6 +342,28 @@ TEST(OOX, ExceptionConstRefReaderWithWriterCancelsOnlyOutput) {
     EXPECT_EQ(oox::wait_and_get(input), 3);
 }
 
+TEST(OOX, ExceptionRealOverridesCancelled) {
+    oox::var<int> cancelled_input(oox::deferred);
+    oox::var<int> gate(oox::deferred);
+
+    oox::var<int> throwing_input = oox::run([](int) -> int {
+        throw dummy_exception{};
+    }, gate);
+
+    oox::var<int> join = oox::run([](int x, int y) -> int {
+        return x + y;
+    }, cancelled_input, throwing_input);
+
+    oox::run([](int& out) {
+        out = 1;
+        throw dummy_exception{};
+    }, cancelled_input);
+
+    oox::run([](int& out) { out = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_and_get(join), dummy_exception);
+}
+
 TEST(OOX, ExceptionDiamondJoinSkipped) {
     oox::var<int> ok = oox::run([]() -> int { return 10; });
     oox::var<int> bad = oox::run([]() -> int { throw dummy_exception{}; });
