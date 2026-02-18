@@ -518,14 +518,10 @@ struct task_node : public task, arc_list {
     template<typename ResultState>
     void bind_result_state([[maybe_unused]] ResultState* state) noexcept {
 #if defined(__cpp_exceptions)
-        if constexpr (std::is_base_of_v<result_state_base, ResultState>) {
-            result_state_base* base = state;
-            uintptr_t raw = reinterpret_cast<uintptr_t>(base);
-            __OOX_ASSERT_EX((raw & exception_tag_mask) == 0, "result_state pointer not aligned for tagging");
-            result_ptr_tagged.store(raw, std::memory_order_release);
-        } else {
-            result_ptr_tagged.store(0, std::memory_order_release);
-        }
+        result_state_base* base = state;
+        uintptr_t raw = reinterpret_cast<uintptr_t>(base);
+        __OOX_ASSERT_EX((raw & exception_tag_mask) == 0, "result_state pointer not aligned for tagging");
+        result_ptr_tagged.store(raw, std::memory_order_release);
 #endif
     }
 
