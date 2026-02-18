@@ -562,7 +562,6 @@ struct arc_list {
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
     std::atomic<int> start_count;
-    int output_slots = 0;
     using notify_fn_t = void (*)(task_node*);
     notify_fn_t notify_dependents_fn = nullptr;
 
@@ -909,7 +908,6 @@ template<int slots>
 struct task_node_slots : task_node {
     output_node output_nodes[slots];
     task_node_slots() {
-        output_slots = slots;
         notify_dependents_fn = &task_node::notify_dependents_impl<slots>;
     }
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
