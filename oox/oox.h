@@ -599,20 +599,6 @@ struct task_node : public task, arc_list {
         }
         while(true) {
             uintptr_t tag = current & exception_tag_mask;
-            if (tag == 0) {
-                uintptr_t desired = (current & ~exception_tag_mask) | exception_tag_lock;
-                if (exception_tagged.compare_exchange_strong(current, desired, std::memory_order_acq_rel)) {
-                    *slot = std::move(ep);
-                    exception_tagged.store(reinterpret_cast<uintptr_t>(slot) | exception_tag_set,
-                                           std::memory_order_release);
-                    return;
-                }
-                slot = strip_exception_tag(current);
-                if (!slot) {
-                    return;
-                }
-                continue;
-            }
             if (tag == exception_tag_lock) {
                 std::this_thread::yield();
                 current = exception_tagged.load(std::memory_order_acquire);
@@ -622,7 +608,9 @@ struct task_node : public task, arc_list {
                 }
                 continue;
             }
-            if (!*slot && ep) {
+            // Try to write on first set, or upgrade an empty slot(which means cancelled) with a real exception.
+            const bool should_try_write = (tag == 0) || (tag == exception_tag_set && ep && !*slot);
+            if (should_try_write) {
                 uintptr_t desired = (current & ~exception_tag_mask) | exception_tag_lock;
                 if (exception_tagged.compare_exchange_strong(current, desired, std::memory_order_acq_rel)) {
                     *slot = std::move(ep);
