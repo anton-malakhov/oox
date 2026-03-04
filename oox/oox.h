@@ -254,6 +254,9 @@ struct result_state<T, true> {
 
     template<typename... Args>
     void emplace(Args&&... args) {
+        if (!lock_for_value_transition()) {
+            return;
+        }
         destroy_active();
         ::new (static_cast<void*>(&storage)) T(std::forward<Args>(args)...);
         set_active_value();
@@ -334,6 +337,29 @@ private:
     }
     bool is_exception_active() const noexcept {
         return !is_value_active();
+    }
+    bool lock_for_value_transition() noexcept {
+        unsigned char current = meta_byte().load(std::memory_order_acquire);
+        for (;;) {
+            const unsigned char current_state =
+                static_cast<unsigned char>(current & exception_state_machine::state_mask);
+            if (current_state == exception_state_machine::set) {
+                // Late cancellation/exception won; keep exception storage active.
+                return false;
+            }
+            if (current_state == exception_state_machine::lock) {
+                std::this_thread::yield();
+                current = meta_byte().load(std::memory_order_acquire);
+                continue;
+            }
+            const unsigned char desired =
+                static_cast<unsigned char>((current & ~exception_state_machine::state_mask) |
+                                           exception_state_machine::lock);
+            if (meta_byte().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+                return true;
+            }
+        }
     }
     T* value_ptr() noexcept {
         return std::launder(reinterpret_cast<T*>(&storage));
