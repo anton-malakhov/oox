@@ -562,8 +562,6 @@ struct arc_list {
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
     std::atomic<int> start_count;
-    using notify_fn_t = void (*)(task_node*);
-    notify_fn_t notify_dependents_fn = nullptr;
 
 #if defined(__cpp_exceptions)
     std::atomic<uintptr_t> exception_tagged{0};
@@ -693,11 +691,8 @@ struct task_node : public task, arc_list {
     // Call base notify successors
     template<int slots>
     void notify_successors();
-    template<int slots>
-    static void notify_dependents_impl(task_node* n) {
-        n->notify_successors<slots>();
-    }
-    void notify_dependents();
+
+    virtual void notify_successors() = 0;
     // Call base forward successors
     template<int slots>
     void forward_successors( oox_var_base& );
@@ -827,7 +822,7 @@ inline void task_node::remove_prerequisite( int n ) {
             __OOX_TRACE("%p remove_prerequisite: cancelled, notifying",this);
             // Cancellation path is in base task_node; dispatch to the node's
             // dependent-notify implementation.
-            notify_dependents();
+            notify_successors();
             return;
         }
 #endif
@@ -887,17 +882,16 @@ void task_node::notify_successors() {
     release(n);
 }
 
-inline void task_node::notify_dependents() {
-    __OOX_ASSERT(notify_dependents_fn, "notify_dependents not configured");
-    notify_dependents_fn(this);
-}
-
 template<int slots>
 struct task_node_slots : task_node {
     output_node output_nodes[slots];
     task_node_slots() {
-        notify_dependents_fn = &task_node::notify_dependents_impl<slots>;
     }
+
+    void notify_successors() override {
+      task_node::notify_successors<slots>();
+    }
+
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
 };
 
