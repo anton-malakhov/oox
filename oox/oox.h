@@ -1276,7 +1276,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             count = self->assign_prerequisite( cov.current_task, cov.current_port );
         if( cov.is_forward ) {
             oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = 1|(uintptr_t)&next;
+            my_ptr = 1|(uintptr_t)&next.storage_ptr;
         } else
             my_ptr = (uintptr_t)cov.storage_ptr;
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
@@ -1286,13 +1286,16 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
     C&& consume() {
         internal::result_state<ooxed_type, false>* state = nullptr;
         if( my_ptr & 1 ) {
-            const auto* owner_var = reinterpret_cast<const internal::oox_var_base*>(my_ptr ^ 1);
-            void* p = owner_var->storage_ptr;
+            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
             state = static_cast<internal::result_state<ooxed_type, false>*>(p);
             if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+                constexpr std::ptrdiff_t offset_delta =
+                    offsetof(internal::oox_var_base, storage_offset) - offsetof(internal::oox_var_base, storage_ptr);
+                const auto* storage_offset_ptr = reinterpret_cast<const int*>(
+                    reinterpret_cast<const char*>(reinterpret_cast<void**>(my_ptr ^ 1)) + offset_delta);
                 auto* owner_task = reinterpret_cast<internal::task_node*>(
                     reinterpret_cast<std::uintptr_t>(p) -
-                    static_cast<std::uintptr_t>(owner_var->storage_offset));
+                    static_cast<std::uintptr_t>(*storage_offset_ptr));
                 __OOX_ASSERT_EX(owner_task, "null owner task");
                 if(!state->has_value(owner_task->head)) {
                     state->emplace(owner_task->head); // requires default-constructible T
