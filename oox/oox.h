@@ -10,7 +10,20 @@
 #include <type_traits>
 #include <limits>
 #include <atomic>
-#include <optional>
+#include <cstddef>
+#include <new>
+#include <thread>
+#if defined(OOX_ENABLE_EXCEPTIONS)
+#define OOX_EXCEPTIONS_ENABLED (OOX_ENABLE_EXCEPTIONS)
+#elif defined(__cpp_exceptions)
+#define OOX_EXCEPTIONS_ENABLED 1
+#else
+#define OOX_EXCEPTIONS_ENABLED 0
+#endif
+
+#if OOX_EXCEPTIONS_ENABLED
+#include <exception>
+#endif
 
 #if HAVE_OMP
 #include <omp.h>
@@ -72,6 +85,416 @@ struct task_life {
             return (k == 0);          // double-check after atomic
         }
     }
+};
+
+template<typename T, bool CanThrow>
+struct result_state;
+
+#if OOX_EXCEPTIONS_ENABLED
+struct exception_state_machine {
+    static constexpr unsigned char active_value_bit = 0x1;
+    static constexpr unsigned char state_mask       = 0x6;
+    static constexpr unsigned char unset            = 0x0;
+    static constexpr unsigned char lock             = 0x2;
+    static constexpr unsigned char set              = 0x4;
+
+    static int try_set(std::atomic<unsigned char>& meta,
+                       std::exception_ptr& slot,
+                       std::exception_ptr* incoming,
+                       unsigned char forbidden_bits = 0) noexcept {
+        unsigned char current = meta.load(std::memory_order_acquire);
+        for (;;) {
+            if (current & forbidden_bits) {
+                return 0;
+            }
+
+            const unsigned char current_state = static_cast<unsigned char>(current & state_mask);
+            if (current_state == lock) {
+                return 2;
+            }
+            if (current_state == set) {
+                // Allow only a cancellation->exception upgrade attempt.
+                if (!incoming || !*incoming) {
+                    return 0;
+                }
+            } else if (current_state != unset) {
+                return 0;
+            }
+
+            const unsigned char desired =
+                static_cast<unsigned char>((current & ~state_mask) | lock);
+            if (!meta.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+                continue;
+            }
+
+            if (current_state == set && slot) {
+                meta.store(static_cast<unsigned char>((desired & ~state_mask) | set),
+                           std::memory_order_release);
+                return 0;
+            }
+
+            slot = incoming ? std::move(*incoming) : std::exception_ptr{};
+            meta.store(static_cast<unsigned char>((desired & ~state_mask) | set),
+                       std::memory_order_release);
+            return 1;
+        }
+    }
+
+    static bool has(const std::atomic<unsigned char>& meta,
+                    unsigned char forbidden_bits = 0) noexcept {
+        const unsigned char current = meta.load(std::memory_order_acquire);
+        if (current & forbidden_bits) {
+            return false;
+        }
+        return static_cast<unsigned char>(current & state_mask) != unset;
+    }
+
+    static std::exception_ptr get(const std::atomic<unsigned char>& meta,
+                                  const std::exception_ptr& slot,
+                                  unsigned char forbidden_bits = 0) noexcept {
+        unsigned char current = meta.load(std::memory_order_acquire);
+        for (;;) {
+            if (current & forbidden_bits) {
+                return std::exception_ptr{};
+            }
+            const unsigned char current_state = static_cast<unsigned char>(current & state_mask);
+            if (current_state == lock) {
+                std::this_thread::yield();
+                current = meta.load(std::memory_order_acquire);
+                continue;
+            }
+            if (current_state == set) {
+                return slot;
+            }
+            return std::exception_ptr{};
+        }
+    }
+};
+#endif
+
+template<typename T>
+struct result_state<T, false> {
+    using value_type = T;
+    static constexpr std::size_t storage_size = sizeof(T);
+    static constexpr std::size_t extra_internal_bytes = 1;
+    static_assert(sizeof(std::atomic<unsigned char>) <= extra_internal_bytes,
+                  "result_state metadata byte is too small for atomic state");
+    static constexpr unsigned char state_unset = 0x0;
+    static constexpr unsigned char state_lock  = 0x2;
+    static constexpr unsigned char state_set   = 0x4;
+
+    result_state() {
+        construct_meta();
+    }
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() { reset(); }
+
+    template<typename... Args>
+    void emplace(Args&&... args) {
+        const unsigned char previous = lock_for_value_transition();
+        struct transition_guard {
+            result_state* self;
+            ~transition_guard() {
+                if (self) {
+                    self->meta_byte().store(state_unset, std::memory_order_release);
+                }
+            }
+            void commit_set() {
+                self->meta_byte().store(state_set, std::memory_order_release);
+                self = nullptr;
+            }
+        } guard{this};
+
+        if (previous == state_set) {
+            ptr()->~T();
+        }
+        ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
+        guard.commit_set();
+    }
+    bool has_value() const noexcept {
+        return read_stable_state() == state_set;
+    }
+    T& value() {
+        __OOX_ASSERT_EX(has_value(), "read from empty result_state");
+        return *ptr();
+    }
+    const T& value() const {
+        __OOX_ASSERT_EX(has_value(), "read from empty result_state");
+        return *ptr();
+    }
+#if OOX_EXCEPTIONS_ENABLED
+    std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
+#endif
+
+private:
+    struct storage_t {
+        alignas(alignof(T)) std::byte data[storage_size + extra_internal_bytes];
+    };
+    storage_t storage{};
+
+    void reset() {
+        const unsigned char previous = lock_for_value_transition();
+        if (previous == state_set) {
+            ptr()->~T();
+        }
+        meta_byte().store(state_unset, std::memory_order_release);
+    }
+    T* ptr() noexcept {
+        return std::launder(reinterpret_cast<T*>(storage.data));
+    }
+    const T* ptr() const noexcept {
+        return std::launder(reinterpret_cast<const T*>(storage.data));
+    }
+    unsigned char read_stable_state() const noexcept {
+        unsigned char current = meta_byte().load(std::memory_order_acquire);
+        while (current == state_lock) {
+            std::this_thread::yield();
+            current = meta_byte().load(std::memory_order_acquire);
+        }
+        return current;
+    }
+    unsigned char lock_for_value_transition() noexcept {
+        unsigned char current = meta_byte().load(std::memory_order_acquire);
+        for (;;) {
+            if (current == state_lock) {
+                std::this_thread::yield();
+                current = meta_byte().load(std::memory_order_acquire);
+                continue;
+            }
+            if (meta_byte().compare_exchange_weak(current, state_lock, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+                return current;
+            }
+        }
+    }
+    void construct_meta() {
+        ::new (static_cast<void*>(storage.data + storage_size))
+            std::atomic<unsigned char>(state_unset);
+    }
+    std::atomic<unsigned char>& meta_byte() noexcept {
+        return *std::launder(reinterpret_cast<std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+    const std::atomic<unsigned char>& meta_byte() const noexcept {
+        return *std::launder(reinterpret_cast<const std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+};
+
+template<bool CanThrow>
+struct result_state<void, CanThrow>;
+
+#if OOX_EXCEPTIONS_ENABLED
+template<typename T>
+struct result_state<T, true> {
+    using value_type = T;
+
+    result_state() {
+        construct_meta();
+        construct_exception();
+    }
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() { destroy_active(); }
+
+    template<typename... Args>
+    void emplace(Args&&... args) {
+        if (!lock_for_value_transition()) {
+            return;
+        }
+        destroy_active();
+        ::new (static_cast<void*>(&storage)) T(std::forward<Args>(args)...);
+        set_active_value();
+    }
+    bool has_value() const noexcept {
+        return is_value_active();
+    }
+    T& value() {
+        __OOX_ASSERT_EX(is_value_active(), "read from empty result_state");
+        return *value_ptr();
+    }
+    const T& value() const {
+        __OOX_ASSERT_EX(is_value_active(), "read from empty result_state");
+        return *value_ptr();
+    }
+    std::exception_ptr* exception_slot_ptr() noexcept {
+        if (!is_exception_active()) {
+            return nullptr;
+        }
+        return exception_ptr();
+    }
+    int try_set_exception(std::exception_ptr* eptr) noexcept {
+        if (!is_exception_active()) {
+            return 0;
+        }
+        return exception_state_machine::try_set(meta_byte(), *exception_ptr(), eptr,
+                                                exception_state_machine::active_value_bit);
+    }
+    bool has_exception() const noexcept {
+        if (!is_exception_active()) {
+            return false;
+        }
+        return exception_state_machine::has(meta_byte(), exception_state_machine::active_value_bit);
+    }
+    std::exception_ptr get_exception() const noexcept {
+        if (!is_exception_active()) {
+            return std::exception_ptr{};
+        }
+        return exception_state_machine::get(meta_byte(), *exception_ptr(),
+                                            exception_state_machine::active_value_bit);
+    }
+
+private:
+    static constexpr std::size_t storage_size =
+        (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
+    static constexpr std::size_t storage_align =
+        (alignof(T) > alignof(std::exception_ptr)) ? alignof(T) : alignof(std::exception_ptr);
+    static constexpr std::size_t extra_internal_bytes = 1;
+    static_assert(sizeof(std::atomic<unsigned char>) <= extra_internal_bytes,
+                  "result_state metadata byte is too small for atomic state");
+    struct storage_t {
+        alignas(storage_align) std::byte data[storage_size + extra_internal_bytes];
+    };
+    storage_t storage;
+
+    void destroy_active() {
+        if (is_value_active()) {
+            value_ptr()->~T();
+        } else {
+            exception_ptr()->~exception_ptr();
+        }
+    }
+    void construct_exception() {
+        ::new (static_cast<void*>(&storage)) std::exception_ptr{};
+        set_active_exception();
+    }
+    void construct_meta() {
+        ::new (static_cast<void*>(storage.data + storage_size))
+            std::atomic<unsigned char>(exception_state_machine::unset);
+    }
+    void set_active_value() noexcept {
+        meta_byte().store(exception_state_machine::active_value_bit, std::memory_order_release);
+    }
+    void set_active_exception() noexcept {
+        meta_byte().store(exception_state_machine::unset, std::memory_order_release);
+    }
+    bool is_value_active() const noexcept {
+        return (meta_byte().load(std::memory_order_acquire) & exception_state_machine::active_value_bit) != 0;
+    }
+    bool is_exception_active() const noexcept {
+        return !is_value_active();
+    }
+    bool lock_for_value_transition() noexcept {
+        unsigned char current = meta_byte().load(std::memory_order_acquire);
+        for (;;) {
+            const unsigned char current_state =
+                static_cast<unsigned char>(current & exception_state_machine::state_mask);
+            if (current_state == exception_state_machine::set) {
+                // Late cancellation/exception won; keep exception storage active.
+                return false;
+            }
+            if (current_state == exception_state_machine::lock) {
+                std::this_thread::yield();
+                current = meta_byte().load(std::memory_order_acquire);
+                continue;
+            }
+            const unsigned char desired =
+                static_cast<unsigned char>((current & ~exception_state_machine::state_mask) |
+                                           exception_state_machine::lock);
+            if (meta_byte().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+    T* value_ptr() noexcept {
+        return std::launder(reinterpret_cast<T*>(&storage));
+    }
+    const T* value_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const T*>(&storage));
+    }
+    std::exception_ptr* exception_ptr() noexcept {
+        return std::launder(reinterpret_cast<std::exception_ptr*>(&storage));
+    }
+    const std::exception_ptr* exception_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const std::exception_ptr*>(&storage));
+    }
+    std::atomic<unsigned char>& meta_byte() noexcept {
+        return *std::launder(reinterpret_cast<std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+    const std::atomic<unsigned char>& meta_byte() const noexcept {
+        return *std::launder(reinterpret_cast<const std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+};
+
+template<>
+struct result_state<void, true> {
+    result_state() {
+        construct_meta();
+        construct_exception();
+    }
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() { destroy_exception(); }
+
+    std::exception_ptr* exception_slot_ptr() noexcept { return exception_ptr(); }
+    int try_set_exception(std::exception_ptr* eptr) noexcept {
+        return exception_state_machine::try_set(meta_byte(), *exception_ptr(), eptr);
+    }
+    bool has_exception() const noexcept {
+        return exception_state_machine::has(meta_byte());
+    }
+    std::exception_ptr get_exception() const noexcept {
+        return exception_state_machine::get(meta_byte(), *exception_ptr());
+    }
+
+private:
+    static constexpr std::size_t storage_size = sizeof(std::exception_ptr);
+    static constexpr std::size_t extra_internal_bytes = 1;
+    static_assert(sizeof(std::atomic<unsigned char>) <= extra_internal_bytes,
+                  "result_state metadata byte is too small for atomic state");
+    struct storage_t {
+        alignas(alignof(std::exception_ptr)) std::byte data[storage_size + extra_internal_bytes];
+    };
+    storage_t storage;
+
+    void construct_exception() {
+        ::new (static_cast<void*>(&storage)) std::exception_ptr{};
+        meta_byte().store(exception_state_machine::unset, std::memory_order_release);
+    }
+    void construct_meta() {
+        ::new (static_cast<void*>(storage.data + storage_size))
+            std::atomic<unsigned char>(exception_state_machine::unset);
+    }
+    void destroy_exception() {
+        exception_ptr()->~exception_ptr();
+    }
+    std::exception_ptr* exception_ptr() noexcept {
+        return std::launder(reinterpret_cast<std::exception_ptr*>(&storage));
+    }
+    const std::exception_ptr* exception_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const std::exception_ptr*>(&storage));
+    }
+    std::atomic<unsigned char>& meta_byte() noexcept {
+        return *std::launder(reinterpret_cast<std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+    const std::atomic<unsigned char>& meta_byte() const noexcept {
+        return *std::launder(reinterpret_cast<const std::atomic<unsigned char>*>(storage.data + storage_size));
+    }
+};
+#endif
+
+template<>
+struct result_state<void, false> {
+#if OOX_EXCEPTIONS_ENABLED
+    std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
+#endif
 };
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
@@ -602,11 +1025,11 @@ output_node& task_node::out(int n) const {
 
 template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots> {
-    std::optional<T> my_precious;
+    result_state<T, false> my_precious;
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
     storage_task() = default;
-    storage_task(T&& t) : my_precious(std::move(t)) {}
-    storage_task(const T& t) : my_precious(t) {}
+    storage_task(T&& t) { my_precious.emplace(std::move(t)); }
+    storage_task(const T& t) { my_precious.emplace(t); }
 };
 
 struct oox_var_base {
@@ -761,12 +1184,12 @@ public:
         allocate_deferred(); // storage exists, but value is not ready
     }
     var(const T& t) noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(t); // TODO: add exception-safe
+        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
+        state->emplace(t); // TODO: add exception-safe
     }
     var(T&& t)      noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(std::move(t));
+        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
+        state->emplace(std::move(t));
     }
     var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
     var& operator=(var<T>&& t) {
@@ -779,7 +1202,7 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
-        return static_cast<std::optional<T>*>(storage_ptr)->value();
+        return static_cast<internal::result_state<T, false>*>(storage_ptr)->value();
     }
 };
 
@@ -870,24 +1293,24 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        std::optional<ooxed_type>* opt = nullptr;
+        internal::result_state<ooxed_type, false>* state = nullptr;
         if( my_ptr & 1 ) {
             void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
-            opt = static_cast<std::optional<ooxed_type>*>(p);
+            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
         } else {
-            opt = reinterpret_cast<std::optional<ooxed_type>*>(my_ptr);
+            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
-        __OOX_ASSERT_EX(opt, "null optional storage");
+        __OOX_ASSERT_EX(state, "null result_state storage");
 
         if constexpr (
             std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-            if(!opt->has_value()) {
-                opt->emplace(); // requires default-constructible T
+            if(!state->has_value()) {
+                state->emplace(); // requires default-constructible T
             }
         } else {
-            __OOX_ASSERT_EX(opt->has_value(), "read from empty optional");
+            __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         }
-        return static_cast<C&&>(opt->value());
+        return static_cast<C&&>(state->value());
     }
 };
 template< typename T, typename... Types, typename A, typename... Args >
@@ -927,7 +1350,7 @@ struct oox_bind {
 template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
-    std::optional<R> my_result;
+    result_state<R, false> my_result;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
         my_result.emplace(this->my_precious.value()());
@@ -1066,7 +1489,7 @@ template<typename T>
     }
 
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
-    return static_cast<std::optional<T>*>(base->storage_ptr)->value();
+    return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
 }
 
 template<typename T>
@@ -1075,6 +1498,7 @@ template<typename T>
 [[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
+#undef OOX_EXCEPTIONS_ENABLED
 
 } // namespace oox
 #endif // __OOX_H__
