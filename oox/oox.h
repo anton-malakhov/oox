@@ -1140,7 +1140,6 @@ class var : public internal::oox_var_base {
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
-        v->wakeup();
         // nobody wait on this task
         this->bind_to( v, &v->my_precious, 2 );
         return storage_ptr;
