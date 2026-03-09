@@ -938,7 +938,8 @@ int task_node::notify_next_writer( task_node* d ) {
     if( i&1 ) {
         if( i == 3 )
             return 1;
-        __OOX_ASSERT( i!=1, "remove_back_arc called on output node with next_writer=1" );
+        if( i == 1 )
+            return 0;
         d = (task_node*)(i&~1);
         if( d == this )
             return 2;
