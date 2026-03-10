@@ -10,7 +10,7 @@
 #include <oox/oox.h>
 
 constexpr int FibN = 28;
-constexpr int max_cutoff = 16;
+constexpr int max_cutoff = 20;
 constexpr int cutoff_step = 2;
 int cutoff = 2;
 
@@ -37,7 +37,6 @@ namespace OOX2 { // Optimized number and order of tasks
         auto right = oox::run(Fib, n-2);                               // spawn right child
         return oox::run(std::plus<int>(), Fib(n-1), std::move(right)); // assign continuation
     }
-
 }
 
 static void Fib_Serial(benchmark::State& state) {
