@@ -974,9 +974,13 @@ void task_node::notify_successors() {
     }
 }
 
+template<int N>
+struct output_slots_storage {
+    output_node nodes[N];
+};
+
 template<int slots>
-struct task_node_slots : task_node {
-    output_node output_nodes[slots];
+struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
 };
 
@@ -986,17 +990,16 @@ __attribute__((no_sanitize("undefined")))
 output_node& task_node::out(int n) const {
     using self_t = task_node_slots<1024>;
     auto self = const_cast<self_t*>(reinterpret_cast<const self_t*>(this));
-    return self->output_nodes[n];
+    return self->nodes[n];
 }
 
 template<int slots, typename T>
-struct alignas(64) storage_task : task_node_slots<slots> {
-    result_state<T, false> my_precious;
+struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
     storage_task() = default;
-    storage_task(T&& t) { my_precious.emplace(this->head, std::move(t)); }
-    storage_task(const T& t) { my_precious.emplace(this->head, t); }
-    ~storage_task() { my_precious.reset(this->head); }
+    storage_task(T&& t) { this->emplace(this->head, std::move(t)); }
+    storage_task(const T& t) { this->emplace(this->head, t); }
+    ~storage_task() { this->reset(this->head); }
 };
 
 struct oox_var_base {
@@ -1173,7 +1176,7 @@ class var : public internal::oox_var_base {
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
-        this->bind_to( v, &v->my_precious, 2 );
+        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
         return storage_ptr;
     }
 
@@ -1184,7 +1187,7 @@ class var : public internal::oox_var_base {
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
-        this->bind_to(v, &v->my_precious, 2, false, true);
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
         return storage_ptr;
     }
 
@@ -1367,7 +1370,7 @@ struct alignas(64) functional_task : storage_task<slots, F> {
     result_state<R, false> my_result;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        my_result.emplace(this->head, this->my_precious.value()());
+        my_result.emplace(this->head, this->value()());
         task_node::notify_successors<slots>();
         return nullptr;
     }
@@ -1381,7 +1384,7 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        this->my_precious.value()();
+        this->value()();
         task_node::notify_successors<slots>();
         return nullptr;
     }
@@ -1396,12 +1399,12 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     TASK_EXECUTE_METHOD {
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
-        new(my_result.begin()) var<VT>( this->my_precious() );
+        new(my_result.begin()) var<VT>( this->value()() );
         return task_node::forward_successors<slots>( *my_result.begin() );
 #else
         if( !is_executed ) {
             __OOX_TRACE("%p do_run: start forward",this);
-            new(&my_result) var<VT>( this->my_precious.value()() );
+            new(&my_result) var<VT>( this->value()() );
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
@@ -1482,7 +1485,7 @@ template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args
     int protect_count = std::numeric_limits<int>::max();
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
-    protect_count -= t->my_precious.value().my_args.setup( 1, t, std::forward<Args>(args)...);
+    protect_count -= t->value().my_args.setup( 1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
