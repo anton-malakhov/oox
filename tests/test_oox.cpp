@@ -33,11 +33,11 @@ namespace ArchSample {
     T h() { return 3; }
     T test() {
         oox::var<T> a, b, c;
-        oox::run([](T&A){A=f();}, a);
-        oox::run([](T&B){B=g();}, b);
-        oox::run([](T&C){C=h();}, c);
-        oox::run([](T&A, T B){A+=B;}, a, b);
-        oox::run([](T&B, T C){B+=C;}, b, c);
+        [[maybe_unused]] auto task_a = oox::run([](T&A){A=f();}, a);
+        [[maybe_unused]] auto task_b = oox::run([](T&B){B=g();}, b);
+        [[maybe_unused]] auto task_c = oox::run([](T&C){C=h();}, c);
+        [[maybe_unused]] auto task_ab = oox::run([](T&A, T B){A+=B;}, a, b);
+        [[maybe_unused]] auto task_bc = oox::run([](T&B, T C){B+=C;}, b, c);
         oox::wait_for_all(b);
         return oox::wait_and_get(a);
     }
@@ -66,7 +66,7 @@ TEST(OOX, Simple) {
 TEST(OOX, Empty) {
     oox::var<int> a;
     oox::var<int> b = oox::run(plus, 1, a);
-    oox::run([](int &A){ A = 2; }, a);
+    [[maybe_unused]] auto assign_a = oox::run([](int &A){ A = 2; }, a);
     ASSERT_EQ(oox::wait_and_get(a), 2);
     const auto b_value = oox::wait_and_get(b);
     ASSERT_TRUE(b_value == 1 || b_value == 3);
@@ -124,7 +124,7 @@ TEST(OOX, DeferredChain) {
     oox::var<int> b = oox::run(plus, 1, a);
     oox::var<int> c = oox::run(plus, 1, b);
 
-    oox::run([](int &A){ A = 10; }, a);
+    [[maybe_unused]] auto assign_a = oox::run([](int &A){ A = 10; }, a);
 
     ASSERT_EQ(oox::wait_and_get(a), 10);
     ASSERT_EQ(oox::wait_and_get(b), 11);
@@ -138,7 +138,7 @@ TEST(OOX, DeferredDiamond) {
     oox::var<int> c = oox::run(plus, 2, a);
     oox::var<int> d = oox::run([](int x, int y){ return x + y; }, b, c);
 
-    oox::run([](int &A){ A = 5; }, a);
+    [[maybe_unused]] auto assign_a = oox::run([](int &A){ A = 5; }, a);
 
     ASSERT_EQ(oox::wait_and_get(a), 5);
     ASSERT_EQ(oox::wait_and_get(b), 6);
@@ -152,8 +152,8 @@ TEST(OOX, DeferredTwoInputs) {
 
     oox::var<int> c = oox::run([](int x, int y){ return x + y; }, a, b);
 
-    oox::run([](int &B){ B = 3; }, b);
-    oox::run([](int &A){ A = 2; }, a);
+    [[maybe_unused]] auto assign_b = oox::run([](int &B){ B = 3; }, b);
+    [[maybe_unused]] auto assign_a = oox::run([](int &A){ A = 2; }, a);
 
     ASSERT_EQ(oox::wait_and_get(a), 2);
     ASSERT_EQ(oox::wait_and_get(b), 3);
@@ -164,8 +164,8 @@ TEST(OOX, DeferredChainWithMultipleWriters) {
     oox::var<int> a(oox::deferred);
     oox::var<int> b = oox::run(plus, 1, a);
 
-    oox::run([](int &A){ A = 1; }, a);
-    oox::run([](int &A){ A = 10; }, a);
+    [[maybe_unused]] auto assign_a_1 = oox::run([](int &A){ A = 1; }, a);
+    [[maybe_unused]] auto assign_a_10 = oox::run([](int &A){ A = 10; }, a);
 
     int aval = oox::wait_and_get(a);
     int bval = oox::wait_and_get(b);
@@ -189,7 +189,7 @@ TEST(OOX, DeferredForwardingLayer) {
 
     oox::var<int> result = oox::run(outer, a);
 
-    oox::run([](int &A){ A = 41; }, a);
+    [[maybe_unused]] auto assign_a = oox::run([](int &A){ A = 41; }, a);
 
     ASSERT_EQ(oox::wait_and_get(a), 41);
     ASSERT_EQ(oox::wait_and_get(result), 42);
@@ -206,7 +206,7 @@ TEST(OOX, DeferredArrayLayered) {
     a[1] = oox::run(plus, 1, a[0]);
     a[2] = oox::run(plus, 1, a[1]);
 
-    oox::run([](int &x){ x = 100; }, a[0]);
+    [[maybe_unused]] auto assign_x = oox::run([](int &x){ x = 100; }, a[0]);
 
     ASSERT_EQ(oox::wait_and_get(a[0]), 100);
     ASSERT_EQ(oox::wait_and_get(a[1]), 101);
