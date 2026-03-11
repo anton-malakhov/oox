@@ -939,8 +939,6 @@ int task_node::notify_next_writer( task_node* d ) {
     if( i&1 ) {
         if( i == 3 )
             return 1;
-        if( i == 1 )
-            return 0;
         d = (task_node*)(i&~1);
         if( d == this )
             return 2;
@@ -984,9 +982,7 @@ void task_node::notify_successors() {
     int counters[slots];
     int n = notify_successors( slots, counters );
     wakeup();
-    if(n > 0) {
-        release(n);
-    }
+    release(n);
 }
 
 template<int N>
