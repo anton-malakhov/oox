@@ -34,8 +34,8 @@ oox::var<size_t> disk_usage(INode& node)
         return node.size();
     oox::var<size_t> sum = 0;
     for (auto &subnode : node)
-        oox::run([](size_t &sm, // serialized on write operation
-                 size_t sz){ sm += sz; }, sum, oox::run(disk_usage, std::ref(subnode))); // parallel recursive leaves
+        [[maybe_unused]] auto append_sum = oox::run([](size_t &sm, // serialized on write operation
+                                                size_t sz){ sm += sz; }, sum, oox::run(disk_usage, std::ref(subnode))); // parallel recursive leaves
     return sum;
 }
 
@@ -59,8 +59,8 @@ oox::var<size_t> disk_usage(INode& node)
     typedef cv_t *cv_ptr_t;
     oox::var<cv_ptr_t> resv = new cv_t;
     for (auto &subnode : node)
-        oox::run([](const cv_ptr_t &v, // make it read-only (but not copyable) and thus parallel
-                            size_t s){ v->push_back(s); }, resv, oox::run(disk_usage, std::ref(subnode)));
+        [[maybe_unused]] auto append_entry = oox::run([](const cv_ptr_t &v, // make it read-only (but not copyable) and thus parallel
+                                                   size_t s){ v->push_back(s); }, resv, oox::run(disk_usage, std::ref(subnode)));
     return oox::run([](cv_ptr_t &v) { // make it read-write to induce anti-dependence from the above read-only tasks
         size_t res = std::accumulate(v->begin(), v->end(), 0);
         delete v; v = nullptr;      // release memory, reset the pointer
