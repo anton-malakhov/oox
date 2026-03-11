@@ -1520,7 +1520,6 @@ template<typename T>
 [[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
-#undef OOX_EXCEPTIONS_ENABLED
 
 } // namespace oox
 #endif // __OOX_H__
