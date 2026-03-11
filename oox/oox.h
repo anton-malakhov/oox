@@ -1460,7 +1460,7 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 } //namespace internal
 
 template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-[[nodiscard]] auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
 {
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
