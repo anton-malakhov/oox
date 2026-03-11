@@ -64,7 +64,7 @@ struct arc;
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
 inline constexpr std::uintptr_t k_result_state_tag_mask = 0x6;
-inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_result_state_tag_mask;
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
 inline constexpr unsigned char k_result_state_empty = 0;
 inline constexpr unsigned char k_result_state_lock = 1;
 inline constexpr unsigned char k_result_state_value = 2;
@@ -76,13 +76,15 @@ inline std::uintptr_t head_bits(arc* p) noexcept { return reinterpret_cast<std::
 
 inline arc* head_from_bits(std::uintptr_t bits) noexcept { return reinterpret_cast<arc*>(bits); }
 
-inline unsigned char decode_result_state(arc* raw_head) noexcept {
-    return static_cast<unsigned char>((head_bits(raw_head) & k_result_state_tag_mask) >> 1);
+inline std::uintptr_t storage_bits(const void* p) noexcept { return reinterpret_cast<std::uintptr_t>(p); }
+
+inline unsigned char decode_result_state(std::uintptr_t raw_storage) noexcept {
+    return static_cast<unsigned char>((raw_storage & k_result_state_tag_mask) >> 1);
 }
 
-inline arc* encode_result_state(arc* raw_head, unsigned char state) noexcept {
-    return head_from_bits((head_bits(raw_head) & ~k_result_state_tag_mask) |
-                          ((static_cast<std::uintptr_t>(state) << 1) & k_result_state_tag_mask));
+inline std::uintptr_t encode_result_state(std::uintptr_t raw_storage, unsigned char state) noexcept {
+    return (raw_storage & ~k_result_state_tag_mask) |
+           ((static_cast<std::uintptr_t>(state) << 1) & k_result_state_tag_mask);
 }
 
 struct task_life {
@@ -122,15 +124,15 @@ struct result_state_base {
     static constexpr unsigned char state_exception = k_result_state_exception;
 
   protected:
-    unsigned char read_state(const std::atomic<arc*>& owner_head) const noexcept {
-        return decode_result_state(owner_head.load(std::memory_order_acquire));
+    unsigned char read_state(const std::atomic<std::uintptr_t>& owner_storage) const noexcept {
+        return decode_result_state(owner_storage.load(std::memory_order_acquire));
     }
-    void store_state(std::atomic<arc*>& owner_head, unsigned char state) noexcept {
-        arc* current = owner_head.load(std::memory_order_acquire);
+    void store_state(std::atomic<std::uintptr_t>& owner_storage, unsigned char state) noexcept {
+        std::uintptr_t current = owner_storage.load(std::memory_order_acquire);
         for (;;) {
-            arc* desired = encode_result_state(current, state);
-            if (owner_head.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
+            std::uintptr_t desired = encode_result_state(current, state);
+            if (owner_storage.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
                 return;
             }
         }
@@ -142,34 +144,35 @@ template <typename Derived> struct result_state_throw_base : result_state_base {
   protected:
     Derived& derived() noexcept { return *static_cast<Derived*>(this); }
     const Derived& derived() const noexcept { return *static_cast<const Derived*>(this); }
+    std::atomic<std::uintptr_t>& state_bits() noexcept { return derived().state_bits(); }
+    const std::atomic<std::uintptr_t>& state_bits() const noexcept { return derived().state_bits(); }
 
-    unsigned char read_stable_state(const std::atomic<arc*>& owner_head) const noexcept {
-        arc* current = owner_head.load(std::memory_order_acquire);
+    unsigned char read_stable_state() const noexcept {
+        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         while (decode_result_state(current) == state_lock) {
             std::this_thread::yield();
-            current = owner_head.load(std::memory_order_acquire);
+            current = state_bits().load(std::memory_order_acquire);
         }
         return decode_result_state(current);
     }
-    unsigned char lock_for_transition(std::atomic<arc*>& owner_head) noexcept {
-        arc* current = owner_head.load(std::memory_order_acquire);
+    unsigned char lock_for_transition() noexcept {
+        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         for (;;) {
             const auto current_state = decode_result_state(current);
             if (current_state == state_lock) {
                 std::this_thread::yield();
-                current = owner_head.load(std::memory_order_acquire);
+                current = state_bits().load(std::memory_order_acquire);
                 continue;
             }
-            arc* desired = encode_result_state(current, state_lock);
-            if (owner_head.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
+            std::uintptr_t desired = encode_result_state(current, state_lock);
+            if (state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
                 return current_state;
             }
         }
     }
-    unsigned char lock_for_value_transition(std::atomic<arc*>& owner_head,
-                                            unsigned char blocked_state = 0xFF) noexcept {
-        arc* current = owner_head.load(std::memory_order_acquire);
+    unsigned char lock_for_value_transition(unsigned char blocked_state = 0xFF) noexcept {
+        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         for (;;) {
             const auto current_state = decode_result_state(current);
             if (current_state == blocked_state) {
@@ -177,26 +180,26 @@ template <typename Derived> struct result_state_throw_base : result_state_base {
             }
             if (current_state == state_lock) {
                 std::this_thread::yield();
-                current = owner_head.load(std::memory_order_acquire);
+                current = state_bits().load(std::memory_order_acquire);
                 continue;
             }
-            arc* desired = encode_result_state(current, state_lock);
-            if (owner_head.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
+            std::uintptr_t desired = encode_result_state(current, state_lock);
+            if (state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
                 return current_state;
             }
         }
     }
 
   public:
-    std::exception_ptr* exception_slot_ptr(const std::atomic<arc*>& owner_head) noexcept {
-        if (read_stable_state(owner_head) != state_exception) {
+    std::exception_ptr* exception_slot_ptr() noexcept {
+        if (read_stable_state() != state_exception) {
             return nullptr;
         }
         return derived().exception_ptr();
     }
-    int try_set_exception(std::atomic<arc*>& owner_head, std::exception_ptr* eptr) noexcept {
-        arc* current = owner_head.load(std::memory_order_acquire);
+    int try_set_exception(std::exception_ptr* eptr) noexcept {
+        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         for (;;) {
             const auto current_state = decode_result_state(current);
             if (current_state == state_lock) {
@@ -206,33 +209,33 @@ template <typename Derived> struct result_state_throw_base : result_state_base {
                 return 0;
             }
 
-            arc* desired = encode_result_state(current, state_lock);
-            if (!owner_head.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
+            std::uintptr_t desired = encode_result_state(current, state_lock);
+            if (!state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
                 continue;
             }
 
             auto* slot = derived().exception_ptr();
             if (current_state == state_exception) {
                 if (*slot || !eptr || !*eptr) {
-                    store_state(owner_head, state_exception);
+                    store_state(state_bits(), state_exception);
                     return 0;
                 }
                 *slot = std::move(*eptr);
-                store_state(owner_head, state_exception);
+                store_state(state_bits(), state_exception);
                 return 1;
             }
 
             ::new (static_cast<void*>(slot)) std::exception_ptr(eptr ? std::move(*eptr) : std::exception_ptr{});
-            store_state(owner_head, state_exception);
+            store_state(state_bits(), state_exception);
             return 1;
         }
     }
-    bool has_exception(const std::atomic<arc*>& owner_head) const noexcept {
-        return read_stable_state(owner_head) == state_exception;
+    bool has_exception() const noexcept {
+        return read_stable_state() == state_exception;
     }
-    std::exception_ptr get_exception(const std::atomic<arc*>& owner_head) const noexcept {
-        if (read_stable_state(owner_head) != state_exception) {
+    std::exception_ptr get_exception() const noexcept {
+        if (read_stable_state() != state_exception) {
             return std::exception_ptr{};
         }
         return *derived().exception_ptr();
@@ -243,36 +246,36 @@ template <typename Derived> struct result_state_throw_base : result_state_base {
 template <typename T> struct result_state<T, false> : private result_state_base {
     using base_type = result_state_base;
     using value_type = T;
-    static constexpr unsigned char state_unset = base_type::state_empty;
-    static constexpr unsigned char state_set = base_type::state_value;
+    static constexpr unsigned char state_unset = 0;
+    static constexpr unsigned char state_set = 1;
 
-    result_state() = default;
+    result_state() : state_bits_field(state_unset) {}
     result_state(const result_state&) = delete;
     result_state& operator=(const result_state&) = delete;
     result_state(result_state&&) = delete;
     result_state& operator=(result_state&&) = delete;
     ~result_state() = default;
 
-    template <typename... Args> void emplace(std::atomic<arc*>& owner_head, Args&&... args) {
-        const auto previous = this->read_state(owner_head);
+    template <typename... Args> void emplace(Args&&... args) {
+        const auto previous = static_cast<unsigned char>(state_bits_field);
         if (previous == state_set) {
             ptr()->~T();
         }
 #if OOX_EXCEPTIONS_ENABLED
         try {
             construct_value(std::forward<Args>(args)...);
-            this->store_state(owner_head, state_set);
+            state_bits_field = state_set;
         } catch (...) {
-            this->store_state(owner_head, state_unset);
+            state_bits_field = state_unset;
             throw;
         }
 #else
         construct_value(std::forward<Args>(args)...);
-        this->store_state(owner_head, state_set);
+        state_bits_field = state_set;
 #endif
     }
-    bool has_value(const std::atomic<arc*>& owner_head) const noexcept {
-        return this->read_state(owner_head) == state_set;
+    bool has_value() const noexcept {
+        return static_cast<unsigned char>(state_bits_field) == state_set;
     }
     T& value() { return *ptr(); }
     const T& value() const { return *ptr(); }
@@ -280,15 +283,16 @@ template <typename T> struct result_state<T, false> : private result_state_base 
     std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
 #endif
 
-    void reset(std::atomic<arc*>& owner_head) {
-        const auto previous = this->read_state(owner_head);
+    void reset() {
+        const auto previous = static_cast<unsigned char>(state_bits_field);
         if (previous == state_set) {
             ptr()->~T();
         }
-        this->store_state(owner_head, state_unset);
+        state_bits_field = state_unset;
     }
 
   private:
+    bool state_bits_field : 1;
     struct storage_t {
         alignas(alignof(T)) std::byte data[sizeof(T)];
     };
@@ -316,15 +320,20 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
 
-    result_state() = default;
+    result_state() {
+        const auto bits = storage_bits(storage.data);
+        __OOX_ASSERT_EX((bits & k_result_state_tag_mask) == 0,
+                        "result_state storage pointer does not provide result_state tag bits");
+        meta_byte.store(bits, std::memory_order_relaxed);
+    }
     result_state(const result_state&) = delete;
     result_state& operator=(const result_state&) = delete;
     result_state(result_state&&) = delete;
     result_state& operator=(result_state&&) = delete;
     ~result_state() = default;
 
-    template <typename... Args> void emplace(std::atomic<arc*>& owner_head, Args&&... args) {
-        const auto previous = this->lock_for_value_transition(owner_head, state_exception);
+    template <typename... Args> void emplace(Args&&... args) {
+        const auto previous = this->lock_for_value_transition(state_exception);
         if (previous == state_exception) {
             return;
         }
@@ -335,26 +344,18 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
 #if OOX_EXCEPTIONS_ENABLED
         try {
             construct_value(std::forward<Args>(args)...);
-            this->store_state(owner_head, state_value);
+            this->store_state(meta_byte, state_value);
         } catch (...) {
-            this->store_state(owner_head, state_empty);
+            this->store_state(meta_byte, state_empty);
             throw;
         }
 #else
         construct_value(std::forward<Args>(args)...);
-        this->store_state(owner_head, state_value);
+        this->store_state(meta_byte, state_value);
 #endif
     }
-    bool has_value(const std::atomic<arc*>& owner_head) const noexcept {
-        return this->read_stable_state(owner_head) == state_value;
-    }
-    T& value(const std::atomic<arc*>& owner_head) {
-        __OOX_ASSERT_EX(has_value(owner_head), "read from empty result_state");
-        return *value_ptr();
-    }
-    const T& value(const std::atomic<arc*>& owner_head) const {
-        __OOX_ASSERT_EX(has_value(owner_head), "read from empty result_state");
-        return *value_ptr();
+    bool has_value() const noexcept {
+        return this->read_stable_state() == state_value;
     }
     T& value() { return *value_ptr(); }
     const T& value() const { return *value_ptr(); }
@@ -362,17 +363,18 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
     using base_type::get_exception;
     using base_type::has_exception;
     using base_type::try_set_exception;
-    void reset(std::atomic<arc*>& owner_head) {
-        const auto previous = this->lock_for_transition(owner_head);
+    void reset() {
+        const auto previous = this->lock_for_transition();
         if (previous == state_value) {
             value_ptr()->~T();
         } else if (previous == state_exception) {
             exception_ptr()->~exception_ptr();
         }
-        this->store_state(owner_head, state_empty);
+        this->store_state(meta_byte, state_empty);
     }
 
   private:
+    std::atomic<std::uintptr_t> meta_byte{0};
     static constexpr std::size_t storage_size =
         (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
     static constexpr std::size_t storage_align =
@@ -381,6 +383,8 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
         alignas(storage_align) std::byte data[storage_size];
     };
     template <typename> friend struct result_state_throw_base;
+    std::atomic<std::uintptr_t>& state_bits() noexcept { return meta_byte; }
+    const std::atomic<std::uintptr_t>& state_bits() const noexcept { return meta_byte; }
     storage_t storage{};
     template <typename... Args> void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
@@ -406,7 +410,12 @@ template <> struct result_state<void, true> : private result_state_throw_base<re
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
 
-    result_state() = default;
+    result_state() {
+        const auto bits = storage_bits(storage.data);
+        __OOX_ASSERT_EX((bits & k_result_state_tag_mask) == 0,
+                        "result_state storage pointer does not provide result_state tag bits");
+        meta_byte.store(bits, std::memory_order_relaxed);
+    }
     result_state(const result_state&) = delete;
     result_state& operator=(const result_state&) = delete;
     result_state(result_state&&) = delete;
@@ -417,20 +426,23 @@ template <> struct result_state<void, true> : private result_state_throw_base<re
     using base_type::get_exception;
     using base_type::has_exception;
     using base_type::try_set_exception;
-    void reset(std::atomic<arc*>& owner_head) {
-        const auto previous = this->lock_for_transition(owner_head);
+    void reset() {
+        const auto previous = this->lock_for_transition();
         if (previous == state_exception) {
             exception_ptr()->~exception_ptr();
         }
-        this->store_state(owner_head, state_empty);
+        this->store_state(meta_byte, state_empty);
     }
 
   private:
+    std::atomic<std::uintptr_t> meta_byte{0};
     static constexpr std::size_t storage_size = sizeof(std::exception_ptr);
     struct storage_t {
         alignas(alignof(std::exception_ptr)) std::byte data[storage_size];
     };
     template <typename> friend struct result_state_throw_base;
+    std::atomic<std::uintptr_t>& state_bits() noexcept { return meta_byte; }
+    const std::atomic<std::uintptr_t>& state_bits() const noexcept { return meta_byte; }
     storage_t storage{};
     std::exception_ptr* exception_ptr() noexcept {
         return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
@@ -733,12 +745,6 @@ struct arc {
 
 static_assert(alignof(arc) >= 8, "arc alignment must provide three low tag bits");
 
-inline arc* head_ptr(arc* raw) noexcept { return head_from_bits(head_bits(raw) & ~k_task_tag_mask); }
-
-inline arc* with_head_ptr(arc* raw, arc* ptr) noexcept {
-    return head_from_bits((head_bits(raw) & k_task_tag_mask) | (head_bits(ptr) & ~k_task_tag_mask));
-}
-
 struct arc_list {
     // Root of list of nodes that are waiting for this node's value to be produced.
     // A node can be waiting for *this to produce a value OR waiting for *this to consume its value.
@@ -797,9 +803,10 @@ bool arc_list::add_arc( arc* i ) {
         arc* raw_j = head.load(std::memory_order_acquire);
         if( k_task_done_tag == (head_bits(raw_j) & k_task_done_tag) )
             return false;
-        auto j = head_ptr(raw_j);
+        auto j = reinterpret_cast<arc*>(head_bits(raw_j) & ~k_task_tag_mask);
         i->next = j;
-        arc* desired = with_head_ptr(raw_j, i);
+        arc* desired = reinterpret_cast<arc*>((head_bits(raw_j) & k_task_tag_mask) |
+                                              (head_bits(i) & ~k_task_tag_mask));
         if( head.compare_exchange_weak( raw_j, desired ) ) // TODO: weak or strong? what's perf?
             return true;
     }
@@ -890,18 +897,12 @@ int task_node::notify_successors( int output_slots, int *count ) {
     Optimized path if we have invariant
     dependency graph is fully built before any task can complete,
     so no concurrent head writers (add_arc/set_next_writer) are possible.
-    arc* desired = head_from_bits((head_bits(raw_head) & k_result_state_tag_mask) | k_task_done_tag);
+    arc* desired = head_from_bits(k_task_done_tag);
     head.store(desired, std::memory_order_release);
     */
-    for (;;) {
-        arc* desired = head_from_bits((head_bits(raw_head) & k_result_state_tag_mask) | k_task_done_tag);
-        if (head.compare_exchange_weak(raw_head, desired, std::memory_order_acq_rel,
-                                       std::memory_order_acquire)) {
-            break;
-        }
-    }
+    raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
 
-    if( arc* r = head_ptr(raw_head) )
+    if( arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask) )
         do_notify_arcs( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
@@ -993,9 +994,9 @@ template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
     storage_task() = default;
-    storage_task(T&& t) { this->emplace(this->head, std::move(t)); }
-    storage_task(const T& t) { this->emplace(this->head, t); }
-    ~storage_task() { this->reset(this->head); }
+    storage_task(T&& t) { this->emplace(std::move(t)); }
+    storage_task(const T& t) { this->emplace(t); }
+    ~storage_task() { this->reset(); }
 };
 
 struct oox_var_base {
@@ -1037,19 +1038,8 @@ struct oox_var_base {
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
             arc* raw_head = current_task->head.load(std::memory_order_acquire);
-            // just like notify_successor an optimization might be useful if we restrict some operations from user
-            /*
-            arc* desired = head_from_bits(head_bits(raw_head) & k_result_state_tag_mask);
-            current_task->head.store(desired, std::memory_order_release);
-            */
-            for (;;) {
-                arc* desired = head_from_bits(head_bits(raw_head) & k_result_state_tag_mask);
-                if (current_task->head.compare_exchange_weak(raw_head, desired, std::memory_order_acq_rel,
-                                                             std::memory_order_acquire)) {
-                    break;
-                }
-            }
-            arc* r = head_ptr(raw_head);
+            raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask);
             while(r) {
                 arc* j = r;
                 r = j->next;
@@ -1182,11 +1172,11 @@ public:
     }
     var(const T& t) noexcept {
         auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(current_task->head, t); // TODO: add exception-safe
+        state->emplace(t); // TODO: add exception-safe
     }
     var(T&& t)      noexcept {
         auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(current_task->head, std::move(t));
+        state->emplace(std::move(t));
     }
     var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
     var& operator=(var<T>&& t) {
@@ -1303,8 +1293,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
                     reinterpret_cast<std::uintptr_t>(p) -
                     static_cast<std::uintptr_t>(*storage_offset_ptr));
                 __OOX_ASSERT_EX(owner_task, "null owner task");
-                if(!state->has_value(owner_task->head)) {
-                    state->emplace(owner_task->head); // requires default-constructible T
+                if(!state->has_value()) {
+                    state->emplace(); // requires default-constructible T
                 }
             }
         } else {
@@ -1349,17 +1339,18 @@ struct oox_bind {
 };
 
 template<int slots, typename F, typename R>
-struct alignas(64) functional_task : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
-    result_state<R, false> my_result;
+struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
+    using functor_base = storage_task<slots, F>;
+    using result_base = result_state<R, false>;
+    using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        my_result.emplace(this->head, this->value()());
+        result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
         return nullptr;
     }
     ~functional_task() {
-        my_result.reset(this->head);
+        result_base::reset();
     }
 };
 
@@ -1413,7 +1404,9 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to( t, &t->my_result, slots+1 ); return oox;
+        type oox;
+        oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1);
+        return oox;
     }
 };
 template<>
@@ -1469,7 +1462,9 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> 
     int protect_count = std::numeric_limits<int>::max();
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
-    protect_count -= t->value().my_args.setup( 1, t, std::forward<Args>(args)...);
+    protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
+                         ->value()
+                         .my_args.setup(1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
