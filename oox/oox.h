@@ -601,6 +601,7 @@ struct task : public tbb_task, task_life {
     }
 };
 #elif HAVE_TF /////////////////////// Taskflow ///////////////////////////////////////
+#include <mutex>
 #define OOX_USING_TF
 #define TASK_EXECUTE_METHOD void* execute() override
 
@@ -612,7 +613,10 @@ tf::Executor& get_tf_pool() {
 struct task : task_life {
 
     std::promise<void> waiter;
+    std::shared_future<void> waiter_future;
+    std::once_flag wakeup_once;
 
+    task() : waiter_future(waiter.get_future().share()) {}
     virtual ~task() = default;
     virtual void* execute() = 0;
 
@@ -628,10 +632,12 @@ struct task : task_life {
         get_tf_pool().silent_async([this]{this->execute();});
     }
     void wait() {
-        waiter.get_future().wait();
+        waiter_future.wait();
     }
     void wakeup() {
-        waiter.set_value();
+        std::call_once(wakeup_once, [this] {
+            waiter.set_value();
+        });
     }
 };
 #elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
