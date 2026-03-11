@@ -701,7 +701,7 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        [[maybe_unused]] auto launched = std::async(std::launch::async, &task::execute, this);
+        std::async(std::launch::async, &task::execute, this);
     }
     void wait() {
         waiter.get_future().wait();
