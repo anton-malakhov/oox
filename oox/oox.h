@@ -247,7 +247,7 @@ struct task : task_life {
         get_tf_pool().silent_async([this]{this->execute();});
     }
     void wait() {
-        waiter.get_future().wait();
+        waiter_future.wait();
     }
     void wakeup() {
       std::call_once(wakeup_once, [this] {
