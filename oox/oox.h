@@ -1005,41 +1005,29 @@ struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false>
 struct oox_var_base {
     //TODO: make it a class with private members
     oox_var_base &operator=(const oox_var_base &) = delete;
-    static constexpr std::uint16_t k_port_mask = 0x3FFFu;
-    static constexpr std::uint16_t k_forward_flag = 0x4000u;
-    static constexpr std::uint16_t k_deferred_flag = 0x8000u;
+    static constexpr int k_port_bits = 14;
+    static constexpr int k_max_port = (1 << k_port_bits) - 1;
+
+    struct current_port_and_flags_t {
+        std::uint16_t port : k_port_bits;
+        bool is_forwarded : 1;
+        bool is_deferred : 1;
+    };
+    static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
+                  "oox::var packed port/flags must stay 16-bit");
 
     template< typename T > friend struct gen_oox;
     task_node*  current_task = nullptr;
     void*       storage_ptr;
     int         storage_offset; // task_node* original = ptr - offset
-    std::uint16_t current_port_and_flags = 0; // port plus var-local forward/deferred flags
+    current_port_and_flags_t current_port_and_flags{}; // port plus var-local forward/deferred flags
 
     int current_port() const noexcept {
-        return static_cast<int>(current_port_and_flags & k_port_mask);
+        return static_cast<int>(current_port_and_flags.port);
     }
     void set_current_port(int port) noexcept {
-        __OOX_ASSERT_EX(port >= 0 && port <= static_cast<int>(k_port_mask), "oox::var port does not fit packed field");
-        current_port_and_flags = static_cast<std::uint16_t>((current_port_and_flags & ~k_port_mask) |
-                                                            static_cast<std::uint16_t>(port));
-    }
-    bool is_forward() const noexcept {
-        return (current_port_and_flags & k_forward_flag) != 0;
-    }
-    void set_forward(bool value) noexcept {
-        if (value)
-            current_port_and_flags |= k_forward_flag;
-        else
-            current_port_and_flags &= static_cast<std::uint16_t>(~k_forward_flag);
-    }
-    bool is_deferred() const noexcept {
-        return (current_port_and_flags & k_deferred_flag) != 0;
-    }
-    void set_deferred(bool value) noexcept {
-        if (value)
-            current_port_and_flags |= k_deferred_flag;
-        else
-            current_port_and_flags &= static_cast<std::uint16_t>(~k_deferred_flag);
+        __OOX_ASSERT_EX(port >= 0 && port <= k_max_port, "oox::var port does not fit packed field");
+        current_port_and_flags.port = static_cast<std::uint16_t>(port);
     }
 
     void set_next_writer( int output_port, task_node* d ) {
@@ -1051,7 +1039,7 @@ struct oox_var_base {
         //
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
-        if (is_deferred()) {
+        if (current_port_and_flags.is_deferred) {
             arc* raw_head = current_task->head.load(std::memory_order_acquire);
             // just like notify_successor an optimization might be useful if we restrict some operations from user
             /*
@@ -1073,16 +1061,16 @@ struct oox_var_base {
                 bool ok = d->add_arc(j);
                 __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
             }
-            set_deferred(false);
+            current_port_and_flags.is_deferred = false;
         }
         current_task->set_next_writer( current_port(), d );
         current_task = d;
         set_current_port(output_port);
     }
     void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false, bool deferred = false ) {
-        current_task = t, storage_ptr = ptr, current_port_and_flags = 0;
-        set_forward(fwd);
-        set_deferred(deferred);
+        current_task = t, storage_ptr = ptr, current_port_and_flags = {};
+        current_port_and_flags.is_forwarded = fwd;
+        current_port_and_flags.is_deferred = deferred;
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
         t->life_set_count(lifetime);
         __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
@@ -1296,7 +1284,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             ov.set_next_writer( port, self );// TODO: add 'count =' because no need in sync here
         } else
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
-        if( cov.is_forward() ) {
+        if( cov.current_port_and_flags.is_forwarded ) {
             oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
             my_ptr = 1|(uintptr_t)&next.storage_ptr;
         } else
@@ -1502,7 +1490,7 @@ template<typename T>
 
     // Follow forwarding chain until we reach a non-forward var
     internal::oox_var_base* base = &v;
-    while (base->is_forward()) {
+    while (base->current_port_and_flags.is_forwarded) {
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
         base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
     }
