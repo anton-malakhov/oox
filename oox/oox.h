@@ -219,7 +219,10 @@ struct task : public tbb_task, task_life {
 #define OOX_USING_TF
 #define TASK_EXECUTE_METHOD void* execute() override
 
-tf::Executor tf_pool; // TODO :)
+tf::Executor& get_tf_pool() {
+    static tf::Executor* tf_pool = new tf::Executor();
+    return *tf_pool;
+}
 
 struct task : task_life {
 
@@ -237,7 +240,7 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        tf_pool.silent_async([this]{this->execute();});
+        get_tf_pool().silent_async([this]{this->execute();});
     }
     void wait() {
         waiter.get_future().wait();
