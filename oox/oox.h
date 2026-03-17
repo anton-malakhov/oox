@@ -117,13 +117,20 @@ struct task_life {
 template<typename T, bool CanThrow>
 struct result_state;
 
-struct result_state_base {
+
+#if OOX_EXCEPTIONS_ENABLED
+template <typename Derived> struct result_state_throw_base {
     static constexpr unsigned char state_empty = k_result_state_empty;
     static constexpr unsigned char state_lock = k_result_state_lock;
     static constexpr unsigned char state_value = k_result_state_value;
     static constexpr unsigned char state_exception = k_result_state_exception;
 
   protected:
+    Derived& derived() noexcept { return *static_cast<Derived*>(this); }
+    const Derived& derived() const noexcept { return *static_cast<const Derived*>(this); }
+    std::atomic<std::uintptr_t>& state_bits() noexcept { return derived().state_bits(); }
+    const std::atomic<std::uintptr_t>& state_bits() const noexcept { return derived().state_bits(); }
+
     unsigned char read_state(const std::atomic<std::uintptr_t>& owner_storage) const noexcept {
         return decode_result_state(owner_storage.load(std::memory_order_acquire));
     }
@@ -137,15 +144,6 @@ struct result_state_base {
             }
         }
     }
-};
-
-#if OOX_EXCEPTIONS_ENABLED
-template <typename Derived> struct result_state_throw_base : result_state_base {
-  protected:
-    Derived& derived() noexcept { return *static_cast<Derived*>(this); }
-    const Derived& derived() const noexcept { return *static_cast<const Derived*>(this); }
-    std::atomic<std::uintptr_t>& state_bits() noexcept { return derived().state_bits(); }
-    const std::atomic<std::uintptr_t>& state_bits() const noexcept { return derived().state_bits(); }
 
     unsigned char read_stable_state() const noexcept {
         std::uintptr_t current = state_bits().load(std::memory_order_acquire);
@@ -243,8 +241,7 @@ template <typename Derived> struct result_state_throw_base : result_state_base {
 };
 #endif
 
-template <typename T> struct result_state<T, false> : private result_state_base {
-    using base_type = result_state_base;
+template <typename T> struct result_state<T, false> {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
     static constexpr unsigned char state_set = 1;
