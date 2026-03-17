@@ -13,7 +13,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#include <thread>
 #if defined(OOX_ENABLE_EXCEPTIONS)
 #define OOX_EXCEPTIONS_ENABLED (OOX_ENABLE_EXCEPTIONS)
 #elif defined(__cpp_exceptions)
@@ -66,7 +65,7 @@ inline constexpr std::uintptr_t k_task_done_tag = 0x1;
 inline constexpr std::uintptr_t k_result_state_tag_mask = 0x6;
 inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
 inline constexpr unsigned char k_result_state_empty = 0;
-inline constexpr unsigned char k_result_state_lock = 1;
+inline constexpr unsigned char k_result_state_cancelled = 1;
 inline constexpr unsigned char k_result_state_value = 2;
 inline constexpr unsigned char k_result_state_exception = 3;
 
@@ -121,7 +120,7 @@ struct result_state;
 #if OOX_EXCEPTIONS_ENABLED
 template <typename Derived> struct result_state_throw_base {
     static constexpr unsigned char state_empty = k_result_state_empty;
-    static constexpr unsigned char state_lock = k_result_state_lock;
+    static constexpr unsigned char state_cancelled = k_result_state_cancelled;
     static constexpr unsigned char state_value = k_result_state_value;
     static constexpr unsigned char state_exception = k_result_state_exception;
 
@@ -144,96 +143,65 @@ template <typename Derived> struct result_state_throw_base {
             }
         }
     }
-
-    unsigned char read_stable_state() const noexcept {
-        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
-        while (decode_result_state(current) == state_lock) {
-            std::this_thread::yield();
-            current = state_bits().load(std::memory_order_acquire);
-        }
-        return decode_result_state(current);
-    }
-    unsigned char lock_for_transition() noexcept {
+    unsigned char read_stable_state() const noexcept { return read_state(state_bits()); }
+    bool try_transition(unsigned char expected_state, unsigned char desired_state) noexcept {
         std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         for (;;) {
             const auto current_state = decode_result_state(current);
-            if (current_state == state_lock) {
-                std::this_thread::yield();
-                current = state_bits().load(std::memory_order_acquire);
-                continue;
+            if (current_state != expected_state) {
+                return false;
             }
-            std::uintptr_t desired = encode_result_state(current, state_lock);
+            const std::uintptr_t desired = encode_result_state(current, desired_state);
             if (state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
-                return current_state;
-            }
-        }
-    }
-    unsigned char lock_for_value_transition(unsigned char blocked_state = 0xFF) noexcept {
-        std::uintptr_t current = state_bits().load(std::memory_order_acquire);
-        for (;;) {
-            const auto current_state = decode_result_state(current);
-            if (current_state == blocked_state) {
-                return current_state;
-            }
-            if (current_state == state_lock) {
-                std::this_thread::yield();
-                current = state_bits().load(std::memory_order_acquire);
-                continue;
-            }
-            std::uintptr_t desired = encode_result_state(current, state_lock);
-            if (state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
-                return current_state;
+                return true;
             }
         }
     }
 
   public:
     std::exception_ptr* exception_slot_ptr() noexcept {
-        if (read_stable_state() != state_exception) {
+        const auto state = read_stable_state();
+        if (state != state_exception && state != state_cancelled) {
             return nullptr;
         }
         return derived().exception_ptr();
     }
-    int try_set_exception(std::exception_ptr* eptr) noexcept {
+    int try_set_exception(std::exception_ptr eptr) noexcept {
+        const bool is_cancelled = !eptr;
         std::uintptr_t current = state_bits().load(std::memory_order_acquire);
         for (;;) {
             const auto current_state = decode_result_state(current);
-            if (current_state == state_lock) {
-                return 2;
+            if (current_state == state_value || current_state == state_exception) {
+                return 0;
             }
-            if (current_state == state_value) {
+            if (is_cancelled && current_state != state_empty) {
                 return 0;
             }
 
-            std::uintptr_t desired = encode_result_state(current, state_lock);
+            const auto desired_state = is_cancelled ? state_cancelled : state_exception;
+            std::uintptr_t desired = encode_result_state(current, desired_state);
             if (!state_bits().compare_exchange_weak(current, desired, std::memory_order_acq_rel,
                                                     std::memory_order_acquire)) {
                 continue;
             }
 
             auto* slot = derived().exception_ptr();
-            if (current_state == state_exception) {
-                if (*slot || !eptr || !*eptr) {
-                    store_state(state_bits(), state_exception);
-                    return 0;
-                }
-                *slot = std::move(*eptr);
-                store_state(state_bits(), state_exception);
+            if (!is_cancelled && current_state == state_cancelled) {
+                *slot = std::move(eptr);
                 return 1;
             }
-
-            ::new (static_cast<void*>(slot)) std::exception_ptr(eptr ? std::move(*eptr) : std::exception_ptr{});
-            store_state(state_bits(), state_exception);
+            ::new (static_cast<void*>(slot)) std::exception_ptr(std::move(eptr));
             return 1;
         }
     }
     bool has_exception() const noexcept {
-        return read_stable_state() == state_exception;
+        const auto state = read_stable_state();
+        return state == state_exception || state == state_cancelled;
     }
     std::exception_ptr get_exception() const noexcept {
-        if (read_stable_state() != state_exception) {
+        const auto state = read_stable_state();
+        if (state != state_exception && state != state_cancelled) {
             return std::exception_ptr{};
         }
         return *derived().exception_ptr();
@@ -276,6 +244,8 @@ template <typename T> struct result_state<T, false> {
     }
     T& value() { return *ptr(); }
     const T& value() const { return *ptr(); }
+    void* value_storage_ptr() noexcept { return static_cast<void*>(storage.data); }
+    const void* value_storage_ptr() const noexcept { return static_cast<const void*>(storage.data); }
 #if OOX_EXCEPTIONS_ENABLED
     std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
 #endif
@@ -313,7 +283,7 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
     using base_type = result_state_throw_base<result_state<T, true>>;
     using value_type = T;
     static constexpr unsigned char state_empty = base_type::state_empty;
-    static constexpr unsigned char state_lock = base_type::state_lock;
+    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
 
@@ -330,44 +300,66 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
     ~result_state() = default;
 
     template <typename... Args> void emplace(Args&&... args) {
-        const auto previous = this->lock_for_value_transition(state_exception);
-        if (previous == state_exception) {
+        std::uintptr_t current = meta_byte.load(std::memory_order_acquire);
+        for (;;) {
+            const auto previous = decode_result_state(current);
+            if (previous == state_value || previous == state_exception) {
+                return;
+            }
+
+            const auto desired_state = state_value;
+            const std::uintptr_t desired = encode_result_state(current, desired_state);
+            if (!meta_byte.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                continue;
+            }
+
+            if (previous == state_cancelled) {
+                exception_ptr()->~exception_ptr();
+            }
+#if OOX_EXCEPTIONS_ENABLED
+            try {
+                construct_value(std::forward<Args>(args)...);
+            } catch (...) {
+                this->store_state(meta_byte, state_empty);
+                throw;
+            }
+#else
+            construct_value(std::forward<Args>(args)...);
+#endif
             return;
         }
-
-        if (previous == state_value) {
-            value_ptr()->~T();
-        }
-#if OOX_EXCEPTIONS_ENABLED
-        try {
-            construct_value(std::forward<Args>(args)...);
-            this->store_state(meta_byte, state_value);
-        } catch (...) {
-            this->store_state(meta_byte, state_empty);
-            throw;
-        }
-#else
-        construct_value(std::forward<Args>(args)...);
-        this->store_state(meta_byte, state_value);
-#endif
     }
     bool has_value() const noexcept {
         return this->read_stable_state() == state_value;
     }
     T& value() { return *value_ptr(); }
     const T& value() const { return *value_ptr(); }
+    void* value_storage_ptr() noexcept { return static_cast<void*>(storage.data); }
+    const void* value_storage_ptr() const noexcept { return static_cast<const void*>(storage.data); }
     using base_type::exception_slot_ptr;
     using base_type::get_exception;
     using base_type::has_exception;
     using base_type::try_set_exception;
     void reset() {
-        const auto previous = this->lock_for_transition();
-        if (previous == state_value) {
-            value_ptr()->~T();
-        } else if (previous == state_exception) {
-            exception_ptr()->~exception_ptr();
+        std::uintptr_t current = meta_byte.load(std::memory_order_acquire);
+        for (;;) {
+            const auto previous = decode_result_state(current);
+            if (previous == state_empty) {
+                return;
+            }
+            const std::uintptr_t desired = encode_result_state(current, state_empty);
+            if (!meta_byte.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                continue;
+            }
+            if (previous == state_value) {
+                value_ptr()->~T();
+            } else {
+                exception_ptr()->~exception_ptr();
+            }
+            return;
         }
-        this->store_state(meta_byte, state_empty);
     }
 
   private:
@@ -403,7 +395,7 @@ template <typename T> struct result_state<T, true> : private result_state_throw_
 template <> struct result_state<void, true> : private result_state_throw_base<result_state<void, true>> {
     using base_type = result_state_throw_base<result_state<void, true>>;
     static constexpr unsigned char state_empty = base_type::state_empty;
-    static constexpr unsigned char state_lock = base_type::state_lock;
+    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
 
@@ -424,11 +416,22 @@ template <> struct result_state<void, true> : private result_state_throw_base<re
     using base_type::has_exception;
     using base_type::try_set_exception;
     void reset() {
-        const auto previous = this->lock_for_transition();
-        if (previous == state_exception) {
-            exception_ptr()->~exception_ptr();
+        std::uintptr_t current = meta_byte.load(std::memory_order_acquire);
+        for (;;) {
+            const auto previous = decode_result_state(current);
+            if (previous == state_empty) {
+                return;
+            }
+            const std::uintptr_t desired = encode_result_state(current, state_empty);
+            if (!meta_byte.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                continue;
+            }
+            if (previous == state_exception || previous == state_cancelled) {
+                exception_ptr()->~exception_ptr();
+            }
+            return;
         }
-        this->store_state(meta_byte, state_empty);
     }
 
   private:
