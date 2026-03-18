@@ -9,10 +9,10 @@
 #include <cassert>
 #include <oox/oox.h>
 
-constexpr int FibN = 28;
+constexpr int FibN = 30;
+int cutoff = 8;
 constexpr int max_cutoff = 20;
 constexpr int cutoff_step = 2;
-int cutoff = 2;
 
 namespace Serial { // Original problem statement
 

@@ -6,18 +6,13 @@
 #define __OOX_H__
 
 #include <utility>
-#include <functional>
 #include <type_traits>
 #include <limits>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#if defined(OOX_ENABLE_EXCEPTIONS)
-#define OOX_EXCEPTIONS_ENABLED (OOX_ENABLE_EXCEPTIONS)
-#elif defined(__cpp_exceptions)
-#define OOX_EXCEPTIONS_ENABLED 1
-#else
+#ifndef OOX_EXCEPTIONS_ENABLED
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif
 
@@ -1299,9 +1294,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
-        } else {
-            __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         }
+        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         return static_cast<C&&>(state->value());
     }
 };
