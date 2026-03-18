@@ -907,15 +907,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
     __OOX_TRACE("%p notify successors",this);
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
-    auto raw_head = head.load(std::memory_order_acquire);
-    /*
-    Optimized path if we have invariant
-    dependency graph is fully built before any task can complete,
-    so no concurrent head writers (add_arc/set_next_writer) are possible.
-    arc* desired = head_from_bits(k_task_done_tag);
-    head.store(desired, std::memory_order_release);
-    */
-    raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
+    auto raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
 
     if( arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask) )
         do_notify_arcs( r, count );
@@ -1052,8 +1044,7 @@ struct oox_var_base {
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
-            arc* raw_head = current_task->head.load(std::memory_order_acquire);
-            raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            arc* raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
             arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask);
             while(r) {
                 arc* j = r;
@@ -1297,12 +1288,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
     C&& consume() {
         internal::result_state<ooxed_type, false>* state = nullptr;
         if( my_ptr & 1 ) {
-            auto* next = reinterpret_cast<oox_var_base*>(
-                reinterpret_cast<char*>(my_ptr ^ 1) - offsetof(oox_var_base, storage_ptr));
-            while(next->current_port_and_flags.is_forwarded) {
-                next = reinterpret_cast<oox_var_base*>(next->storage_ptr);
-            }
-            state = static_cast<internal::result_state<ooxed_type, false>*>(next->storage_ptr);
+            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
+            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
         } else {
             state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
@@ -1312,8 +1299,9 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
+        } else {
+            __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         }
-        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         return static_cast<C&&>(state->value());
     }
 };
