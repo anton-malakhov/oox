@@ -7,10 +7,16 @@ const std::string parallel_str = STR(PARALLEL);
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 #include <oox/oox.h>
-#if defined(__cpp_exceptions)
+#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED
 #include <exception>
 #endif
 #include <functional>
+
+#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED
+#define OOX_BENCH_RUNTIME_EXCEPTIONS 1
+#else
+#define OOX_BENCH_RUNTIME_EXCEPTIONS 0
+#endif
 
 namespace {
     const bool kBenchmarkContext = []() {
@@ -19,7 +25,7 @@ namespace {
         return true;
     }();
 
-#if defined(__cpp_exceptions)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS
     struct dummy_throw : std::exception {
         const char *what() const noexcept override {
             return "dummy throw";
@@ -41,7 +47,7 @@ namespace {
         }
     }
 
-#if defined(__cpp_exceptions)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS
     void OOX_Single_Throw(benchmark::State &state) {
         for (auto _: state) {
             oox::var<int> a = oox::run([]() -> int {
@@ -69,7 +75,7 @@ namespace {
         state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(N) + 1));
     }
 
-#if defined(__cpp_exceptions)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS
     void OOX_Chain_RootThrows(benchmark::State &state) {
         const auto N = static_cast<int>(state.range(0));
         for (auto _: state) {
@@ -106,7 +112,7 @@ namespace {
         state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(3) * N + 1));
     }
 
-#if defined(__cpp_exceptions)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS
     void OOX_Diamond_ThrowMiddle(benchmark::State &state) {
         const auto N = static_cast<int>(state.range(0));
         const int throw_at = (N > 0) ? (N / 2) : 0;
@@ -137,20 +143,20 @@ namespace {
 } // namespace
 
 BENCHMARK(OOX_Single_NoExcept)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
-#if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
 BENCHMARK(OOX_Single_Throw)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
 #endif
 
 BENCHMARK(OOX_Chain_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
-#if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
 BENCHMARK(OOX_Chain_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #endif
 
 BENCHMARK(OOX_Diamond_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
-#if defined(__cpp_exceptions) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
+#if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
 BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #endif
