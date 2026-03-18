@@ -1297,25 +1297,23 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
     C&& consume() {
         internal::result_state<ooxed_type, false>* state = nullptr;
         if( my_ptr & 1 ) {
-            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
-            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
-            if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-                constexpr std::ptrdiff_t offset_delta =
-                    offsetof(internal::oox_var_base, storage_offset) - offsetof(internal::oox_var_base, storage_ptr);
-                const auto* storage_offset_ptr = reinterpret_cast<const int*>(
-                    reinterpret_cast<const char*>(reinterpret_cast<void**>(my_ptr ^ 1)) + offset_delta);
-                auto* owner_task = reinterpret_cast<internal::task_node*>(
-                    reinterpret_cast<std::uintptr_t>(p) -
-                    static_cast<std::uintptr_t>(*storage_offset_ptr));
-                __OOX_ASSERT_EX(owner_task, "null owner task");
-                if(!state->has_value()) {
-                    state->emplace(); // requires default-constructible T
-                }
+            auto* next = reinterpret_cast<oox_var_base*>(
+                reinterpret_cast<char*>(my_ptr ^ 1) - offsetof(oox_var_base, storage_ptr));
+            while(next->current_port_and_flags.is_forwarded) {
+                next = reinterpret_cast<oox_var_base*>(next->storage_ptr);
             }
+            state = static_cast<internal::result_state<ooxed_type, false>*>(next->storage_ptr);
         } else {
             state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
         __OOX_ASSERT_EX(state, "null result_state storage");
+
+        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+            if(!state->has_value()) {
+                state->emplace(); // requires default-constructible T
+            }
+        }
+        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         return static_cast<C&&>(state->value());
     }
 };
@@ -1385,7 +1383,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
     using storage_task<slots, F>::storage_task;
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
-    bool is_executed = false;
+    bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
@@ -1419,9 +1417,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox;
-        oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1);
-        return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1); return oox;
     }
 };
 template<>
