@@ -902,9 +902,8 @@ int task_node::notify_successors( int output_slots, int *count ) {
     __OOX_TRACE("%p notify successors",this);
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
-    auto raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
 
-    if( arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask) )
+   if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
         do_notify_arcs( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
@@ -1039,9 +1038,8 @@ struct oox_var_base {
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
-            arc* raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
-            arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask);
-            while(r) {
+            arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            while(r > (arc*)k_task_done_tag) {
                 arc* j = r;
                 r = j->next;
                 j->port = arc::port_int(output_port);
