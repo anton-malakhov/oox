@@ -574,8 +574,8 @@ struct task : public tbb_task, task_life {
 #define TASK_EXECUTE_METHOD void* execute() override
 
 tf::Executor& get_tf_pool() {
-  static tf::Executor* tf_pool = new tf::Executor();
-  return *tf_pool;
+    static tf::Executor* tf_pool = new tf::Executor();
+    return *tf_pool;
 }
 
 struct task : task_life {
@@ -597,15 +597,21 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        get_tf_pool().silent_async([this]{this->execute();});
+        // Without this guard, concurrent release() on dependency edges can reclaim
+        // the task object before execute() reaches its own release path.
+        life_count.fetch_add(1, std::memory_order_acq_rel);
+        get_tf_pool().silent_async([this]{
+            this->execute();
+            this->release(1);
+        });
     }
     void wait() {
         waiter_future.wait();
     }
     void wakeup() {
-        std::call_once(wakeup_once, [this] {
-            waiter.set_value();
-        });
+      std::call_once(wakeup_once, [this] {
+        waiter.set_value();
+      });
     }
 };
 #elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
