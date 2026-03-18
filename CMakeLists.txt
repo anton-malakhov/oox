@@ -27,6 +27,7 @@ option(OOX_LOCAL_TF "Force local copy of TaskFlow" OFF)
 option(OOX_ENABLE_FOLLY "Enable Folly for threading" ON)
 option(OOX_LOCAL_FOLLY "Force local copy of Folly" OFF)
 option(OOX_ENABLE_OMP "Enable OpenMP for comparison (if found)" ON)
+option(OOX_ENABLE_EXCEPTIONS "Enable OOX exception-aware state machinery" OFF)
 
 # Global features
 if (OOX_SANITIZE)
@@ -139,6 +140,11 @@ add_library(${PROJECT_NAME} INTERFACE)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_11)
 target_link_libraries(${PROJECT_NAME} INTERFACE Threads::Threads)
+if (OOX_ENABLE_EXCEPTIONS)
+  target_compile_definitions(${PROJECT_NAME} INTERFACE OOX_ENABLE_EXCEPTIONS=1)
+else ()
+  target_compile_definitions(${PROJECT_NAME} INTERFACE OOX_ENABLE_EXCEPTIONS=0)
+endif ()
 target_include_directories(${PROJECT_NAME} INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
         $<INSTALL_INTERFACE:include/>
