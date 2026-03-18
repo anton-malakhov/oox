@@ -827,7 +827,7 @@ struct task_node : public task, arc_list {
     // Call base notify successors
     template<int slots>
     void notify_successors();
-#if OOX_ENABLE_EXCEPTIONS
+#if OOX_EXCEPTIONS_ENABLED
     virtual void notify_successors_virtual() = 0;
 #endif
     // Call base forward successors
@@ -1038,7 +1038,7 @@ struct output_slots_storage {
 template<int slots>
 struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
-#if OOX_ENABLE_EXCEPTIONS
+#if OOX_EXCEPTIONS_ENABLED
     void notify_successors_virtual() override {
         task_node::notify_successors<slots>();
     }

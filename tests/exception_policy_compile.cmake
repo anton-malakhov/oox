@@ -16,8 +16,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 set(OOX_SOURCE_DIR \"${OOX_SOURCE_DIR}\")
-set(CMAKE_CXX_FLAGS \"${CMAKE_CXX_FLAGS} -I${OOX_SOURCE_DIR}\")
-
 file(WRITE \"${OOX_TRY_SRC_DIR}/ok.cpp\" \"
 #include <oox/oox.h>
 int main() {
@@ -33,13 +31,14 @@ int main() {
 try_compile(OOX_OK_RESULT
             \"${OOX_TRY_BUILD_DIR}/ok_build\"
             \"${OOX_TRY_SRC_DIR}/ok.cpp\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
               \"-DCMAKE_CXX_EXTENSIONS=OFF\"
             OUTPUT_VARIABLE OOX_OK_OUTPUT)
 if (NOT OOX_OK_RESULT)
-  message(FATAL_ERROR \"Expected ok.cpp to compile. Output:\\n${OOX_OK_OUTPUT}\")
+  message(FATAL_ERROR \"Expected ok.cpp to compile. Output:\\n\${OOX_OK_OUTPUT}\")
 endif()
 
 file(WRITE \"${OOX_TRY_SRC_DIR}/fail.cpp\" \"
@@ -55,13 +54,14 @@ int main() {
 try_compile(OOX_FAIL_RESULT
             \"${OOX_TRY_BUILD_DIR}/fail_build\"
             \"${OOX_TRY_SRC_DIR}/fail.cpp\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
               \"-DCMAKE_CXX_EXTENSIONS=OFF\"
             OUTPUT_VARIABLE OOX_FAIL_OUTPUT)
 if (OOX_FAIL_RESULT)
-  message(FATAL_ERROR \"Expected fail.cpp to fail to compile. Output:\\n${OOX_FAIL_OUTPUT}\")
+  message(FATAL_ERROR \"Expected fail.cpp to fail to compile. Output:\\n\${OOX_FAIL_OUTPUT}\")
 endif()
 
 file(WRITE \"${OOX_TRY_SRC_DIR}/fail_write.cpp\" \"
@@ -76,13 +76,14 @@ int main() {
 try_compile(OOX_FAIL_WRITE_RESULT
             \"${OOX_TRY_BUILD_DIR}/fail_write_build\"
             \"${OOX_TRY_SRC_DIR}/fail_write.cpp\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
               \"-DCMAKE_CXX_EXTENSIONS=OFF\"
             OUTPUT_VARIABLE OOX_FAIL_WRITE_OUTPUT)
 if (OOX_FAIL_WRITE_RESULT)
-  message(FATAL_ERROR \"Expected fail_write.cpp to fail to compile. Output:\\n${OOX_FAIL_WRITE_OUTPUT}\")
+  message(FATAL_ERROR \"Expected fail_write.cpp to fail to compile. Output:\\n\${OOX_FAIL_WRITE_OUTPUT}\")
 endif()
 ")
 
