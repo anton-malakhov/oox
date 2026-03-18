@@ -19,7 +19,7 @@ set(OOX_SOURCE_DIR \"${OOX_SOURCE_DIR}\")
 file(WRITE \"${OOX_TRY_SRC_DIR}/ok.cpp\" \"
 #include <oox/oox.h>
 int main() {
-#if defined(__cpp_exceptions)
+#if OOX_EXCEPTIONS_ENABLED
     oox::var<int, false> base = oox::run<false>([]() { return 1; });
     oox::var<int, true> dep = oox::run<true>([](int x) { return x + 1; }, base);
     (void)dep;
@@ -31,7 +31,7 @@ int main() {
 try_compile(OOX_OK_RESULT
             \"${OOX_TRY_BUILD_DIR}/ok_build\"
             \"${OOX_TRY_SRC_DIR}/ok.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
@@ -54,7 +54,7 @@ int main() {
 try_compile(OOX_FAIL_RESULT
             \"${OOX_TRY_BUILD_DIR}/fail_build\"
             \"${OOX_TRY_SRC_DIR}/fail.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
@@ -76,7 +76,7 @@ int main() {
 try_compile(OOX_FAIL_WRITE_RESULT
             \"${OOX_TRY_BUILD_DIR}/fail_write_build\"
             \"${OOX_TRY_SRC_DIR}/fail_write.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"

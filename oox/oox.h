@@ -12,11 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#if defined(OOX_ENABLE_EXCEPTIONS)
-#define OOX_EXCEPTIONS_ENABLED (OOX_ENABLE_EXCEPTIONS)
-#elif defined(__cpp_exceptions)
-#define OOX_EXCEPTIONS_ENABLED 1
-#else
+#ifndef OOX_EXCEPTIONS_ENABLED
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif
 
@@ -66,7 +62,8 @@ struct cancelled_by_exception final : std::exception {
 #endif
 
 #if defined(OOX_DEFAULT_EXCEPTION_POLICY)
-inline constexpr bool default_exception_policy = (OOX_DEFAULT_EXCEPTION_POLICY != 0);
+inline constexpr bool default_exception_policy =
+    OOX_EXCEPTIONS_ENABLED && (OOX_DEFAULT_EXCEPTION_POLICY != 0);
 #elif OOX_EXCEPTIONS_ENABLED
 inline constexpr bool default_exception_policy = true;
 #else
@@ -945,15 +942,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
     __OOX_TRACE("%p notify successors",this);
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
-    auto raw_head = head.load(std::memory_order_acquire);
-    /*
-    Optimized path if we have invariant
-    dependency graph is fully built before any task can complete,
-    so no concurrent head writers (add_arc/set_next_writer) are possible.
-    arc* desired = head_from_bits(k_task_done_tag);
-    head.store(desired, std::memory_order_release);
-    */
-    raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
+    auto raw_head = head.exchange(head_from_bits(k_task_done_tag), std::memory_order_acq_rel);
 
     if( arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask) )
         do_notify_arcs( r, count );
@@ -1125,8 +1114,7 @@ struct oox_var_base {
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
-            arc* raw_head = current_task->head.load(std::memory_order_acquire);
-            raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            arc* raw_head = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
             arc* r = reinterpret_cast<arc*>(head_bits(raw_head) & ~k_task_tag_mask);
             while(r) {
                 arc* j = r;
@@ -1231,6 +1219,7 @@ class var : public internal::oox_var_base {
                   "Specialize oox::var only by plain types and pointers."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<T, true> requires OOX_EXCEPTIONS_ENABLED=1");
 
     void* allocate_new() noexcept {
         auto *v = internal::task::allocate<internal::storage_task<1, T, CanThrow>>();
@@ -1284,6 +1273,7 @@ public:
 template<bool CanThrow>
 class var<void, CanThrow> : public internal::oox_var_base {
     template< typename T, bool > friend struct gen_oox;
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<void, true> requires OOX_EXCEPTIONS_ENABLED=1");
 public:
     var() {}
     template<typename D, bool DCanThrow>
@@ -1365,29 +1355,25 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
         }
         if( cov.current_port_and_flags.is_forwarded ) {
-            oox_var_base& next = *reinterpret_cast<oox_var_base*>(cov.storage_ptr);
-            my_ptr = 1 | reinterpret_cast<uintptr_t>(&next.storage_ptr);
-        } else {
+            oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
+            my_ptr = 1|(uintptr_t)&next.storage_ptr;
+        } else
             my_ptr = (uintptr_t)cov.storage_ptr;
-        }
+        //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
+        //    ov.~var(); // TODO: no need in sync for not yet published task
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
         internal::result_state<ooxed_type, VarCanThrow>* state = nullptr;
         if( my_ptr & 1 ) {
-            auto* next = reinterpret_cast<oox_var_base*>(
-                reinterpret_cast<char*>(my_ptr ^ 1) - offsetof(oox_var_base, storage_ptr));
-            while(next->current_port_and_flags.is_forwarded) {
-                next = reinterpret_cast<oox_var_base*>(next->storage_ptr);
-            }
-            state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(next->storage_ptr);
+            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
+            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
         } else {
-            state = reinterpret_cast<internal::result_state<ooxed_type, VarCanThrow>*>(my_ptr);
+            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
         __OOX_ASSERT_EX(state, "null result_state storage");
 
-        if constexpr (
-            std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
@@ -1707,6 +1693,7 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 template< bool CanThrow = default_exception_policy, typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
 auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>, CanThrow>
 {
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::run<true>(...) requires OOX_EXCEPTIONS_ENABLED=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
     using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
