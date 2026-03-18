@@ -244,7 +244,13 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        get_tf_pool().silent_async([this]{this->execute();});
+        // Without this guard, concurrent release() on dependency edges can reclaim
+        // the task object before execute() reaches its own release path.
+        life_count.fetch_add(1, std::memory_order_acq_rel);
+        get_tf_pool().silent_async([this]{
+            this->execute();
+            this->release(1);
+        });
     }
     void wait() {
         waiter_future.wait();
