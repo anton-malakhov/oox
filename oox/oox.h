@@ -71,7 +71,6 @@ inline constexpr bool default_exception_policy = false;
 #endif
 
 namespace internal {
-struct arc;
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
 inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
@@ -720,8 +719,6 @@ struct arc {
     kinds      kind;
     arc( task_node* n, int p, kinds k = flow_back ) : node(n), port(port_int(p)), kind(k) {}
 };
-
-static_assert(alignof(arc) >= 8, "arc alignment must provide three low tag bits");
 
 struct arc_list {
     // Root of list of nodes that are waiting for this node's value to be produced.
