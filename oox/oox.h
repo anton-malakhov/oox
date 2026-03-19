@@ -92,8 +92,8 @@ struct task_life {
 template<typename T, bool CanThrow>
 struct result_state;
 
-
-template <typename T> struct result_state<T, false> {
+template <typename T>
+struct result_state<T, false> {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
     static constexpr unsigned char state_set = 1;
@@ -105,21 +105,16 @@ template <typename T> struct result_state<T, false> {
     result_state& operator=(result_state&&) = delete;
     ~result_state() = default;
 
-    template <typename... Args> void emplace(Args&&... args) {
+    template <typename... Args>
+    void emplace(Args&&... args) {
         const auto previous = static_cast<unsigned char>(state_bits_field);
-        if (previous == state_set) {
-            ptr()->~T();
-        }
+        __OOX_ASSERT(previous != state_set, "never changing value inside storage with emplace");
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_set;
     }
-    bool has_value() const noexcept {
-        return static_cast<unsigned char>(state_bits_field) == state_set;
-    }
+    bool has_value() const noexcept { return static_cast<unsigned char>(state_bits_field) == state_set; }
     T& value() { return *ptr(); }
     const T& value() const { return *ptr(); }
-    void* value_storage_ptr() noexcept { return static_cast<void*>(storage.data); }
-    const void* value_storage_ptr() const noexcept { return static_cast<const void*>(storage.data); }
     void reset() {
         const auto previous = static_cast<unsigned char>(state_bits_field);
         if (previous == state_set) {
@@ -135,7 +130,8 @@ template <typename T> struct result_state<T, false> {
     storage_t storage{};
     bool state_bits_field : 1;
 
-    template <typename... Args> void construct_value(Args&&... args) {
+    template <typename... Args>
+    void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
             ::new (static_cast<void*>(storage.data)) T;
         } else {
@@ -146,7 +142,8 @@ template <typename T> struct result_state<T, false> {
     const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
 };
 
-template <bool CanThrow> struct result_state<void, CanThrow>;
+template <bool CanThrow>
+struct result_state<void, CanThrow>;
 
 
 template <> struct result_state<void, false> {
@@ -665,7 +662,7 @@ void task_node::notify_successors() {
 
 template<int N>
 struct output_slots_storage {
-    output_node nodes[N];
+    output_node output_nodes[N];
 };
 
 template<int slots>
@@ -679,7 +676,7 @@ __attribute__((no_sanitize("undefined")))
 output_node& task_node::out(int n) const {
     using self_t = task_node_slots<1024>;
     auto self = const_cast<self_t*>(reinterpret_cast<const self_t*>(this));
-    return self->nodes[n];
+    return self->output_nodes[n];
 }
 
 template<int slots, typename T>
