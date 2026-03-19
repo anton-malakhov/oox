@@ -129,11 +129,11 @@ template <typename T> struct result_state<T, false> {
     }
 
   private:
-    bool state_bits_field : 1;
     struct storage_t {
         alignas(alignof(T)) std::byte data[sizeof(T)];
     };
     storage_t storage{};
+    bool state_bits_field : 1;
 
     template <typename... Args> void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
