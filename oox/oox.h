@@ -110,7 +110,6 @@ template <typename T> struct result_state<T, false> {
         if (previous == state_set) {
             ptr()->~T();
         }
-e
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_set;
     }
