@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <new>
 #ifndef OOX_EXCEPTIONS_ENABLED
-#define OOX_EXCEPTIONS_ENABLED 1
+#define OOX_EXCEPTIONS_ENABLED 0
 #endif
 
 #if OOX_EXCEPTIONS_ENABLED
@@ -93,87 +93,6 @@ template<typename T, bool CanThrow>
 struct result_state;
 
 
-#if OOX_EXCEPTIONS_ENABLED
-template <typename Derived> struct result_state_throw_base {
-    static constexpr unsigned char state_empty = k_result_state_empty;
-    static constexpr unsigned char state_cancelled = k_result_state_cancelled;
-    static constexpr unsigned char state_value = k_result_state_value;
-    static constexpr unsigned char state_exception = k_result_state_exception;
-
-  protected:
-    Derived& derived() noexcept { return *static_cast<Derived*>(this); }
-    const Derived& derived() const noexcept { return *static_cast<const Derived*>(this); }
-    std::atomic<unsigned char>& state_bits() noexcept { return derived().state_bits(); }
-    const std::atomic<unsigned char>& state_bits() const noexcept { return derived().state_bits(); }
-
-    unsigned char read_state(const std::atomic<unsigned char>& owner_storage) const noexcept {
-        return owner_storage.load(std::memory_order_acquire);
-    }
-    void store_state(std::atomic<unsigned char>& owner_storage, unsigned char state) noexcept {
-        owner_storage.store(state, std::memory_order_release);
-    }
-    unsigned char read_stable_state() const noexcept { return read_state(state_bits()); }
-    bool try_transition(unsigned char expected_state, unsigned char desired_state) noexcept {
-        unsigned char current = state_bits().load(std::memory_order_acquire);
-        for (;;) {
-            if (current != expected_state) {
-                return false;
-            }
-            if (state_bits().compare_exchange_weak(current, desired_state, std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
-                return true;
-            }
-        }
-    }
-
-  public:
-    std::exception_ptr* exception_slot_ptr() noexcept {
-        const auto state = read_stable_state();
-        if (state != state_exception && state != state_cancelled) {
-            return nullptr;
-        }
-        return derived().exception_ptr();
-    }
-    int try_set_exception(std::exception_ptr eptr) noexcept {
-        const bool is_cancelled = !eptr;
-        unsigned char current = state_bits().load(std::memory_order_acquire);
-        for (;;) {
-            if (current == state_value || current == state_exception) {
-                return 0;
-            }
-            if (is_cancelled && current != state_empty) {
-                return 0;
-            }
-
-            const auto desired_state = is_cancelled ? state_cancelled : state_exception;
-            if (!state_bits().compare_exchange_weak(current, desired_state, std::memory_order_acq_rel,
-                                                    std::memory_order_acquire)) {
-                continue;
-            }
-
-            auto* slot = derived().exception_ptr();
-            if (!is_cancelled && current == state_cancelled) {
-                *slot = std::move(eptr);
-                return 1;
-            }
-            ::new (static_cast<void*>(slot)) std::exception_ptr(std::move(eptr));
-            return 1;
-        }
-    }
-    bool has_exception() const noexcept {
-        const auto state = read_stable_state();
-        return state == state_exception || state == state_cancelled;
-    }
-    std::exception_ptr get_exception() const noexcept {
-        const auto state = read_stable_state();
-        if (state != state_exception && state != state_cancelled) {
-            return std::exception_ptr{};
-        }
-        return *derived().exception_ptr();
-    }
-};
-#endif
-
 template <typename T> struct result_state<T, false> {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
@@ -191,18 +110,9 @@ template <typename T> struct result_state<T, false> {
         if (previous == state_set) {
             ptr()->~T();
         }
-#if OOX_EXCEPTIONS_ENABLED
-        try {
-            construct_value(std::forward<Args>(args)...);
-            state_bits_field = state_set;
-        } catch (...) {
-            state_bits_field = state_unset;
-            throw;
-        }
-#else
+e
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_set;
-#endif
     }
     bool has_value() const noexcept {
         return static_cast<unsigned char>(state_bits_field) == state_set;
@@ -211,10 +121,6 @@ template <typename T> struct result_state<T, false> {
     const T& value() const { return *ptr(); }
     void* value_storage_ptr() noexcept { return static_cast<void*>(storage.data); }
     const void* value_storage_ptr() const noexcept { return static_cast<const void*>(storage.data); }
-#if OOX_EXCEPTIONS_ENABLED
-    std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
-#endif
-
     void reset() {
         const auto previous = static_cast<unsigned char>(state_bits_field);
         if (previous == state_set) {
@@ -243,171 +149,8 @@ template <typename T> struct result_state<T, false> {
 
 template <bool CanThrow> struct result_state<void, CanThrow>;
 
-#if OOX_EXCEPTIONS_ENABLED
-template <typename T> struct result_state<T, true> : private result_state_throw_base<result_state<T, true>> {
-    using base_type = result_state_throw_base<result_state<T, true>>;
-    using value_type = T;
-    static constexpr unsigned char state_empty = base_type::state_empty;
-    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
-    static constexpr unsigned char state_value = base_type::state_value;
-    static constexpr unsigned char state_exception = base_type::state_exception;
-
-    result_state() : meta_state(state_empty) {}
-    result_state(const result_state&) = delete;
-    result_state& operator=(const result_state&) = delete;
-    result_state(result_state&&) = delete;
-    result_state& operator=(result_state&&) = delete;
-    ~result_state() = default;
-
-    template <typename... Args> void emplace(Args&&... args) {
-        unsigned char current = meta_state.load(std::memory_order_acquire);
-        for (;;) {
-            const auto previous = current;
-            if (previous == state_value || previous == state_exception) {
-                return;
-            }
-
-            if (!meta_state.compare_exchange_weak(current, state_value, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-                continue;
-            }
-
-            if (previous == state_cancelled) {
-                exception_ptr()->~exception_ptr();
-            }
-#if OOX_EXCEPTIONS_ENABLED
-            try {
-                construct_value(std::forward<Args>(args)...);
-            } catch (...) {
-                this->store_state(meta_state, state_empty);
-                throw;
-            }
-#else
-            construct_value(std::forward<Args>(args)...);
-#endif
-            return;
-        }
-    }
-    bool has_value() const noexcept {
-        return this->read_stable_state() == state_value;
-    }
-    T& value() { return *value_ptr(); }
-    const T& value() const { return *value_ptr(); }
-    void* value_storage_ptr() noexcept { return static_cast<void*>(storage.data); }
-    const void* value_storage_ptr() const noexcept { return static_cast<const void*>(storage.data); }
-    using base_type::exception_slot_ptr;
-    using base_type::get_exception;
-    using base_type::has_exception;
-    using base_type::try_set_exception;
-    void reset() {
-        unsigned char current = meta_state.load(std::memory_order_acquire);
-        for (;;) {
-            const auto previous = current;
-            if (previous == state_empty) {
-                return;
-            }
-            if (!meta_state.compare_exchange_weak(current, state_empty, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-                continue;
-            }
-            if (previous == state_value) {
-                value_ptr()->~T();
-            } else {
-                exception_ptr()->~exception_ptr();
-            }
-            return;
-        }
-    }
-
-  private:
-    std::atomic<unsigned char> meta_state{state_empty};
-    static constexpr std::size_t storage_size =
-        (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
-    static constexpr std::size_t storage_align =
-        (alignof(T) > alignof(std::exception_ptr)) ? alignof(T) : alignof(std::exception_ptr);
-    struct storage_t {
-        alignas(storage_align) std::byte data[storage_size];
-    };
-    template <typename> friend struct result_state_throw_base;
-    std::atomic<unsigned char>& state_bits() noexcept { return meta_state; }
-    const std::atomic<unsigned char>& state_bits() const noexcept { return meta_state; }
-    storage_t storage{};
-    template <typename... Args> void construct_value(Args&&... args) {
-        if constexpr (sizeof...(Args) == 0) {
-            ::new (static_cast<void*>(storage.data)) T;
-        } else {
-            ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
-        }
-    }
-    T* value_ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
-    const T* value_ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
-    std::exception_ptr* exception_ptr() noexcept {
-        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
-    }
-    const std::exception_ptr* exception_ptr() const noexcept {
-        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
-    }
-};
-
-template <> struct result_state<void, true> : private result_state_throw_base<result_state<void, true>> {
-    using base_type = result_state_throw_base<result_state<void, true>>;
-    static constexpr unsigned char state_empty = base_type::state_empty;
-    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
-    static constexpr unsigned char state_value = base_type::state_value;
-    static constexpr unsigned char state_exception = base_type::state_exception;
-
-    result_state() : meta_state(state_empty) {}
-    result_state(const result_state&) = delete;
-    result_state& operator=(const result_state&) = delete;
-    result_state(result_state&&) = delete;
-    result_state& operator=(result_state&&) = delete;
-    ~result_state() = default;
-
-    using base_type::exception_slot_ptr;
-    using base_type::get_exception;
-    using base_type::has_exception;
-    using base_type::try_set_exception;
-    void reset() {
-        unsigned char current = meta_state.load(std::memory_order_acquire);
-        for (;;) {
-            const auto previous = current;
-            if (previous == state_empty) {
-                return;
-            }
-            if (!meta_state.compare_exchange_weak(current, state_empty, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-                continue;
-            }
-            if (previous == state_exception || previous == state_cancelled) {
-                exception_ptr()->~exception_ptr();
-            }
-            return;
-        }
-    }
-
-  private:
-    std::atomic<unsigned char> meta_state{state_empty};
-    static constexpr std::size_t storage_size = sizeof(std::exception_ptr);
-    struct storage_t {
-        alignas(alignof(std::exception_ptr)) std::byte data[storage_size];
-    };
-    template <typename> friend struct result_state_throw_base;
-    std::atomic<unsigned char>& state_bits() noexcept { return meta_state; }
-    const std::atomic<unsigned char>& state_bits() const noexcept { return meta_state; }
-    storage_t storage{};
-    std::exception_ptr* exception_ptr() noexcept {
-        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
-    }
-    const std::exception_ptr* exception_ptr() const noexcept {
-        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
-    }
-};
-#endif
 
 template <> struct result_state<void, false> {
-#if OOX_EXCEPTIONS_ENABLED
-    std::exception_ptr* exception_slot_ptr() noexcept { return nullptr; }
-#endif
 };
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
