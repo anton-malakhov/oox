@@ -216,15 +216,22 @@ struct task : public tbb_task, task_life {
     }
 };
 #elif HAVE_TF /////////////////////// Taskflow ///////////////////////////////////////
+#include <mutex>
 #define OOX_USING_TF
 #define TASK_EXECUTE_METHOD void* execute() override
 
-tf::Executor tf_pool; // TODO :)
+tf::Executor& get_tf_pool() {
+    static tf::Executor* tf_pool = new tf::Executor();
+    return *tf_pool;
+}
 
 struct task : task_life {
 
     std::promise<void> waiter;
+    std::shared_future<void> waiter_future;
+    std::once_flag wakeup_once;
 
+    task() : waiter_future(waiter.get_future().share()) {}
     virtual ~task() = default;
     virtual void* execute() = 0;
 
@@ -237,13 +244,21 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        tf_pool.silent_async([this]{this->execute();});
+        // Without this guard, concurrent release() on dependency edges can reclaim
+        // the task object before execute() reaches its own release path.
+        life_count.fetch_add(1, std::memory_order_acq_rel);
+        get_tf_pool().silent_async([this]{
+            this->execute();
+            this->release(1);
+        });
     }
     void wait() {
-        waiter.get_future().wait();
+        waiter_future.wait();
     }
     void wakeup() {
+      std::call_once(wakeup_once, [this] {
         waiter.set_value();
+      });
     }
 };
 #elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
