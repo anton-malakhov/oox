@@ -929,6 +929,7 @@ int task_node::notify_next_writer( task_node* d ) {
     if( i&1 ) {
         if( i == 3 )
             return 1;
+        __OOX_ASSERT( i!=1, "remove_back_arc called on output node with next_writer=1" );
         d = (task_node*)(i&~1);
         if( d == this )
             return 2;
@@ -977,7 +978,7 @@ void task_node::notify_successors() {
 
 template<int N>
 struct output_slots_storage {
-    output_node nodes[N];
+    output_node output_nodes[N];
 };
 
 template<int slots>
@@ -996,7 +997,7 @@ __attribute__((no_sanitize("undefined")))
 output_node& task_node::out(int n) const {
     using self_t = task_node_slots<1024>;
     auto self = const_cast<self_t*>(reinterpret_cast<const self_t*>(this));
-    return self->nodes[n];
+    return self->output_nodes[n];
 }
 
 template<int slots, typename T, bool CanThrow>
