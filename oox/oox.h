@@ -6,11 +6,19 @@
 #define __OOX_H__
 
 #include <utility>
-#include <functional>
 #include <type_traits>
 #include <limits>
 #include <atomic>
-#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <new>
+#ifndef OOX_EXCEPTIONS_ENABLED
+#define OOX_EXCEPTIONS_ENABLED 0
+#endif
+
+#if OOX_EXCEPTIONS_ENABLED
+#include <exception>
+#endif
 
 #if HAVE_OMP
 #include <omp.h>
@@ -47,6 +55,13 @@ inline constexpr deferred_t deferred{};
 
 namespace internal {
 
+inline constexpr std::uintptr_t k_task_done_tag = 0x1;
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
+inline constexpr unsigned char k_result_state_empty = 0;
+inline constexpr unsigned char k_result_state_cancelled = 1;
+inline constexpr unsigned char k_result_state_value = 2;
+inline constexpr unsigned char k_result_state_exception = 3;
+
 struct task_life {
     // Pointers to this structure and live output nodes
     std::atomic<int> life_count;
@@ -72,6 +87,66 @@ struct task_life {
             return (k == 0);          // double-check after atomic
         }
     }
+};
+
+template<typename T, bool CanThrow>
+struct result_state;
+
+template <typename T>
+struct result_state<T, false> {
+    using value_type = T;
+    static constexpr unsigned char state_unset = 0;
+    static constexpr unsigned char state_set = 1;
+
+    result_state() : state_bits_field(state_unset) {}
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() = default;
+
+    template <typename... Args>
+    void emplace(Args&&... args) {
+        const auto previous = static_cast<unsigned char>(state_bits_field);
+        __OOX_ASSERT(previous != state_set, "never changing value inside storage with emplace");
+        construct_value(std::forward<Args>(args)...);
+        state_bits_field = state_set;
+    }
+    bool has_value() const noexcept { return static_cast<unsigned char>(state_bits_field) == state_set; }
+    T& value() { return *ptr(); }
+    const T& value() const { return *ptr(); }
+    void reset() {
+        const auto previous = static_cast<unsigned char>(state_bits_field);
+        if (previous == state_set) {
+            ptr()->~T();
+        }
+        state_bits_field = state_unset;
+    }
+
+  private:
+    struct storage_t {
+        alignas(alignof(T)) std::byte data[sizeof(T)];
+    };
+    storage_t storage{};
+    bool state_bits_field : 1;
+
+    template <typename... Args>
+    void construct_value(Args&&... args) {
+        if constexpr (sizeof...(Args) == 0) {
+            ::new (static_cast<void*>(storage.data)) T;
+        } else {
+            ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
+        }
+    }
+    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
+    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
+};
+
+template <bool CanThrow>
+struct result_state<void, CanThrow>;
+
+
+template <> struct result_state<void, false> {
 };
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
@@ -427,7 +502,7 @@ bool arc_list::add_arc( arc* i ) {
     __OOX_ASSERT( uintptr_t(i->node)>2, "" );
     for(;;) {
         arc* j = head.load(std::memory_order_acquire);
-        if( j==(arc*)uintptr_t(1) )
+        if( j==(arc*)k_task_done_tag )
             return false;
         i->next = j;
         if( head.compare_exchange_weak( j, i ) ) // TODO: weak or strong? what's perf?
@@ -515,7 +590,8 @@ int task_node::notify_successors( int output_slots, int *count ) {
     __OOX_TRACE("%p notify successors",this);
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
-    if( arc* r = head.exchange( (arc*)uintptr_t(1) ) )
+
+   if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
         do_notify_arcs( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
@@ -538,7 +614,6 @@ int task_node::notify_next_writer( task_node* d ) {
     if( i&1 ) {
         if( i == 3 )
             return 1;
-        __OOX_ASSERT( i!=1, "remove_back_arc called on output node with next_writer=1" );
         d = (task_node*)(i&~1);
         if( d == this )
             return 2;
@@ -585,9 +660,13 @@ void task_node::notify_successors() {
     release(n);
 }
 
+template<int N>
+struct output_slots_storage {
+    output_node output_nodes[N];
+};
+
 template<int slots>
-struct task_node_slots : task_node {
-    output_node output_nodes[slots];
+struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
 };
 
@@ -601,25 +680,41 @@ output_node& task_node::out(int n) const {
 }
 
 template<int slots, typename T>
-struct alignas(64) storage_task : task_node_slots<slots> {
-    std::optional<T> my_precious;
+struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
     storage_task() = default;
-    storage_task(T&& t) : my_precious(std::move(t)) {}
-    storage_task(const T& t) : my_precious(t) {}
+    storage_task(T&& t) { this->emplace(std::move(t)); }
+    storage_task(const T& t) { this->emplace(t); }
+    ~storage_task() { this->reset(); }
 };
 
 struct oox_var_base {
     //TODO: make it a class with private members
     oox_var_base &operator=(const oox_var_base &) = delete;
+    static constexpr int k_port_bits = 14;
+    static constexpr int k_max_port = (1 << k_port_bits) - 1;
+
+    struct current_port_and_flags_t {
+        std::uint16_t port : k_port_bits;
+        bool is_forwarded : 1;
+        bool is_deferred : 1;
+    };
+    static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
+                  "oox::var packed port/flags must stay 16-bit");
 
     template< typename T > friend struct gen_oox;
     task_node*  current_task = nullptr;
     void*       storage_ptr;
     int         storage_offset; // task_node* original = ptr - offset
-    short int   current_port = 0; // the problem can arise from concurrent accesses to oox::var, TODO: check
-    bool        is_forward : 1 = false; // indicate if it refers to another oox::var recursively
-    bool        is_deferred: 1 = false; // created via oox::deferred and not yet “bound” to a writer
+    current_port_and_flags_t current_port_and_flags{}; // port plus var-local forward/deferred flags
+
+    int current_port() const noexcept {
+        return static_cast<int>(current_port_and_flags.port);
+    }
+    void set_current_port(int port) noexcept {
+        __OOX_ASSERT_EX(port >= 0 && port <= k_max_port, "oox::var port does not fit packed field");
+        current_port_and_flags.port = static_cast<std::uint16_t>(port);
+    }
 
     void set_next_writer( int output_port, task_node* d ) {
         __OOX_ASSERT(current_task, "empty oox::var");
@@ -630,25 +725,28 @@ struct oox_var_base {
         //
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
-        if (is_deferred) {
+        if (current_port_and_flags.is_deferred) {
             arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
-            while(r > (arc*)uintptr_t(1)) {
+            while(r > (arc*)k_task_done_tag) {
                 arc* j = r;
                 r = j->next;
                 j->port = arc::port_int(output_port);
                 bool ok = d->add_arc(j);
                 __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
             }
-            is_deferred = false;
+            current_port_and_flags.is_deferred = false;
         }
-        current_task->set_next_writer( current_port, d );
-        current_task = d, current_port = output_port;
+        current_task->set_next_writer( current_port(), d );
+        current_task = d;
+        set_current_port(output_port);
     }
-    void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false ) {
-        current_task = t, current_port = 0, storage_ptr = ptr, is_forward = fwd;
+    void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false, bool deferred = false ) {
+        current_task = t, storage_ptr = ptr, current_port_and_flags = {};
+        current_port_and_flags.is_forwarded = fwd;
+        current_port_and_flags.is_deferred = deferred;
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
         t->life_set_count(lifetime);
-        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d",t,ptr,lifetime,fwd);
+        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
@@ -656,14 +754,14 @@ struct oox_var_base {
         // - either a constant storage_task, or
         // - a completed functional_task.
         arc* h = current_task->head.load(std::memory_order_acquire);
-        if (h == (arc*)uintptr_t(1)) {
+        if (k_task_done_tag == (uintptr_t)h) {
             return;
         }
         current_task->wait();
     }
     void release() {
         if( current_task ) {
-            current_task->set_next_writer( current_port, (task_node*)uintptr_t(
+            current_task->set_next_writer( current_port(), (task_node*)uintptr_t(
                     storage_offset? ((uintptr_t(storage_ptr)-storage_offset)|1) : 3/*var<void>*/) );
             current_task = nullptr;
         }
@@ -737,9 +835,9 @@ class var : public internal::oox_var_base {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
-        v->head.store((internal::arc*)uintptr_t(1), std::memory_order_release);
+        v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
-        this->bind_to( v, &v->my_precious, 2 );
+        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
         return storage_ptr;
     }
 
@@ -750,8 +848,7 @@ class var : public internal::oox_var_base {
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
-        this->bind_to(v, &v->my_precious, 2);
-        this->is_deferred = true;
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
         return storage_ptr;
     }
 
@@ -761,12 +858,12 @@ public:
         allocate_deferred(); // storage exists, but value is not ready
     }
     var(const T& t) noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(t); // TODO: add exception-safe
+        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
+        state->emplace(t); // TODO: add exception-safe
     }
     var(T&& t)      noexcept {
-        auto* opt = static_cast<std::optional<T>*>(allocate_new());
-        opt->emplace(std::move(t));
+        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
+        state->emplace(std::move(t));
     }
     var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
     var& operator=(var<T>&& t) {
@@ -779,7 +876,7 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
-        return static_cast<std::optional<T>*>(storage_ptr)->value();
+        return static_cast<internal::result_state<T, false>*>(storage_ptr)->value();
     }
 };
 
@@ -859,8 +956,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             auto &ov = const_cast<var_type&>(cov); // actual type is non-const due to is_writer
             ov.set_next_writer( port, self );// TODO: add 'count =' because no need in sync here
         } else
-            count = self->assign_prerequisite( cov.current_task, cov.current_port );
-        if( cov.is_forward ) {
+            count = self->assign_prerequisite( cov.current_task, cov.current_port() );
+        if( cov.current_port_and_flags.is_forwarded ) {
             oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
             my_ptr = 1|(uintptr_t)&next.storage_ptr;
         } else
@@ -870,24 +967,22 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        std::optional<ooxed_type>* opt = nullptr;
+        internal::result_state<ooxed_type, false>* state = nullptr;
         if( my_ptr & 1 ) {
             void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
-            opt = static_cast<std::optional<ooxed_type>*>(p);
+            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
         } else {
-            opt = reinterpret_cast<std::optional<ooxed_type>*>(my_ptr);
+            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
-        __OOX_ASSERT_EX(opt, "null optional storage");
+        __OOX_ASSERT_EX(state, "null result_state storage");
 
-        if constexpr (
-            std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-            if(!opt->has_value()) {
-                opt->emplace(); // requires default-constructible T
+        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+            if(!state->has_value()) {
+                state->emplace(); // requires default-constructible T
             }
-        } else {
-            __OOX_ASSERT_EX(opt->has_value(), "read from empty optional");
         }
-        return static_cast<C&&>(opt->value());
+        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
+        return static_cast<C&&>(state->value());
     }
 };
 template< typename T, typename... Types, typename A, typename... Args >
@@ -925,16 +1020,19 @@ struct oox_bind {
 };
 
 template<int slots, typename F, typename R>
-struct alignas(64) functional_task : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
-    std::optional<R> my_result;
+struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
+    using functor_base = storage_task<slots, F>;
+    using result_base = result_state<R, false>;
+    using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        my_result.emplace(this->my_precious.value()());
+        result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
         return nullptr;
     }
-    ~functional_task() = default;
+    ~functional_task() {
+        result_base::reset();
+    }
 };
 
 template<int slots, typename F>
@@ -942,7 +1040,7 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        this->my_precious.value()();
+        this->value()();
         task_node::notify_successors<slots>();
         return nullptr;
     }
@@ -953,16 +1051,16 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
     using storage_task<slots, F>::storage_task;
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
-    bool is_executed = false;
+    bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
-        new(my_result.begin()) var<VT>( this->my_precious() );
+        new(my_result.begin()) var<VT>( this->value()() );
         return task_node::forward_successors<slots>( *my_result.begin() );
 #else
         if( !is_executed ) {
             __OOX_TRACE("%p do_run: start forward",this);
-            new(&my_result) var<VT>( this->my_precious.value()() );
+            new(&my_result) var<VT>( this->value()() );
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
@@ -987,7 +1085,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to( t, &t->my_result, slots+1 ); return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1); return oox;
     }
 };
 template<>
@@ -1030,7 +1128,7 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 } //namespace internal
 
 template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-[[nodiscard]] auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
 {
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
@@ -1043,7 +1141,9 @@ template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args
     int protect_count = std::numeric_limits<int>::max();
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
-    protect_count -= t->my_precious.value().my_args.setup( 1, t, std::forward<Args>(args)...);
+    protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
+                         ->value()
+                         .my_args.setup(1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
@@ -1060,13 +1160,13 @@ template<typename T>
 
     // Follow forwarding chain until we reach a non-forward var
     internal::oox_var_base* base = &v;
-    while (base->is_forward) {
+    while (base->current_port_and_flags.is_forwarded) {
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
         base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
     }
 
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
-    return static_cast<std::optional<T>*>(base->storage_ptr)->value();
+    return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
 }
 
 template<typename T>

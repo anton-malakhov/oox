@@ -18,6 +18,11 @@ bool g_oox_verbose = false;
 #include <numeric>
 #include <vector>
 #include <functional>
+#if OOX_EXCEPTIONS_ENABLED
+#include <stdexcept>
+#include <atomic>
+#endif
+
 
 /////////////////////////////////////// EXAMPLES ////////////////////////////////////////
 
@@ -221,10 +226,14 @@ int main(int argc, char** argv) {
     }
 
     int err{0};
+#if OOX_EXCEPTIONS_ENABLED
     try {
         err = RUN_ALL_TESTS();
     } catch (const std::exception& e) {
         REMARK("Error: %s", e.what());
     }
+#else
+    err = RUN_ALL_TESTS();
+#endif
     return err;
 }
