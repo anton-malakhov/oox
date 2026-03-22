@@ -12,11 +12,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#ifndef OOX_EXCEPTIONS_ENABLED
-#define OOX_EXCEPTIONS_ENABLED 0
+#ifndef OOX_ENABLE_EXCEPTIONS
+#define OOX_ENABLE_EXCEPTIONS 0
 #endif
 
-#if OOX_EXCEPTIONS_ENABLED
+#if OOX_ENABLE_EXCEPTIONS
 #include <exception>
 #endif
 
@@ -52,6 +52,29 @@ namespace oox {
 
 struct deferred_t { explicit constexpr deferred_t(int = 0) {} };
 inline constexpr deferred_t deferred{};
+
+#if OOX_ENABLE_EXCEPTIONS
+struct cancelled_by_exception final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_exception";
+    }
+};
+
+struct cancelled_by_user final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_user";
+    }
+};
+#endif
+
+#if defined(OOX_DEFAULT_EXCEPTION_POLICY)
+inline constexpr bool default_exception_policy =
+    OOX_ENABLE_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0);
+#elif OOX_ENABLE_EXCEPTIONS
+inline constexpr bool default_exception_policy = true;
+#else
+inline constexpr bool default_exception_policy = false;
+#endif
 
 namespace internal {
 
@@ -92,6 +115,60 @@ struct task_life {
 template<typename T, bool CanThrow>
 struct result_state;
 
+#if OOX_ENABLE_EXCEPTIONS
+template <typename Derived>
+struct result_state_throw_base {
+    static constexpr unsigned char state_empty = k_result_state_empty;
+    static constexpr unsigned char state_cancelled = k_result_state_cancelled;
+    static constexpr unsigned char state_value = k_result_state_value;
+    static constexpr unsigned char state_exception = k_result_state_exception;
+
+  protected:
+    Derived& derived() noexcept { return *static_cast<Derived*>(this); }
+    const Derived& derived() const noexcept { return *static_cast<const Derived*>(this); }
+    unsigned char state_bits() const noexcept { return derived().state_bits(); }
+    void set_state_bits(unsigned char state) noexcept { derived().set_state_bits(state); }
+
+  public:
+    void try_set_exception(std::exception_ptr eptr) noexcept {
+        const bool is_cancelled = !eptr;
+        const auto current = state_bits();
+        if (current == state_value || current == state_exception) {
+            return;
+        }
+
+        auto* slot = derived().exception_ptr();
+        if (is_cancelled) {
+            if (current != state_empty) {
+                return;
+            }
+            ::new (static_cast<void*>(slot)) std::exception_ptr();
+            set_state_bits(state_cancelled);
+            return;
+        }
+        if (current == state_cancelled) {
+            *slot = std::move(eptr);
+            set_state_bits(state_exception);
+            return;
+        }
+        __OOX_ASSERT_EX(current == state_empty, "unexpected result_state while storing exception");
+        ::new (static_cast<void*>(slot)) std::exception_ptr(std::move(eptr));
+        set_state_bits(state_exception);
+    }
+    bool has_exception() const noexcept {
+        const auto state = state_bits();
+        return state == state_exception || state == state_cancelled;
+    }
+    std::exception_ptr get_exception() const noexcept {
+        const auto state = state_bits();
+        if (state != state_exception && state != state_cancelled) {
+            return std::exception_ptr{};
+        }
+        return *derived().exception_ptr();
+    }
+};
+#endif
+
 template <typename T>
 struct result_state<T, false> {
     using value_type = T;
@@ -107,17 +184,19 @@ struct result_state<T, false> {
 
     template <typename... Args>
     void emplace(Args&&... args) {
-        const auto previous = static_cast<unsigned char>(state_bits_field);
+        const auto previous = state_bits_field;
         __OOX_ASSERT(previous != state_set, "never changing value inside storage with emplace");
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_set;
     }
-    bool has_value() const noexcept { return static_cast<unsigned char>(state_bits_field) == state_set; }
+    bool has_value() const noexcept {
+        return state_bits_field == state_set;
+    }
     T& value() { return *ptr(); }
     const T& value() const { return *ptr(); }
+
     void reset() {
-        const auto previous = static_cast<unsigned char>(state_bits_field);
-        if (previous == state_set) {
+        if (state_bits_field == state_set) {
             ptr()->~T();
         }
         state_bits_field = state_unset;
@@ -145,8 +224,139 @@ struct result_state<T, false> {
 template <bool CanThrow>
 struct result_state<void, CanThrow>;
 
+#if OOX_ENABLE_EXCEPTIONS
+template <typename T>
+struct result_state<T, true> : private result_state_throw_base<result_state<T, true>> {
+    using base_type = result_state_throw_base<result_state<T, true>>;
+    using value_type = T;
+    static constexpr unsigned char state_empty = base_type::state_empty;
+    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
+    static constexpr unsigned char state_value = base_type::state_value;
+    static constexpr unsigned char state_exception = base_type::state_exception;
 
-template <> struct result_state<void, false> {
+    result_state() : state_bits_field(state_empty) {}
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() = default;
+
+    template <typename... Args>
+    void emplace(Args&&... args) {
+        const auto previous = state_bits_field;
+        if (previous == state_value || previous == state_exception) {
+            return;
+        }
+        if (previous == state_cancelled) {
+            exception_ptr()->~exception_ptr();
+        }
+        construct_value(std::forward<Args>(args)...);
+        state_bits_field = state_value;
+    }
+    bool has_value() const noexcept {
+        return state_bits_field == state_value;
+    }
+    T& value() { return *ptr(); }
+    const T& value() const { return *ptr(); }
+    using base_type::get_exception;
+    using base_type::has_exception;
+    using base_type::try_set_exception;
+    void reset() {
+        const auto previous = state_bits_field;
+        if (previous == state_empty) {
+            return;
+        }
+        state_bits_field = state_empty;
+        if (previous == state_value) {
+            ptr()->~T();
+        } else {
+            exception_ptr()->~exception_ptr();
+        }
+    }
+
+  private:
+    static constexpr std::size_t storage_size =
+        (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
+    static constexpr std::size_t storage_align =
+        (alignof(T) > alignof(std::exception_ptr)) ? alignof(T) : alignof(std::exception_ptr);
+    struct storage_t {
+        alignas(storage_align) std::byte data[storage_size];
+    };
+    template <typename Derived>
+    friend struct result_state_throw_base;
+    unsigned char state_bits() const noexcept { return state_bits_field; }
+    void set_state_bits(unsigned char state) noexcept { state_bits_field = state; }
+    storage_t storage{};
+    unsigned char state_bits_field : 2;
+    template <typename... Args>
+    void construct_value(Args&&... args) {
+        if constexpr (sizeof...(Args) == 0) {
+            ::new (static_cast<void*>(storage.data)) T;
+        } else {
+            ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
+        }
+    }
+    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
+    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
+    std::exception_ptr* exception_ptr() noexcept {
+        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
+    }
+    const std::exception_ptr* exception_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
+    }
+};
+
+template <>
+struct result_state<void, true> : private result_state_throw_base<result_state<void, true>> {
+    using base_type = result_state_throw_base<result_state<void, true>>;
+    static constexpr unsigned char state_empty = base_type::state_empty;
+    static constexpr unsigned char state_cancelled = base_type::state_cancelled;
+    static constexpr unsigned char state_value = base_type::state_value;
+    static constexpr unsigned char state_exception = base_type::state_exception;
+
+    result_state() : state_bits_field(state_empty) {}
+    result_state(const result_state&) = delete;
+    result_state& operator=(const result_state&) = delete;
+    result_state(result_state&&) = delete;
+    result_state& operator=(result_state&&) = delete;
+    ~result_state() = default;
+
+    using base_type::get_exception;
+    using base_type::has_exception;
+    using base_type::try_set_exception;
+    void reset() {
+        const auto previous = state_bits_field;
+        if (previous == state_empty) {
+            return;
+        }
+        state_bits_field = state_empty;
+        if (previous == state_exception || previous == state_cancelled) {
+            exception_ptr()->~exception_ptr();
+        }
+    }
+
+  private:
+    static constexpr std::size_t storage_size = sizeof(std::exception_ptr);
+    struct storage_t {
+        alignas(alignof(std::exception_ptr)) std::byte data[storage_size];
+    };
+    template <typename Derived>
+    friend struct result_state_throw_base;
+    unsigned char state_bits() const noexcept { return state_bits_field; }
+    void set_state_bits(unsigned char state) noexcept { state_bits_field = state; }
+    storage_t storage{};
+    unsigned char state_bits_field : 2;
+    std::exception_ptr* exception_ptr() noexcept {
+        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
+    }
+    const std::exception_ptr* exception_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
+    }
+};
+#endif
+
+template <>
+struct result_state<void, false> {
 };
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
@@ -462,7 +672,33 @@ struct arc_list {
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
     std::atomic<int> start_count;
-    // TODO: exception storage here?
+#if OOX_ENABLE_EXCEPTIONS
+    virtual void try_set_exception(std::exception_ptr eptr) noexcept = 0;
+    virtual bool has_exception() const noexcept = 0;
+    virtual std::exception_ptr get_exception() const noexcept = 0;
+    virtual void publish_incoming_failure(task_node* source, int source_port) noexcept = 0;
+    virtual bool apply_incoming_failure() noexcept = 0;
+
+    void set_exception(std::exception_ptr ep) noexcept {
+        try_set_exception(std::move(ep));
+    }
+
+    void cancel() noexcept {
+        publish_incoming_failure(nullptr, 0);
+        if (start_count.load(std::memory_order_acquire) == 0) {
+            set_exception(std::make_exception_ptr(cancelled_by_user{}));
+        }
+    }
+
+    std::exception_ptr exception_for_port([[maybe_unused]] int port) const noexcept {
+        if (port > 0) {
+            return std::exception_ptr{}; //cancelled
+        }
+        return get_exception();
+    }
+#else
+    void cancel() noexcept {}
+#endif
 
     task_node() { } // prepare the task for waiting on it directly
     virtual ~task_node() = default;
@@ -490,6 +726,9 @@ struct task_node : public task, arc_list {
     // Call base notify successors
     template<int slots>
     void notify_successors();
+#if OOX_ENABLE_EXCEPTIONS
+    virtual void notify_successors_virtual() = 0;
+#endif
     // Call base forward successors
     template<int slots>
     void forward_successors( oox_var_base& );
@@ -518,6 +757,11 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
         return 1; // Prerequisite n will decrement start_count when it produces a value
     } else {
         // Prerequisite n already produced a value. Add this as a consumer of n.
+#if OOX_ENABLE_EXCEPTIONS
+        if (n->has_exception()) {
+            this->publish_incoming_failure(n, req_port);
+        }
+#endif
         int k = ++n->out(req_port).countdown;
         __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
         __OOX_ASSERT_EX(k>1,"risk that a prerequisite might be prematurely destroyed");
@@ -558,6 +802,11 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
+#if OOX_ENABLE_EXCEPTIONS
+            if (this->has_exception()) {
+                n->publish_incoming_failure(this, j->port);
+            }
+#endif
             n->remove_prerequisite();
         }
     } while( r );
@@ -605,6 +854,12 @@ void task_node::remove_prerequisite( int n ) {
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
+#if OOX_ENABLE_EXCEPTIONS
+        if (apply_incoming_failure()) {
+            notify_successors_virtual();
+            return;
+        }
+#endif
         spawn();
     }
 }
@@ -660,6 +915,83 @@ void task_node::notify_successors() {
     release(n);
 }
 
+#if OOX_ENABLE_EXCEPTIONS
+template <bool CanThrow>
+struct incoming_failure_state {
+    void publish_incoming_failure(task_node*, int) noexcept {}
+    template <typename Node>
+    bool apply_incoming_failure(Node&) noexcept {
+        return false;
+    }
+};
+
+template <>
+struct incoming_failure_state<true> {
+    static constexpr uintptr_t incoming_failure_none = 0;
+    static constexpr uintptr_t incoming_failure_cancelled = 1;
+    static constexpr uintptr_t incoming_failure_source_tag = 2;
+    static constexpr uintptr_t incoming_failure_user_cancelled = 3;
+    static constexpr uintptr_t incoming_failure_tag_mask = 3;
+
+    std::atomic<uintptr_t> incoming_failure_word{incoming_failure_none};
+
+    void publish_incoming_failure(task_node* source, int source_port) noexcept {
+        if (!source) {
+            publish_user_cancelled();
+            return;
+        }
+        if (source_port != 0) {
+            publish_cancelled();
+            return;
+        }
+        if (!source->exception_for_port(0)) {
+            publish_cancelled();
+            return;
+        }
+        publish_exception_source(source);
+    }
+
+    template <typename Node>
+    bool apply_incoming_failure(Node& node) noexcept {
+        const auto state = incoming_failure_word.load(std::memory_order_acquire);
+        if (state == incoming_failure_none) {
+            return false;
+        }
+        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
+            auto* source = reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
+            node.set_exception(source->exception_for_port(0));
+            return node.has_exception();
+        }
+        if (state == incoming_failure_user_cancelled) {
+            node.set_exception(std::make_exception_ptr(cancelled_by_user{}));
+            return node.has_exception();
+        }
+        if (state & incoming_failure_cancelled) {
+            node.set_exception(std::exception_ptr{});
+            return node.has_exception();
+        }
+        return false;
+    }
+
+  private:
+    void publish_cancelled() noexcept {
+        incoming_failure_word.fetch_or(incoming_failure_cancelled, std::memory_order_acq_rel);
+    }
+
+    void publish_user_cancelled() noexcept {
+        incoming_failure_word.fetch_or(incoming_failure_user_cancelled, std::memory_order_acq_rel);
+    }
+
+    void publish_exception_source(task_node* source) noexcept {
+        const auto source_word = reinterpret_cast<uintptr_t>(source);
+        __OOX_ASSERT_EX((source_word & incoming_failure_tag_mask) == 0,
+                        "incoming failure source pointer must be aligned");
+        const auto encoded = source_word | incoming_failure_source_tag;
+        incoming_failure_word.store(encoded, std::memory_order_release);
+    }
+};
+#endif
+
 template<int N>
 struct output_slots_storage {
     output_node output_nodes[N];
@@ -668,6 +1000,11 @@ struct output_slots_storage {
 template<int slots>
 struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
+#if OOX_ENABLE_EXCEPTIONS
+    void notify_successors_virtual() override {
+        task_node::notify_successors<slots>();
+    }
+#endif
 };
 
 #if defined(__clang__)
@@ -681,35 +1018,44 @@ output_node& task_node::out(int n) const {
 
 template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
+    using result_base = result_state<T, false>;
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
     storage_task() = default;
-    storage_task(T&& t) { this->emplace(std::move(t)); }
-    storage_task(const T& t) { this->emplace(t); }
-    ~storage_task() { this->reset(); }
+    storage_task(T&& t) { result_base::emplace(std::move(t)); }
+    storage_task(const T& t) { result_base::emplace(t); }
+#if OOX_ENABLE_EXCEPTIONS
+    void try_set_exception(std::exception_ptr) noexcept override {}
+    bool has_exception() const noexcept override { return false; }
+    std::exception_ptr get_exception() const noexcept override { return std::exception_ptr{}; }
+    void publish_incoming_failure(task_node*, int) noexcept override {}
+    bool apply_incoming_failure() noexcept override { return false; }
+#endif
+    ~storage_task() override { result_base::reset(); }
 };
 
 struct oox_var_base {
     //TODO: make it a class with private members
     oox_var_base &operator=(const oox_var_base &) = delete;
-    static constexpr int k_port_bits = 14;
+    static constexpr int k_port_bits = 13;
     static constexpr int k_max_port = (1 << k_port_bits) - 1;
 
     struct current_port_and_flags_t {
         std::uint16_t port : k_port_bits;
         bool is_forwarded : 1;
         bool is_deferred : 1;
+        bool storage_state_can_throw : 1;
     };
     static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
                   "oox::var packed port/flags must stay 16-bit");
 
-    template< typename T > friend struct gen_oox;
+    template< typename T, bool > friend struct gen_oox;
     task_node*  current_task = nullptr;
     void*       storage_ptr;
     int         storage_offset; // task_node* original = ptr - offset
     current_port_and_flags_t current_port_and_flags{}; // port plus var-local forward/deferred flags
 
     int current_port() const noexcept {
-        return static_cast<int>(current_port_and_flags.port);
+        return current_port_and_flags.port;
     }
     void set_current_port(int port) noexcept {
         __OOX_ASSERT_EX(port >= 0 && port <= k_max_port, "oox::var port does not fit packed field");
@@ -740,13 +1086,16 @@ struct oox_var_base {
         current_task = d;
         set_current_port(output_port);
     }
-    void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false, bool deferred = false ) {
+    void bind_to( task_node * t, void* ptr, int lifetime,
+                  bool fwd = false, bool deferred = false, bool state_can_throw = false ) {
         current_task = t, storage_ptr = ptr, current_port_and_flags = {};
         current_port_and_flags.is_forwarded = fwd;
         current_port_and_flags.is_deferred = deferred;
+        current_port_and_flags.storage_state_can_throw = state_can_throw;
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
         t->life_set_count(lifetime);
-        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
+        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d throw_state=%d",
+                    t, ptr, lifetime, fwd, deferred, state_can_throw);
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
@@ -758,6 +1107,13 @@ struct oox_var_base {
             return;
         }
         current_task->wait();
+    }
+    void cancel_current_task() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if (current_task) {
+            current_task->cancel();
+        }
+#endif
     }
     void release() {
         if( current_task ) {
@@ -819,17 +1175,18 @@ tbb::task* task_node::forward_successors( oox_var_base& m ) {
 }
 #endif
 
-template< typename T > struct gen_oox;
+template< typename T, bool CanThrow > struct gen_oox;
 
 } // namespace internal
 
 
-template< typename T >
+template< typename T, bool CanThrow = default_exception_policy >
 class var : public internal::oox_var_base {
     static_assert(std::is_same_v<T, std::decay_t<T>>,
                   "Specialize oox::var only by plain types and pointers."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
+    static_assert(OOX_ENABLE_EXCEPTIONS || !CanThrow, "oox::var<T, true> requires OOX_ENABLE_EXCEPTIONS=1");
 
     void* allocate_new() noexcept {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
@@ -837,7 +1194,7 @@ class var : public internal::oox_var_base {
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
-        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, false, false);
         return storage_ptr;
     }
 
@@ -848,7 +1205,7 @@ class var : public internal::oox_var_base {
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
         v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
-        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true, false);
         return storage_ptr;
     }
 
@@ -865,8 +1222,8 @@ public:
         auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
         state->emplace(std::move(t));
     }
-    var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
-    var& operator=(var<T>&& t) {
+    var(var<T, CanThrow>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
+    var& operator=(var<T, CanThrow>&& t) {
         release();
         new(this) internal::oox_var_base(std::move(t));
         __OOX_ASSERT_EX(current_task, "");
@@ -876,19 +1233,42 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
+        if constexpr (CanThrow) {
+#if OOX_ENABLE_EXCEPTIONS
+            if (current_port_and_flags.storage_state_can_throw) {
+                return static_cast<internal::result_state<T, true>*>(storage_ptr)->value();
+            }
+#endif
+        }
         return static_cast<internal::result_state<T, false>*>(storage_ptr)->value();
+    }
+    void cancel() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
     }
 };
 
-template<>
-class var<void> : public internal::oox_var_base {
-    template< typename T > friend struct gen_oox;
+template<bool CanThrow>
+class var<void, CanThrow> : public internal::oox_var_base {
+    template< typename T, bool > friend struct gen_oox;
+    static_assert(OOX_ENABLE_EXCEPTIONS || !CanThrow, "oox::var<void, true> requires OOX_ENABLE_EXCEPTIONS=1");
 public:
     var() {}
-    template<typename D>
-    var(var<D>&& src) : internal::oox_var_base(src) {
+    template<typename D, bool DCanThrow>
+    var(var<D, DCanThrow>&& src) : internal::oox_var_base(src) {
+        static_assert(CanThrow || !DCanThrow, "non-throwing void var cannot bind to throwing source");
         ((internal::task_node*)(uintptr_t(src.storage_ptr)-src.storage_offset))->release();
         src.current_task = nullptr;
+    }
+    void cancel() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
     }
 };
 
@@ -911,16 +1291,17 @@ template< typename... Args > struct types {};
 
 // Types is types<list> of user functor argument types
 // Args is variadic list of run argument types
-template< typename Types, typename... Args > struct base_args;
+template< typename Types, bool SelfCanThrow, typename... Args > struct base_args;
 // User functor might have default arguments which are not specified thus ignoring them
-template< typename IgnoredTypes > struct base_args<IgnoredTypes> {
+template< typename IgnoredTypes, bool SelfCanThrow > struct base_args<IgnoredTypes, SelfCanThrow> {
     static constexpr int write_nodes_count = 1; // for resulting node
     int setup(int, internal::task_node *) { return 0 /* resulting node is ready initially*/; }
 };
 
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Args...> {
-    using base_type = base_args<types<Types...>, Args...>;
+template< typename T, typename... Types, typename A, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
+    : base_args<types<Types...>, SelfCanThrow, Args...> {
+    using base_type = base_args<types<Types...>, SelfCanThrow, Args...>;
 
     std::decay_t<A> my_value;
 
@@ -933,13 +1314,16 @@ struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Ar
     }
 };
 
-template< typename Types, typename... Args > struct oox_var_args;
-template< typename T, typename... Types, typename C, typename... Args >
-struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>, Args...> {
-    using base_type = base_args<types<Types...>, Args...>;
+template< typename Types, bool SelfCanThrow, typename C, bool VarCanThrow, typename... Args > struct oox_var_args;
+template< typename T, typename... Types, typename C, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
+    : base_args<types<Types...>, SelfCanThrow, Args...> {
+    using base_type = base_args<types<Types...>, SelfCanThrow, Args...>;
     using ooxed_type = std::decay_t<C>;
-    using var_type = var<ooxed_type>;
+    using var_type = var<ooxed_type, VarCanThrow>;
 
+    static constexpr uintptr_t k_forward_ptr_tag = uintptr_t(1);
+    static constexpr uintptr_t k_throw_state_tag = uintptr_t(2);
     uintptr_t my_ptr;
     // TODO: copy-based optimizations
     oox_var_args( const var_type& cov, Args&&... args ) : base_type( std::forward<Args>(args)... ) {}
@@ -952,50 +1336,75 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("oox::var<A>").c_str(), cov.current_task, get_type<T>("T").c_str(), count);
         if( !cov.current_task )
             new( &const_cast<var_type&>(cov) ) var_type(ooxed_type()); // allocate oox container with default value
-        if( count ) {
+        if constexpr (is_writer) {
+            static_assert(VarCanThrow || !SelfCanThrow, "throwing task cannot write to non-throwing var");
             auto &ov = const_cast<var_type&>(cov); // actual type is non-const due to is_writer
             ov.set_next_writer( port, self );// TODO: add 'count =' because no need in sync here
-        } else
+        } else {
+            static_assert(SelfCanThrow || !VarCanThrow, "non-throwing task cannot depend on throwing task");
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
+        }
         if( cov.current_port_and_flags.is_forwarded ) {
-            oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = 1|(uintptr_t)&next.storage_ptr;
-        } else
-            my_ptr = (uintptr_t)cov.storage_ptr;
+            auto* next = static_cast<oox_var_base*>(cov.storage_ptr);
+            const auto next_word = reinterpret_cast<uintptr_t>(next);
+            __OOX_ASSERT_EX((next_word & k_forward_ptr_tag) == 0, "forward var pointer must be aligned");
+            my_ptr = k_forward_ptr_tag | next_word;
+        } else {
+            const uintptr_t tags_mask = k_forward_ptr_tag | k_throw_state_tag;
+            const auto storage_word = reinterpret_cast<uintptr_t>(cov.storage_ptr);
+            __OOX_ASSERT_EX((storage_word & tags_mask) == 0,
+                            "result_state pointer must be at least 4-byte aligned");
+            my_ptr = storage_word
+                     | (cov.current_port_and_flags.storage_state_can_throw ? k_throw_state_tag : 0);
+        }
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
         //    ov.~var(); // TODO: no need in sync for not yet published task
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        internal::result_state<ooxed_type, false>* state = nullptr;
-        if( my_ptr & 1 ) {
-            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
-            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
+        void* state_ptr = nullptr;
+        bool state_can_throw = (my_ptr & k_throw_state_tag) != 0;
+        if( my_ptr & k_forward_ptr_tag ) {
+            oox_var_base* next = reinterpret_cast<oox_var_base*>(my_ptr & ~k_forward_ptr_tag);
+            state_ptr = next->storage_ptr;
+            state_can_throw = next->current_port_and_flags.storage_state_can_throw;
         } else {
-            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
+            state_ptr = reinterpret_cast<void*>(my_ptr & ~k_throw_state_tag);
         }
-        __OOX_ASSERT_EX(state, "null result_state storage");
+        __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
-        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-            if(!state->has_value()) {
-                state->emplace(); // requires default-constructible T
+        auto consume_state = [](auto* state) -> C&& {
+            if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+                if(!state->has_value()) {
+                    state->emplace(); // requires default-constructible T
+                }
             }
+            __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
+            return std::forward<C>(state->value());
+        };
+
+#if OOX_ENABLE_EXCEPTIONS
+        if (state_can_throw) {
+            return consume_state(static_cast<internal::result_state<ooxed_type, true>*>(state_ptr));
         }
-        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
-        return static_cast<C&&>(state->value());
+#endif
+        return consume_state(static_cast<internal::result_state<ooxed_type, false>*>(state_ptr));
     }
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, var<A>&, Args...> : oox_var_args<types<T, Types...>, A&, Args...> {
-    using oox_var_args<types<T, Types...>, A&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, var<A, VarCanThrow>&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, A&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, A&, VarCanThrow, Args...>::oox_var_args;
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, const var<A>&, Args...> : oox_var_args<types<T, Types...>, const A&, Args...> {
-    using oox_var_args<types<T, Types...>, const A&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, const var<A, VarCanThrow>&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, const A&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, const A&, VarCanThrow, Args...>::oox_var_args;
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, var<A>&&, Args...> : oox_var_args<types<T, Types...>, A&&, Args...> {
-    using oox_var_args<types<T, Types...>, A&&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, var<A, VarCanThrow>&&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, A&&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, A&&, VarCanThrow, Args...>::oox_var_args;
 };
 
 template< typename F, typename... Preceding, typename Args >
@@ -1006,8 +1415,8 @@ auto apply_args( F&& f, Args&& pack, Preceding&&... params ) {
                       pack.consume());
 }
 
-template< typename F, typename... Preceding, typename Last >
-auto apply_args( F&& f, base_args<Last>&& /*pack*/, Preceding&&... params ) {
+template< typename F, typename... Preceding, typename Last, bool SelfCanThrow >
+auto apply_args( F&& f, base_args<Last, SelfCanThrow>&& /*pack*/, Preceding&&... params ) {
     return std::forward<F>(f)(std::forward<Preceding>(params)...);
 }
 
@@ -1019,93 +1428,314 @@ struct oox_bind {
     auto operator()() { return apply_args(std::move(my_func), std::move(my_args)); }
 };
 
-template<int slots, typename F, typename R>
-struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
+template<int slots, typename F, typename R, bool CanThrow>
+struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, CanThrow>
+#if OOX_ENABLE_EXCEPTIONS
+                                  , private incoming_failure_state<CanThrow>
+#endif
+{
     using functor_base = storage_task<slots, F>;
-    using result_base = result_state<R, false>;
-    using functor_base::functor_base;
+    using result_base = result_state<R, CanThrow>;
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+
+#if OOX_ENABLE_EXCEPTIONS
+    using failure_base = incoming_failure_state<CanThrow>;
+    void try_set_exception(std::exception_ptr eptr) noexcept override {
+        if constexpr (CanThrow) {
+            result_base::try_set_exception(std::move(eptr));
+        }
+    }
+    bool has_exception() const noexcept override {
+        if constexpr (CanThrow) {
+            return result_base::has_exception();
+        }
+        return false;
+    }
+    std::exception_ptr get_exception() const noexcept override {
+        if constexpr (CanThrow) {
+            return result_base::get_exception();
+        }
+        return std::exception_ptr{};
+    }
+    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        failure_base::publish_incoming_failure(source, source_port);
+    }
+    bool apply_incoming_failure() noexcept override {
+        return failure_base::apply_incoming_failure(*this);
+    }
+#endif
+
     TASK_EXECUTE_METHOD {
-        __OOX_TRACE("%p do_run: start",this);
-        result_base::emplace(functor_base::value()());
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
+            try {
+                result_base::emplace(this->functor_base::value()());
+            } catch(...) {
+                this->set_exception(std::current_exception());
+            }
+        } else {
+            result_base::emplace(this->functor_base::value()());
+        }
+#else
+        result_base::emplace(this->functor_base::value()());
+#endif
         task_node::notify_successors<slots>();
         return nullptr;
     }
-    ~functional_task() {
-        result_base::reset();
-    }
+    ~functional_task() override { result_base::reset(); }
 };
 
-template<int slots, typename F>
-struct functional_task<slots, F, void> : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
+template<int slots, typename F, bool CanThrow>
+struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, result_state<void, CanThrow>
+#if OOX_ENABLE_EXCEPTIONS
+                                                  , private incoming_failure_state<CanThrow>
+#endif
+{
+    using functor_base = storage_task<slots, F>;
+    using result_base = result_state<void, CanThrow>;
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+#if OOX_ENABLE_EXCEPTIONS
+    using failure_base = incoming_failure_state<CanThrow>;
+    void try_set_exception(std::exception_ptr eptr) noexcept override {
+        if constexpr (CanThrow) {
+            result_base::try_set_exception(std::move(eptr));
+        }
+    }
+    bool has_exception() const noexcept override {
+        if constexpr (CanThrow) {
+            return result_base::has_exception();
+        }
+        return false;
+    }
+    std::exception_ptr get_exception() const noexcept override {
+        if constexpr (CanThrow) {
+            return result_base::get_exception();
+        }
+        return std::exception_ptr{};
+    }
+    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        failure_base::publish_incoming_failure(source, source_port);
+    }
+    bool apply_incoming_failure() noexcept override {
+        return failure_base::apply_incoming_failure(*this);
+    }
+#endif
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
-        this->value()();
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
+            try {
+                this->functor_base::value()();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+            }
+        } else {
+            this->functor_base::value()();
+        }
+#else
+        this->functor_base::value()();
+#endif
         task_node::notify_successors<slots>();
         return nullptr;
     }
+    ~functional_task() override {
+        if constexpr (CanThrow) {
+            result_base::reset();
+        }
+    }
 };
 
-template<int slots, typename F, typename VT> // forwarding task
-struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
+template<int slots, typename F, typename VT, bool VarCanThrow, bool CanThrow>
+struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<slots, F>
+#if OOX_ENABLE_EXCEPTIONS
+                                                                   , private incoming_failure_state<CanThrow>
+#endif
+{
     // TODO: NRVO optimized forwarding
+    static_assert(VarCanThrow == CanThrow, "returning var<T, P> requires task policy to match P");
     using storage_task<slots, F>::storage_task;
-    std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
+    using var_type = var<VT, VarCanThrow>;
+    std::aligned_storage_t<sizeof(var_type), alignof(var_type)> my_result;
     bool is_executed : 1 = false;
+#if OOX_ENABLE_EXCEPTIONS
+    bool local_exception_set : 1 = false;
+    std::exception_ptr local_exception{};
+#endif
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+    var_type* result_var_ptr() noexcept {
+        return std::launder(reinterpret_cast<var_type*>(&my_result));
+    }
+    const var_type* result_var_ptr() const noexcept {
+        return std::launder(reinterpret_cast<const var_type*>(&my_result));
+    }
+#if OOX_ENABLE_EXCEPTIONS
+    using failure_base = incoming_failure_state<CanThrow>;
+    void try_set_exception(std::exception_ptr eptr) noexcept override {
+        if constexpr (!CanThrow) {
+            return;
+        }
+      
+        if (local_exception_set) {
+            return;
+        }
+        local_exception_set = true;
+        local_exception = eptr;
+
+        if (is_executed) {
+            auto* result = result_var_ptr();
+            __OOX_ASSERT_EX(result && result->current_task, "forwarding result var has no current task");
+            result->current_task->try_set_exception(std::move(eptr));
+        }
+    }
+    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        failure_base::publish_incoming_failure(source, source_port);
+    }
+    bool apply_incoming_failure() noexcept override {
+        return failure_base::apply_incoming_failure(*this);
+    }
+    bool has_exception() const noexcept override {
+        if constexpr (!CanThrow) {
+            return false;
+        }
+        if (local_exception_set) {
+            return true;
+        }
+        if (!is_executed) {
+            return false;
+        }
+        const auto* result = result_var_ptr();
+        return result && result->current_task && result->current_task->has_exception();
+    }
+    std::exception_ptr get_exception() const noexcept override {
+        if constexpr (!CanThrow) {
+            return std::exception_ptr{};
+        }
+        if (local_exception_set) {
+            return local_exception;
+        }
+        if (!is_executed) {
+            return std::exception_ptr{};
+        }
+        const auto* result = result_var_ptr();
+        if (!result || !result->current_task) {
+            return std::exception_ptr{};
+        }
+        return result->current_task->get_exception();
+    }
+#endif
     TASK_EXECUTE_METHOD {
-#if 0
-        __OOX_TRACE("%p do_run: start forward",this);
-        new(my_result.begin()) var<VT>( this->value()() );
-        return task_node::forward_successors<slots>( *my_result.begin() );
+    //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
+            try {
+                if ( !is_executed ) {
+                    __OOX_TRACE("%p do_run: start forward",this);
+                    ::new (static_cast<void*>(&my_result)) var_type(this->value()());
+                    is_executed = true;
+                    this->start_count.store(1, std::memory_order_release);
+                    arc* j = new arc(this, 0, arc::flow_only);
+                    auto& result = *result_var_ptr();
+                    __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
+                    if(result.current_task->add_arc(j)) {
+                        __OOX_TRACE("%p do_run: add_arc", this);
+                        return nullptr;
+                    }
+                    delete j;
+                }
+            } catch(...) {
+                this->set_exception(std::current_exception());
+            }
+        } else {
+            if ( !is_executed ) {
+                __OOX_TRACE("%p do_run: start forward",this);
+                ::new (static_cast<void*>(&my_result)) var_type(this->value()());
+                is_executed = true;
+                this->start_count.store(1, std::memory_order_release);
+                arc* j = new arc(this, 0, arc::flow_only);
+                auto& result = *result_var_ptr();
+                __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
+                if(result.current_task->add_arc(j)) {
+                    __OOX_TRACE("%p do_run: add_arc", this);
+                    return nullptr;
+                }
+                delete j;
+            }
+        }
 #else
         if( !is_executed ) {
             __OOX_TRACE("%p do_run: start forward",this);
-            new(&my_result) var<VT>( this->value()() );
+            ::new (static_cast<void*>(&my_result)) var_type(this->value()());
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
-            arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
-            if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
-                __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
+            arc* j = new arc(this, 0, arc::flow_only);
+            auto& result = *result_var_ptr();
+            __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
+            if(result.current_task->add_arc(j)) {
+                __OOX_TRACE("%p do_run: add_arc", this);
                 return nullptr;
             }
             else delete j;
         }
+#endif
         __OOX_TRACE("%p do_run: notify forward",this);
         task_node::notify_successors<slots>();
         return nullptr;
-#endif
     }
-    ~functional_task() {
-        reinterpret_cast<var<VT>*>(&my_result)->~var<VT>(); // current_task is finished in forward_successors
+
+    ~functional_task() override {
+      if constexpr (CanThrow) {
+          if (is_executed) {
+              result_var_ptr()->~var_type();
+          }
+      } else {
+          result_var_ptr()->~var_type();
+        }
     }
 };
 
-template< typename T >
+template< typename T, bool CanThrow >
 struct gen_oox {
-    using type = var<T>;
+    using type = var<T, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1); return oox;
+    static type bind_to(internal::functional_task<slots, F, T, CanThrow> * t) {
+        type oox;
+        oox.bind_to(t, static_cast<internal::result_state<T, CanThrow>*>(t), slots+1, false, false, CanThrow);
+        return oox;
     }
 };
-template<>
-struct gen_oox<void> {
-    using type = var<void>;
+template<bool CanThrow>
+struct gen_oox<void, CanThrow> {
+    using type = var<void, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, void> * t) {
+    static type bind_to(internal::functional_task<slots, F, void, CanThrow> * t) {
         type oox; oox.bind_to( t, t, slots ); return oox;
     }
 };
-template< typename VT >
-struct gen_oox<var<VT> > {
-    using type = var<VT>;
+template< typename VT, bool CanThrow >
+struct gen_oox<var<VT, CanThrow>, CanThrow> {
+    using type = var<VT, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
+    static type bind_to(internal::functional_task<slots, F, var<VT, CanThrow>, CanThrow > * t) {
         type oox; oox.bind_to( t, &t->my_result, slots+1, true ); return oox;
     }
 };
-template< typename T>
-using var_type = typename gen_oox<T>::type;
+template< typename T, bool CanThrow>
+using var_type = typename gen_oox<T, CanThrow>::type;
 
 template< typename R, typename... Types >
 struct functor_info {
@@ -1127,14 +1757,15 @@ using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::a
 
 } //namespace internal
 
-template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+template< bool CanThrow = default_exception_policy, typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
+auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>, CanThrow>
 {
+    static_assert(OOX_ENABLE_EXCEPTIONS || !CanThrow, "oox::run<true>(...) requires OOX_ENABLE_EXCEPTIONS=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
-    using args_type = internal::base_args<call_args_type, Args&&...>;
+    using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
     using functor_type = internal::oox_bind<F, args_type>;
-    using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type>;
+    using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
@@ -1144,35 +1775,89 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> 
     protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
                          ->value()
                          .my_args.setup(1, t, std::forward<Args>(args)...);
-    auto r = internal::gen_oox<r_type>::bind_to( t );
+    auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
 }
 
 void wait_for_all(internal::oox_var_base& on ) {
     on.wait();
+#if OOX_ENABLE_EXCEPTIONS
+    if (on.current_task->has_exception()) {
+        auto ep = on.current_task->exception_for_port(on.current_port());
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+        throw cancelled_by_exception{};
+    }
+#endif
 }
 
-template<typename T>
-[[nodiscard]] T wait_and_get(const var<T> &ov) {
-    auto &v = const_cast<var<T>&>(ov);
+template<typename T, bool CanThrow>
+void wait_for_all(const var<T, CanThrow>& on) {
+    const_cast<var<T, CanThrow>&>(on).wait();
+    if constexpr (CanThrow) {
+#if OOX_ENABLE_EXCEPTIONS
+        if (on.current_task->has_exception()) {
+            auto ep = on.current_task->exception_for_port(on.current_port());
+            if (ep) {
+                std::rethrow_exception(ep);
+            }
+            throw cancelled_by_exception{};
+        }
+#endif
+    }
+}
+
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(const var<T, CanThrow> &ov) {
+    auto &v = const_cast<var<T, CanThrow>&>(ov);
     wait_for_all(v);
 
     // Follow forwarding chain until we reach a non-forward var
     internal::oox_var_base* base = &v;
     while (base->current_port_and_flags.is_forwarded) {
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            if (base->current_task->has_exception()) {
+                auto ep = base->current_task->exception_for_port(base->current_port());
+                if (ep) {
+                    std::rethrow_exception(ep);
+                }
+                throw cancelled_by_exception{};
+            }
+        }
+#endif
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
         base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
     }
 
+#if OOX_ENABLE_EXCEPTIONS
+    if constexpr (CanThrow) {
+        if (base->current_task->has_exception()) {
+            auto ep = base->current_task->exception_for_port(base->current_port());
+            if (ep) {
+                std::rethrow_exception(ep);
+            }
+            throw cancelled_by_exception{};
+        }
+    }
+#endif
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
+    if constexpr (CanThrow) {
+#if OOX_ENABLE_EXCEPTIONS
+        if (base->current_port_and_flags.storage_state_can_throw) {
+            return static_cast<internal::result_state<T, true>*>(base->storage_ptr)->value();
+        }
+#endif
+    }
     return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
 }
 
-template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
-template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(var<T, CanThrow> &ov) { return wait_and_get(static_cast<const var<T, CanThrow>&>(ov)); }
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(var<T, CanThrow> &&ov) { return wait_and_get(static_cast<const var<T, CanThrow>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
 
