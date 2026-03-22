@@ -304,6 +304,442 @@ TEST(OOX, ExceptionLateConsumerAfterOutputVarCancelled) {
     EXPECT_THROW(oox::wait_and_get(b), oox::cancelled_by_exception);
 }
 
+TEST(OOX, ExceptionExplicitVarCancelSkipsBodyAndPropagates) {
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> ran_a{0};
+    std::atomic<int> ran_b{0};
+
+    oox::var<int> a = oox::run([&](int x) -> int {
+        ran_a.fetch_add(1);
+        return x + 1;
+    }, gate);
+    oox::var<int> b = oox::run([&](int x) -> int {
+        ran_b.fetch_add(1);
+        return x + 1;
+    }, a);
+
+    a.cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_and_get(a), oox::cancelled_by_user);
+    EXPECT_THROW(oox::wait_and_get(b), oox::cancelled_by_user);
+    EXPECT_EQ(ran_a.load(), 0);
+    EXPECT_EQ(ran_b.load(), 0);
+}
+
+TEST(OOX, ExceptionExplicitTaskCancelSkipsBodyAndPropagates) {
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> ran_a{0};
+    std::atomic<int> ran_b{0};
+
+    oox::var<int> a = oox::run([&](int x) -> int {
+        ran_a.fetch_add(1);
+        return x + 1;
+    }, gate);
+    oox::var<int> b = oox::run([&](int x) -> int {
+        ran_b.fetch_add(1);
+        return x + 1;
+    }, a);
+
+    ASSERT_TRUE(a.current_task != nullptr);
+    a.current_task->cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_and_get(a), oox::cancelled_by_user);
+    EXPECT_THROW(oox::wait_and_get(b), oox::cancelled_by_user);
+    EXPECT_EQ(ran_a.load(), 0);
+    EXPECT_EQ(ran_b.load(), 0);
+}
+
+TEST(OOX, ExceptionExplicitNodeCancelSkipsBody) {
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> ran{0};
+
+    oox::node n = oox::run([&](int x) {
+        ran.fetch_add(x);
+    }, gate);
+
+    n.cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_for_all(n), oox::cancelled_by_user);
+    EXPECT_EQ(ran.load(), 0);
+}
+
+TEST(OOX, ExceptionExplicitCancelRealExceptionWins) {
+    oox::var<int> gate(oox::deferred);
+    oox::var<int> bad = oox::run([](int) -> int {
+        throw dummy_exception{};
+    }, gate);
+    oox::var<int> out = oox::run(plus, 1, bad);
+
+    out.cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_and_get(out), dummy_exception);
+}
+
+TEST(OOX, ExceptionExplicitCancelCanBeRecoveredByWriter) {
+    oox::var<int> a(oox::deferred);
+    oox::var<int> stale = oox::run(plus, 1, a);
+
+    a.cancel();
+    oox::run([](int& A) { A = 10; }, a);
+    oox::var<int> fresh = oox::run(plus, 2, a);
+
+    EXPECT_EQ(oox::wait_and_get(a), 10);
+    EXPECT_EQ(oox::wait_and_get(stale), 11);
+    EXPECT_EQ(oox::wait_and_get(fresh), 12);
+}
+
+TEST(OOX, ExceptionExplicitCancelAfterCompletionIsNoop) {
+    oox::var<int> a = oox::run([]() -> int { return 5; });
+
+    EXPECT_EQ(oox::wait_and_get(a), 5);
+    a.cancel();
+    EXPECT_EQ(oox::wait_and_get(a), 5);
+}
+
+TEST(OOX, ExceptionCancelLargeTreeIntermediateSubtree) {
+    constexpr int kDepth = 8;
+    constexpr int kCancelDepth = 3;
+    constexpr int kCancelIndex = 5;
+    static_assert(kCancelDepth < kDepth, "cancelled node must be internal");
+
+    auto in_cancel_subtree = [](int depth, int index) -> bool {
+        if (depth < kCancelDepth) {
+            return false;
+        }
+        return (index >> (depth - kCancelDepth)) == kCancelIndex;
+    };
+
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> cancelled_branch_runs{0};
+    std::atomic<int> live_branch_runs{0};
+
+    std::vector<std::vector<oox::var<int>>> levels(kDepth + 1);
+    levels[0].reserve(1);
+    levels[0].push_back(oox::run([&](int x) -> int {
+        if (in_cancel_subtree(0, 0)) {
+            cancelled_branch_runs.fetch_add(1);
+        } else {
+            live_branch_runs.fetch_add(1);
+        }
+        return x + 1;
+    }, gate));
+
+    int expected_cancelled_runs = 0;
+    int expected_live_runs = 1;
+
+    for (int depth = 1; depth <= kDepth; ++depth) {
+        levels[depth].reserve(1 << depth);
+        const int parent_count = 1 << (depth - 1);
+        for (int i = 0; i < parent_count; ++i) {
+            auto& parent = levels[depth - 1][i];
+
+            const int left_index = 2 * i;
+            const int right_index = left_index + 1;
+
+            if (in_cancel_subtree(depth, left_index)) {
+                ++expected_cancelled_runs;
+            } else {
+                ++expected_live_runs;
+            }
+            if (in_cancel_subtree(depth, right_index)) {
+                ++expected_cancelled_runs;
+            } else {
+                ++expected_live_runs;
+            }
+
+            levels[depth].push_back(oox::run([&, depth, left_index](int x) -> int {
+                if (in_cancel_subtree(depth, left_index)) {
+                    cancelled_branch_runs.fetch_add(1);
+                } else {
+                    live_branch_runs.fetch_add(1);
+                }
+                return x + 1;
+            }, parent));
+
+            levels[depth].push_back(oox::run([&, depth, right_index](int x) -> int {
+                if (in_cancel_subtree(depth, right_index)) {
+                    cancelled_branch_runs.fetch_add(1);
+                } else {
+                    live_branch_runs.fetch_add(1);
+                }
+                return x + 2;
+            }, parent));
+        }
+    }
+
+    levels[kCancelDepth][kCancelIndex].cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    int cancelled_leaf_count = 0;
+    int live_leaf_count = 0;
+    for (int i = 0; i < (1 << kDepth); ++i) {
+        if (in_cancel_subtree(kDepth, i)) {
+            ++cancelled_leaf_count;
+            EXPECT_THROW(oox::wait_and_get(levels[kDepth][i]), oox::cancelled_by_user);
+        } else {
+            ++live_leaf_count;
+            int value = 0;
+            EXPECT_NO_THROW(value = oox::wait_and_get(levels[kDepth][i]));
+            EXPECT_GT(value, 0);
+        }
+    }
+
+    EXPECT_GT(cancelled_leaf_count, 0);
+    EXPECT_GT(live_leaf_count, 0);
+    EXPECT_EQ(cancelled_branch_runs.load(), 0);
+    EXPECT_EQ(live_branch_runs.load(), expected_live_runs);
+    EXPECT_GT(expected_cancelled_runs, 0);
+}
+
+TEST(OOX, ExceptionCancelIntermediateNodeAfterUpstreamReady) {
+    oox::var<int> gate1(oox::deferred);
+    oox::var<int> gate2(oox::deferred);
+
+    std::atomic<int> target_ran{0};
+    std::atomic<int> child_ran{0};
+    std::atomic<int> sibling_ran{0};
+
+    oox::var<int> root = oox::run([](int x) -> int { return x + 1; }, gate1);
+    oox::var<int> target = oox::run([&](int x, int y) -> int {
+        target_ran.fetch_add(1);
+        return x + y;
+    }, root, gate2);
+    oox::var<int> child = oox::run([&](int x) -> int {
+        child_ran.fetch_add(1);
+        return x + 10;
+    }, target);
+    oox::var<int> sibling = oox::run([&](int x) -> int {
+        sibling_ran.fetch_add(1);
+        return x + 2;
+    }, root);
+
+    oox::run([](int& g) { g = 3; }, gate1);
+    EXPECT_EQ(oox::wait_and_get(root), 4);
+
+    ASSERT_TRUE(target.current_task != nullptr);
+    target.current_task->cancel();
+
+    oox::run([](int& g) { g = 5; }, gate2);
+
+    EXPECT_THROW(oox::wait_and_get(target), oox::cancelled_by_user);
+    EXPECT_THROW(oox::wait_and_get(child), oox::cancelled_by_user);
+    EXPECT_EQ(oox::wait_and_get(sibling), 6);
+    EXPECT_EQ(target_ran.load(), 0);
+    EXPECT_EQ(child_ran.load(), 0);
+    EXPECT_EQ(sibling_ran.load(), 1);
+}
+
+TEST(OOX, ExceptionThrowLargeTreeIntermediateSubtree) {
+    constexpr int kDepth = 8;
+    constexpr int kThrowDepth = 3;
+    constexpr int kThrowIndex = 5;
+    static_assert(kThrowDepth < kDepth, "throwing node must be internal");
+
+    auto is_throw_node = [](int depth, int index) -> bool {
+        return depth == kThrowDepth && index == kThrowIndex;
+    };
+    auto in_throw_subtree = [](int depth, int index) -> bool {
+        if (depth < kThrowDepth) {
+            return false;
+        }
+        return (index >> (depth - kThrowDepth)) == kThrowIndex;
+    };
+
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> throwing_node_runs{0};
+    std::atomic<int> blocked_subtree_runs{0};
+    std::atomic<int> live_branch_runs{0};
+
+    std::vector<std::vector<oox::var<int>>> levels(kDepth + 1);
+    levels[0].reserve(1);
+    levels[0].push_back(oox::run([&](int x) -> int {
+        live_branch_runs.fetch_add(1);
+        return x + 1;
+    }, gate));
+
+    int expected_live_runs = 1;
+    int expected_blocked_descendants = 0;
+
+    for (int depth = 1; depth <= kDepth; ++depth) {
+        levels[depth].reserve(1 << depth);
+        const int parent_count = 1 << (depth - 1);
+        for (int i = 0; i < parent_count; ++i) {
+            auto& parent = levels[depth - 1][i];
+
+            const int left_index = 2 * i;
+            const int right_index = left_index + 1;
+
+            if (is_throw_node(depth, left_index)) {
+                // The throwing node itself should execute once and throw.
+            } else if (in_throw_subtree(depth, left_index)) {
+                ++expected_blocked_descendants;
+            } else {
+                ++expected_live_runs;
+            }
+            if (is_throw_node(depth, right_index)) {
+                // The throwing node itself should execute once and throw.
+            } else if (in_throw_subtree(depth, right_index)) {
+                ++expected_blocked_descendants;
+            } else {
+                ++expected_live_runs;
+            }
+
+            levels[depth].push_back(oox::run([&, depth, left_index](int x) -> int {
+                if (is_throw_node(depth, left_index)) {
+                    throwing_node_runs.fetch_add(1);
+                    throw dummy_exception{};
+                }
+                if (in_throw_subtree(depth, left_index)) {
+                    blocked_subtree_runs.fetch_add(1);
+                } else {
+                    live_branch_runs.fetch_add(1);
+                }
+                return x + 1;
+            }, parent));
+
+            levels[depth].push_back(oox::run([&, depth, right_index](int x) -> int {
+                if (is_throw_node(depth, right_index)) {
+                    throwing_node_runs.fetch_add(1);
+                    throw dummy_exception{};
+                }
+                if (in_throw_subtree(depth, right_index)) {
+                    blocked_subtree_runs.fetch_add(1);
+                } else {
+                    live_branch_runs.fetch_add(1);
+                }
+                return x + 2;
+            }, parent));
+        }
+    }
+
+    oox::run([](int& g) { g = 1; }, gate);
+
+    int throwing_leaf_count = 0;
+    int live_leaf_count = 0;
+    for (int i = 0; i < (1 << kDepth); ++i) {
+        if (in_throw_subtree(kDepth, i)) {
+            ++throwing_leaf_count;
+            EXPECT_THROW(oox::wait_and_get(levels[kDepth][i]), dummy_exception);
+        } else {
+            ++live_leaf_count;
+            int value = 0;
+            EXPECT_NO_THROW(value = oox::wait_and_get(levels[kDepth][i]));
+            EXPECT_GT(value, 0);
+        }
+    }
+
+    EXPECT_GT(throwing_leaf_count, 0);
+    EXPECT_GT(live_leaf_count, 0);
+    EXPECT_EQ(throwing_node_runs.load(), 1);
+    EXPECT_EQ(blocked_subtree_runs.load(), 0);
+    EXPECT_EQ(live_branch_runs.load(), expected_live_runs);
+    EXPECT_GT(expected_blocked_descendants, 0);
+}
+
+TEST(OOX, ExceptionThrowLargeLayeredDagPartitionPropagation) {
+    constexpr int kWidth = 32;
+    constexpr int kLayers = 6;
+    static_assert((kWidth % 2) == 0, "width must be even");
+    constexpr int kHalf = kWidth / 2;
+
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> source_bad_runs{0};
+    std::atomic<int> source_good_runs{0};
+    std::atomic<int> bad_partition_runs{0};
+    std::atomic<int> good_partition_runs{0};
+    std::atomic<int> mixed_sink_runs{0};
+    std::atomic<int> good_sink_runs{0};
+
+    oox::var<int> bad_source = oox::run([&](int) -> int {
+        source_bad_runs.fetch_add(1);
+        throw dummy_exception{};
+    }, gate);
+    oox::var<int> good_source = oox::run([&](int x) -> int {
+        source_good_runs.fetch_add(1);
+        return x + 1;
+    }, gate);
+
+    std::vector<oox::var<int>> current;
+    current.reserve(kWidth);
+    for (int i = 0; i < kHalf; ++i) {
+        current.push_back(oox::run([&](int x) -> int {
+            bad_partition_runs.fetch_add(1);
+            return x + 1;
+        }, bad_source));
+    }
+    for (int i = 0; i < kHalf; ++i) {
+        current.push_back(oox::run([&](int x) -> int {
+            good_partition_runs.fetch_add(1);
+            return x + 1;
+        }, good_source));
+    }
+
+    int expected_good_runs = kHalf;
+
+    for (int layer = 1; layer <= kLayers; ++layer) {
+        std::vector<oox::var<int>> next;
+        next.reserve(kWidth);
+
+        for (int i = 0; i < kHalf; ++i) {
+            const int j = (i + 1) % kHalf;
+            next.push_back(oox::run([&](int a, int b) -> int {
+                bad_partition_runs.fetch_add(1);
+                return a + b + 1;
+            }, current[i], current[j]));
+        }
+
+        for (int i = 0; i < kHalf; ++i) {
+            const int idx = kHalf + i;
+            const int jdx = kHalf + ((i + 1) % kHalf);
+            next.push_back(oox::run([&](int a, int b) -> int {
+                good_partition_runs.fetch_add(1);
+                return a + b + 1;
+            }, current[idx], current[jdx]));
+        }
+
+        expected_good_runs += kHalf;
+        current = std::move(next);
+    }
+
+    oox::var<int> mixed_sink = oox::run([&](int a, int b) -> int {
+        mixed_sink_runs.fetch_add(1);
+        return a + b;
+    }, current[0], current[kHalf]);
+
+    oox::var<int> good_sink = oox::run([&](int a, int b) -> int {
+        good_sink_runs.fetch_add(1);
+        return a + b;
+    }, current[kHalf], current[kHalf + 1]);
+
+    oox::run([](int& g) { g = 1; }, gate);
+
+    EXPECT_THROW(oox::wait_and_get(mixed_sink), dummy_exception);
+
+    int good_sink_value = 0;
+    EXPECT_NO_THROW(good_sink_value = oox::wait_and_get(good_sink));
+    EXPECT_GT(good_sink_value, 0);
+
+    for (int i = 0; i < kHalf; ++i) {
+        EXPECT_THROW(oox::wait_and_get(current[i]), dummy_exception);
+    }
+    for (int i = kHalf; i < kWidth; ++i) {
+        int value = 0;
+        EXPECT_NO_THROW(value = oox::wait_and_get(current[i]));
+        EXPECT_GT(value, 0);
+    }
+
+    EXPECT_EQ(source_bad_runs.load(), 1);
+    EXPECT_EQ(source_good_runs.load(), 1);
+    EXPECT_EQ(bad_partition_runs.load(), 0);
+    EXPECT_EQ(good_partition_runs.load(), expected_good_runs);
+    EXPECT_EQ(mixed_sink_runs.load(), 0);
+    EXPECT_EQ(good_sink_runs.load(), 1);
+}
+
 TEST(OOX, ExceptionMultiOutputWriterAndReturn) {
     oox::var<int> a(oox::deferred);
     oox::var<int> r = oox::run([](int& A) -> int {

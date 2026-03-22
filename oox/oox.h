@@ -59,6 +59,12 @@ struct cancelled_by_exception final : std::exception {
         return "oox::cancelled_by_exception";
     }
 };
+
+struct cancelled_by_user final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_user";
+    }
+};
 #endif
 
 #if defined(OOX_DEFAULT_EXCEPTION_POLICY)
@@ -677,12 +683,21 @@ struct task_node : public task, arc_list {
         try_set_exception(std::move(ep));
     }
 
+    void cancel() noexcept {
+        publish_incoming_failure(nullptr, 0);
+        if (start_count.load(std::memory_order_acquire) == 0) {
+            set_exception(std::make_exception_ptr(cancelled_by_user{}));
+        }
+    }
+
     std::exception_ptr exception_for_port([[maybe_unused]] int port) const noexcept {
         if (port > 0) {
             return std::exception_ptr{}; //cancelled
         }
         return get_exception();
     }
+#else
+    void cancel() noexcept {}
 #endif
 
     task_node() { } // prepare the task for waiting on it directly
@@ -915,12 +930,17 @@ struct incoming_failure_state<true> {
     static constexpr uintptr_t incoming_failure_none = 0;
     static constexpr uintptr_t incoming_failure_cancelled = 1;
     static constexpr uintptr_t incoming_failure_source_tag = 2;
+    static constexpr uintptr_t incoming_failure_user_cancelled = 3;
     static constexpr uintptr_t incoming_failure_tag_mask = 3;
 
     std::atomic<uintptr_t> incoming_failure_word{incoming_failure_none};
 
     void publish_incoming_failure(task_node* source, int source_port) noexcept {
-        if (!source || source_port != 0) {
+        if (!source) {
+            publish_user_cancelled();
+            return;
+        }
+        if (source_port != 0) {
             publish_cancelled();
             return;
         }
@@ -937,9 +957,13 @@ struct incoming_failure_state<true> {
         if (state == incoming_failure_none) {
             return false;
         }
-        if (state & incoming_failure_source_tag) {
+        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
             auto* source = reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
             node.set_exception(source->exception_for_port(0));
+            return node.has_exception();
+        }
+        if (state == incoming_failure_user_cancelled) {
+            node.set_exception(std::make_exception_ptr(cancelled_by_user{}));
             return node.has_exception();
         }
         if (state & incoming_failure_cancelled) {
@@ -952,6 +976,10 @@ struct incoming_failure_state<true> {
   private:
     void publish_cancelled() noexcept {
         incoming_failure_word.fetch_or(incoming_failure_cancelled, std::memory_order_acq_rel);
+    }
+
+    void publish_user_cancelled() noexcept {
+        incoming_failure_word.fetch_or(incoming_failure_user_cancelled, std::memory_order_acq_rel);
     }
 
     void publish_exception_source(task_node* source) noexcept {
@@ -1080,6 +1108,13 @@ struct oox_var_base {
         }
         current_task->wait();
     }
+    void cancel_current_task() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if (current_task) {
+            current_task->cancel();
+        }
+#endif
+    }
     void release() {
         if( current_task ) {
             current_task->set_next_writer( current_port(), (task_node*)uintptr_t(
@@ -1207,6 +1242,13 @@ public:
         }
         return static_cast<internal::result_state<T, false>*>(storage_ptr)->value();
     }
+    void cancel() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
+    }
 };
 
 template<bool CanThrow>
@@ -1220,6 +1262,13 @@ public:
         static_assert(CanThrow || !DCanThrow, "non-throwing void var cannot bind to throwing source");
         ((internal::task_node*)(uintptr_t(src.storage_ptr)-src.storage_offset))->release();
         src.current_task = nullptr;
+    }
+    void cancel() noexcept {
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
     }
 };
 
@@ -1420,6 +1469,10 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     TASK_EXECUTE_METHOD {
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
             try {
                 result_base::emplace(this->functor_base::value()());
             } catch(...) {
@@ -1477,6 +1530,10 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
             try {
                 this->functor_base::value()();
             } catch(...) {
@@ -1581,6 +1638,10 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
+            if (this->has_exception()) {
+                task_node::notify_successors<slots>();
+                return nullptr;
+            }
             try {
                 if ( !is_executed ) {
                     __OOX_TRACE("%p do_run: start forward",this);
