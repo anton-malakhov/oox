@@ -43,7 +43,7 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     # build test in TBB mode as well
     add_executable(${unittest}_tbb ${unittest}.cpp)
     target_compile_definitions(${unittest}_tbb PRIVATE HAVE_TBB)
-    if (OOX_EXCEPTIONS_ENABLED)
+    if (OOX_ENABLE_EXCEPTIONS)
       target_compile_definitions(${unittest}_tbb PRIVATE TBB_USE_EXCEPTIONS=1)
     endif ()
     target_link_libraries(${unittest}_tbb
@@ -70,7 +70,7 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
 
 endforeach ()
 
-if (OOX_EXCEPTIONS_ENABLED)
+if (OOX_ENABLE_EXCEPTIONS)
   add_test(NAME ExceptionPolicyCompile
            COMMAND ${CMAKE_COMMAND}
                    -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}

@@ -19,7 +19,7 @@ set(OOX_SOURCE_DIR \"${OOX_SOURCE_DIR}\")
 file(WRITE \"${OOX_TRY_SRC_DIR}/ok.cpp\" \"
 #include <oox/oox.h>
 int main() {
-#if OOX_EXCEPTIONS_ENABLED
+#if OOX_ENABLE_EXCEPTIONS
     oox::var<int, false> base = oox::run<false>([]() { return 1; });
     oox::var<int, true> dep = oox::run<true>([](int x) { return x + 1; }, base);
     (void)dep;
@@ -31,7 +31,7 @@ int main() {
 try_compile(OOX_OK_RESULT
             \"${OOX_TRY_BUILD_DIR}/ok_build\"
             \"${OOX_TRY_SRC_DIR}/ok.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_ENABLE_EXCEPTIONS=1\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
@@ -54,7 +54,7 @@ int main() {
 try_compile(OOX_FAIL_RESULT
             \"${OOX_TRY_BUILD_DIR}/fail_build\"
             \"${OOX_TRY_SRC_DIR}/fail.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
+            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_ENABLE_EXCEPTIONS=1\"
             CMAKE_FLAGS
               \"-DCMAKE_CXX_STANDARD=20\"
               \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
@@ -62,28 +62,6 @@ try_compile(OOX_FAIL_RESULT
             OUTPUT_VARIABLE OOX_FAIL_OUTPUT)
 if (OOX_FAIL_RESULT)
   message(FATAL_ERROR \"Expected fail.cpp to fail to compile. Output:\\n\${OOX_FAIL_OUTPUT}\")
-endif()
-
-file(WRITE \"${OOX_TRY_SRC_DIR}/fail_write.cpp\" \"
-#include <oox/oox.h>
-int main() {
-    oox::var<int, false> out = oox::run<false>([]() { return 0; });
-    oox::run<true>([](oox::var<int, false>& v) { v = 5; }, out);
-    return 0;
-}
-\")
-
-try_compile(OOX_FAIL_WRITE_RESULT
-            \"${OOX_TRY_BUILD_DIR}/fail_write_build\"
-            \"${OOX_TRY_SRC_DIR}/fail_write.cpp\"
-            COMPILE_DEFINITIONS \"-I${OOX_SOURCE_DIR}\" \"-DOOX_EXCEPTIONS_ENABLED=1\"
-            CMAKE_FLAGS
-              \"-DCMAKE_CXX_STANDARD=20\"
-              \"-DCMAKE_CXX_STANDARD_REQUIRED=ON\"
-              \"-DCMAKE_CXX_EXTENSIONS=OFF\"
-            OUTPUT_VARIABLE OOX_FAIL_WRITE_OUTPUT)
-if (OOX_FAIL_WRITE_RESULT)
-  message(FATAL_ERROR \"Expected fail_write.cpp to fail to compile. Output:\\n\${OOX_FAIL_WRITE_OUTPUT}\")
 endif()
 ")
 

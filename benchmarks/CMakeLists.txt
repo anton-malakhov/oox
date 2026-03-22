@@ -61,7 +61,7 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
       set(OOX_LOOP_MODES exe)
     endif()
     foreach(suffix IN LISTS OOX_LOOP_MODES)
-      if("${bench}" MATCHES "exceptions" AND NOT OOX_EXCEPTIONS_ENABLED)
+      if("${bench}" MATCHES "exceptions" AND NOT OOX_ENABLE_EXCEPTIONS)
         set(OOX_POLICY_LIST noexc)
       else()
         set(OOX_POLICY_LIST noexc exc)
@@ -76,6 +76,9 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
         target_compile_definitions(${bench}_${mode}.${suffix}_${policy} PRIVATE PARALLEL=${suffix} HAVE_${mode}
                                    OOX_DEFAULT_EXCEPTION_POLICY=${OOX_POLICY_VALUE}
                                    OOX_EXCEPTION_POLICY_STR=${policy})
+        target_compile_options(${bench}_${mode}.${suffix}_${policy} PRIVATE
+                                -UOOX_ENABLE_EXCEPTIONS
+                                -DOOX_ENABLE_EXCEPTIONS=${OOX_POLICY_VALUE})
         if ("${mode}" STREQUAL "TBB")
           if (OOX_POLICY_VALUE)
             target_compile_definitions(${bench}_${mode}.${suffix}_${policy} PRIVATE TBB_USE_EXCEPTIONS=1)
@@ -89,3 +92,28 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
     endforeach()
   endforeach()
 endforeach()
+
+if(TBB_FOUND)
+  # Standalone TBB exception-overhead benchmark (does not use OOX).
+  add_executable(bench_tbb_exceptions_noexc bench_tbb_exceptions.cpp)
+  target_compile_definitions(bench_tbb_exceptions_noexc PRIVATE
+    HAVE_TBB
+    TBB_USE_EXCEPTIONS=0
+    TBB_EXCEPTION_POLICY_STR=noexc
+  )
+  target_compile_options(bench_tbb_exceptions_noexc PRIVATE -fno-exceptions)
+  target_link_libraries(bench_tbb_exceptions_noexc PRIVATE benchmark::benchmark TBB::tbb TBB::tbbmalloc)
+  add_test(bench_tbb_exceptions_noexc
+    bench_tbb_exceptions_noexc --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=NoThrow)
+
+  add_executable(bench_tbb_exceptions_exc bench_tbb_exceptions.cpp)
+  target_compile_definitions(bench_tbb_exceptions_exc PRIVATE
+    HAVE_TBB
+    TBB_USE_EXCEPTIONS=1
+    TBB_EXCEPTION_POLICY_STR=exc
+  )
+  target_compile_options(bench_tbb_exceptions_exc PRIVATE -fexceptions)
+  target_link_libraries(bench_tbb_exceptions_exc PRIVATE benchmark::benchmark TBB::tbb TBB::tbbmalloc)
+  add_test(bench_tbb_exceptions_exc
+    bench_tbb_exceptions_exc --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=NoThrow)
+endif()

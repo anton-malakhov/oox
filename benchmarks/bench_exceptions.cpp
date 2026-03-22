@@ -7,12 +7,12 @@ const std::string parallel_str = STR(PARALLEL);
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 #include <oox/oox.h>
-#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED
+#if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS
 #include <exception>
 #endif
 #include <functional>
 
-#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED
+#if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS
 #define OOX_BENCH_RUNTIME_EXCEPTIONS 1
 #else
 #define OOX_BENCH_RUNTIME_EXCEPTIONS 0
