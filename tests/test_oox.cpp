@@ -18,9 +18,12 @@ bool g_oox_verbose = false;
 #include <numeric>
 #include <vector>
 #include <functional>
-#if OOX_EXCEPTIONS_ENABLED
+#if OOX_CONTEXTS_ENABLED
+#include <future>
 #include <stdexcept>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #endif
 
 
@@ -61,6 +64,103 @@ namespace ArchSample {
 #endif
 
 auto plus = std::plus<int>();
+
+#if OOX_CONTEXTS_ENABLED
+namespace {
+
+class task_gate {
+public:
+    void notify_started() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            started_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    void wait_until_started() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return started_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    void wait_until_released() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return released_; });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool started_ = false;
+    bool released_ = false;
+};
+
+template <typename Body>
+struct launched_task {
+    std::future<oox::var<int>> future;
+    std::thread thread;
+};
+
+template <typename Body>
+launched_task<Body> launch_blocked_task(oox::ctx::context& ctx, std::atomic<int>& runs, task_gate& gate, Body&& body) {
+    std::promise<oox::var<int>> promise;
+    auto future = promise.get_future();
+    std::thread thread([&ctx, &runs, &gate, body = std::forward<Body>(body), promise = std::move(promise)]() mutable {
+        promise.set_value(oox::run(ctx, [&]() -> int {
+            ++runs;
+            gate.notify_started();
+            gate.wait_until_released();
+            return body();
+        }));
+    });
+    return {std::move(future), std::move(thread)};
+}
+
+template <typename Callable>
+void expect_runtime_error(Callable&& callable, const char* message) {
+    try {
+        if constexpr (std::is_void_v<std::invoke_result_t<Callable>>) {
+            callable();
+        } else {
+            [[maybe_unused]] auto ignored = callable();
+        }
+        FAIL() << "expected std::runtime_error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_STREQ(e.what(), message);
+    } catch (...) {
+        FAIL() << "expected std::runtime_error";
+    }
+}
+
+template <typename Callable>
+void expect_task_cancelled(Callable&& callable) {
+    EXPECT_THROW(
+        [&] {
+            if constexpr (std::is_void_v<std::invoke_result_t<Callable>>) {
+                callable();
+            } else {
+                [[maybe_unused]] auto ignored = callable();
+            }
+        }(),
+        oox::task_cancelled);
+}
+
+struct rethrow_if_failed_probe final : oox::internal::task_node_slots<1> {
+    explicit rethrow_if_failed_probe(oox::ctx::context* ctx_ptr = nullptr) : ctx(ctx_ptr) {}
+    oox::ctx::context* get_ctx() const noexcept override { return ctx; }
+    oox::ctx::context* ctx;
+};
+
+} // namespace
+#endif
 
 TEST(OOX, Simple) {
     const oox::var<int> a = oox::run(plus, 2, 3);
@@ -218,6 +318,189 @@ TEST(OOX, DeferredArrayLayered) {
     ASSERT_EQ(oox::wait_and_get(a[2]), 102);
 }
 
+#if OOX_CONTEXTS_ENABLED
+TEST(OOX, RethrowIfFailedReturnsWhenContextActive) {
+    oox::ctx::context ctx;
+    rethrow_if_failed_probe probe(&ctx);
+
+    EXPECT_NO_THROW(probe.rethrow_if_failed());
+}
+
+TEST(OOX, RethrowIfFailedRethrowsStoredContextException) {
+    oox::ctx::context ctx;
+    rethrow_if_failed_probe probe(&ctx);
+    constexpr const char* kMessage = "rethrow_if_failed exception";
+
+    ctx.record_exception(std::make_exception_ptr(std::runtime_error(kMessage)));
+
+    expect_runtime_error([&] { probe.rethrow_if_failed(); }, kMessage);
+}
+
+TEST(OOX, RethrowIfFailedThrowsCancelledForCancelledContext) {
+    oox::ctx::context ctx;
+    rethrow_if_failed_probe probe(&ctx);
+
+    EXPECT_TRUE(ctx.cancel());
+    expect_task_cancelled([&] { probe.rethrow_if_failed(); });
+}
+
+TEST(OOX, RethrowIfFailedThrowsCancelledForFailedHeadWithoutContext) {
+    rethrow_if_failed_probe probe(nullptr);
+    probe.head.store(reinterpret_cast<oox::internal::arc*>(oox::internal::k_task_failed_tag),
+                     std::memory_order_release);
+
+    expect_task_cancelled([&] { probe.rethrow_if_failed(); });
+}
+
+TEST(OOX, CancelledBeforeReadyTaskDoesNotSpawn) {
+    oox::ctx::context ctx;
+    oox::var<int> input(oox::deferred);
+    std::atomic<int> runs{0};
+
+    auto result = oox::run(ctx, [&](int value) {
+        ++runs;
+        return value + 1;
+    }, input);
+
+    ASSERT_TRUE(ctx.cancel());
+
+    oox::run([](int& value) { value = 41; }, input);
+
+    EXPECT_EQ(oox::wait_and_get(input), 41);
+    EXPECT_EQ(runs.load(), 0);
+    expect_task_cancelled([&] { return oox::wait_and_get(result); });
+}
+
+TEST(OOX, CancelledAfterStartTaskCompletesButReadIsPoisoned) {
+    oox::ctx::context ctx;
+    std::atomic<int> runs{0};
+    task_gate gate;
+    auto launched = launch_blocked_task(ctx, runs, gate, [] { return 7; });
+
+    gate.wait_until_started();
+
+    EXPECT_TRUE(ctx.cancel());
+
+    gate.release();
+
+    launched.thread.join();
+    auto result = launched.future.get();
+
+    EXPECT_EQ(runs.load(), 1);
+    EXPECT_TRUE(ctx.is_cancelled());
+    EXPECT_FALSE(ctx.has_exception());
+    expect_task_cancelled([&] { return oox::wait_and_get(result); });
+}
+
+TEST(OOX, CancelledAfterStartThrownExceptionMarksContext) {
+    oox::ctx::context ctx;
+    std::atomic<int> runs{0};
+    task_gate gate;
+    constexpr const char* kMessage = "boom after cancel";
+
+    auto launched = launch_blocked_task(ctx, runs, gate, []() -> int {
+        throw std::runtime_error(kMessage);
+    });
+
+    gate.wait_until_started();
+    EXPECT_TRUE(ctx.cancel());
+    EXPECT_FALSE(ctx.has_exception());
+
+    gate.release();
+
+    launched.thread.join();
+    auto result = launched.future.get();
+
+    EXPECT_EQ(runs.load(), 1);
+    expect_runtime_error([&] { return oox::wait_and_get(result); }, kMessage);
+    EXPECT_TRUE(ctx.is_cancelled());
+    EXPECT_TRUE(ctx.has_exception());
+    expect_runtime_error([&] { ctx.rethrow_if_exception(); }, kMessage);
+}
+
+TEST(OOX, CancelledAfterStartThrownExceptionPropagatesToLateConsumer) {
+    oox::ctx::context ctx;
+    std::atomic<int> runs{0};
+    task_gate gate;
+    constexpr const char* kMessage = "late consumer sees original";
+
+    auto launched = launch_blocked_task(ctx, runs, gate, []() -> int {
+        throw std::runtime_error(kMessage);
+    });
+
+    gate.wait_until_started();
+    EXPECT_TRUE(ctx.cancel());
+    gate.release();
+
+    launched.thread.join();
+    auto failed = launched.future.get();
+
+    expect_runtime_error([&] { return oox::wait_and_get(failed); }, kMessage);
+    EXPECT_TRUE(ctx.has_exception());
+
+    auto late = oox::run(ctx, [](int value) { return value + 1; }, failed);
+    expect_runtime_error([&] { return oox::wait_and_get(late); }, kMessage);
+}
+
+TEST(OOX, ThrownTaskCancelledMarksContextAsException) {
+    oox::ctx::context ctx;
+
+    auto failed = oox::run(ctx, []() -> int {
+        throw oox::task_cancelled();
+    });
+
+    expect_task_cancelled([&] { return oox::wait_and_get(failed); });
+    EXPECT_TRUE(ctx.is_cancelled());
+    EXPECT_TRUE(ctx.has_exception());
+    expect_task_cancelled([&] { ctx.rethrow_if_exception(); });
+}
+
+TEST(OOX, ForwardedChainWithExplicitContextStaysValid) {
+    oox::ctx::context ctx;
+
+    auto result = oox::run(ctx, [&]() -> oox::var<int> {
+        return oox::run(ctx, [&]() -> oox::var<int> {
+            return oox::run(ctx, [] { return 7; });
+        });
+    });
+
+    EXPECT_EQ(oox::wait_and_get(result), 7);
+}
+
+TEST(OOX, ExceptionPoisonsSiblingReadsInSameContext) {
+    oox::ctx::context ctx;
+    constexpr const char* kMessage = "ctx poisoning";
+
+    auto ok = oox::run(ctx, [] { return 7; });
+    auto failed = oox::run(ctx, []() -> int {
+        throw std::runtime_error(kMessage);
+    });
+
+    expect_runtime_error([&] { return oox::wait_and_get(failed); }, kMessage);
+    expect_runtime_error([&] { return oox::wait_and_get(ok); }, kMessage);
+}
+
+TEST(OOX, ContextResetClearsStoredException) {
+    oox::ctx::context ctx;
+    constexpr const char* kMessage = "reset clears exception";
+
+    auto failed = oox::run(ctx, []() -> int {
+        throw std::runtime_error(kMessage);
+    });
+
+    expect_runtime_error([&] { return oox::wait_and_get(failed); }, kMessage);
+    EXPECT_TRUE(ctx.is_cancelled());
+    EXPECT_TRUE(ctx.has_exception());
+    expect_runtime_error([&] { ctx.rethrow_if_exception(); }, kMessage);
+
+    ctx.reset();
+
+    EXPECT_FALSE(ctx.is_cancelled());
+    EXPECT_FALSE(ctx.has_exception());
+    EXPECT_NO_THROW(ctx.rethrow_if_exception());
+}
+#endif
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     for (int i = 1; i < argc; i++) {
@@ -226,7 +509,7 @@ int main(int argc, char** argv) {
     }
 
     int err{0};
-#if OOX_EXCEPTIONS_ENABLED
+#if OOX_CONTEXTS_ENABLED
     try {
         err = RUN_ALL_TESTS();
     } catch (const std::exception& e) {
