@@ -678,6 +678,7 @@ struct task_node : public task, arc_list {
     virtual void try_set_exception(std::exception_ptr eptr) noexcept = 0;
     virtual bool has_exception() const noexcept = 0;
     virtual std::exception_ptr get_exception() const noexcept = 0;
+    virtual task_node* exception_origin() const noexcept = 0;
     virtual void publish_incoming_failure(task_node* source, int source_port) noexcept = 0;
     virtual bool apply_incoming_failure() noexcept = 0;
 
@@ -946,11 +947,13 @@ struct incoming_failure_state<true> {
             publish_cancelled();
             return;
         }
-        if (!source->exception_for_port(0)) {
+        // Store the originator (task that holds the actual exception_ptr), not the immediate source.
+        auto* origin = source->exception_origin();
+        if (!origin) {
             publish_cancelled();
             return;
         }
-        publish_exception_source(source);
+        publish_exception_source(origin);
     }
 
     template <typename Node>
@@ -960,9 +963,8 @@ struct incoming_failure_state<true> {
             return false;
         }
         if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
-            auto* source = reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
-            node.set_exception(source->exception_for_port(0));
-            return node.has_exception();
+            // Real exception from predecessor — originator pointer already stored.
+            return true;
         }
         if (state == incoming_failure_user_cancelled) {
             node.set_exception(std::make_exception_ptr(cancelled_by_user{}));
@@ -973,6 +975,19 @@ struct incoming_failure_state<true> {
             return node.has_exception();
         }
         return false;
+    }
+
+    bool has_incoming_exception_source() const noexcept {
+        const auto state = incoming_failure_word.load(std::memory_order_acquire);
+        return (state & incoming_failure_source_tag) && state > incoming_failure_tag_mask;
+    }
+
+    task_node* incoming_exception_source() const noexcept {
+        const auto state = incoming_failure_word.load(std::memory_order_acquire);
+        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
+            return reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
+        }
+        return nullptr;
     }
 
   private:
@@ -1029,6 +1044,7 @@ struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false>
     void try_set_exception(std::exception_ptr) noexcept override {}
     bool has_exception() const noexcept override { return false; }
     std::exception_ptr get_exception() const noexcept override { return std::exception_ptr{}; }
+    task_node* exception_origin() const noexcept override { return nullptr; }
     void publish_incoming_failure(task_node*, int) noexcept override {}
     bool apply_incoming_failure() noexcept override { return false; }
 #endif
@@ -1450,15 +1466,24 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     }
     bool has_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::has_exception();
+            return result_base::has_exception() || failure_base::has_incoming_exception_source();
         }
         return false;
     }
     std::exception_ptr get_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::get_exception();
+            if (result_base::has_exception()) return result_base::get_exception();
+            auto* origin = failure_base::incoming_exception_source();
+            if (origin) return origin->get_exception();
         }
         return std::exception_ptr{};
+    }
+    task_node* exception_origin() const noexcept override {
+        if constexpr (CanThrow) {
+            if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
+            return failure_base::incoming_exception_source();
+        }
+        return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
         failure_base::publish_incoming_failure(source, source_port);
@@ -1511,15 +1536,24 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
     }
     bool has_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::has_exception();
+            return result_base::has_exception() || failure_base::has_incoming_exception_source();
         }
         return false;
     }
     std::exception_ptr get_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::get_exception();
+            if (result_base::has_exception()) return result_base::get_exception();
+            auto* origin = failure_base::incoming_exception_source();
+            if (origin) return origin->get_exception();
         }
         return std::exception_ptr{};
+    }
+    task_node* exception_origin() const noexcept override {
+        if constexpr (CanThrow) {
+            if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
+            return failure_base::incoming_exception_source();
+        }
+        return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
         failure_base::publish_incoming_failure(source, source_port);
@@ -1595,6 +1629,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             return false;
         }
         if (result_base::has_exception()) return true;
+        if (failure_base::has_incoming_exception_source()) return true;
         if (!result_base::has_value()) return false;
         const auto& result = result_base::value();
         return result.current_task && result.current_task->has_exception();
@@ -1604,10 +1639,24 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             return std::exception_ptr{};
         }
         if (result_base::has_exception()) return result_base::get_exception();
+        auto* origin = failure_base::incoming_exception_source();
+        if (origin) return origin->get_exception();
         if (!result_base::has_value()) return std::exception_ptr{};
         const auto& result = result_base::value();
         if (!result.current_task) return std::exception_ptr{};
         return result.current_task->get_exception();
+    }
+    task_node* exception_origin() const noexcept override {
+        if constexpr (!CanThrow) {
+            return nullptr;
+        }
+        if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
+        auto* origin = failure_base::incoming_exception_source();
+        if (origin) return origin;
+        if (!result_base::has_value()) return nullptr;
+        const auto& result = result_base::value();
+        if (!result.current_task) return nullptr;
+        return result.current_task->exception_origin();
     }
 #endif
     TASK_EXECUTE_METHOD {
