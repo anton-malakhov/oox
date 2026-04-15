@@ -202,6 +202,9 @@ struct result_state<T, false> {
         state_bits_field = state_unset;
     }
 
+    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
+    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
+
   private:
     struct storage_t {
         alignas(alignof(T)) std::byte data[sizeof(T)];
@@ -217,8 +220,6 @@ struct result_state<T, false> {
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
     }
-    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
-    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
 };
 
 template <bool CanThrow>
@@ -274,6 +275,9 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
         }
     }
 
+    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
+    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
+
   private:
     static constexpr std::size_t storage_size =
         (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
@@ -296,8 +300,6 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
     }
-    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
-    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
     std::exception_ptr* exception_ptr() noexcept {
         return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
     }
@@ -1557,45 +1559,29 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
 
 template<int slots, typename F, typename VT, bool VarCanThrow, bool CanThrow>
 struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<slots, F>
+                                                                  , result_state<var<VT, VarCanThrow>, CanThrow>
 #if OOX_ENABLE_EXCEPTIONS
-                                                                   , private incoming_failure_state<CanThrow>
+                                                                  , private incoming_failure_state<CanThrow>
 #endif
 {
     // TODO: NRVO optimized forwarding
     static_assert(VarCanThrow == CanThrow, "returning var<T, P> requires task policy to match P");
-    using storage_task<slots, F>::storage_task;
+    using functor_base = storage_task<slots, F>;
     using var_type = var<VT, VarCanThrow>;
-    std::aligned_storage_t<sizeof(var_type), alignof(var_type)> my_result;
-    bool is_executed : 1 = false;
-#if OOX_ENABLE_EXCEPTIONS
-    bool local_exception_set : 1 = false;
-    std::exception_ptr local_exception{};
-#endif
+    using result_base = result_state<var_type, CanThrow>;
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
-    var_type* result_var_ptr() noexcept {
-        return std::launder(reinterpret_cast<var_type*>(&my_result));
-    }
-    const var_type* result_var_ptr() const noexcept {
-        return std::launder(reinterpret_cast<const var_type*>(&my_result));
-    }
 #if OOX_ENABLE_EXCEPTIONS
     using failure_base = incoming_failure_state<CanThrow>;
     void try_set_exception(std::exception_ptr eptr) noexcept override {
         if constexpr (!CanThrow) {
             return;
         }
-      
-        if (local_exception_set) {
-            return;
-        }
-        local_exception_set = true;
-        local_exception = eptr;
-
-        if (is_executed) {
-            auto* result = result_var_ptr();
-            __OOX_ASSERT_EX(result && result->current_task, "forwarding result var has no current task");
-            result->current_task->try_set_exception(std::move(eptr));
+        result_base::try_set_exception(eptr);
+        if (result_base::has_value()) {
+            auto& result = result_base::value();
+            __OOX_ASSERT_EX(result.current_task, "forwarding result var has no current task");
+            result.current_task->try_set_exception(std::move(eptr));
         }
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
@@ -1608,30 +1594,20 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         if constexpr (!CanThrow) {
             return false;
         }
-        if (local_exception_set) {
-            return true;
-        }
-        if (!is_executed) {
-            return false;
-        }
-        const auto* result = result_var_ptr();
-        return result && result->current_task && result->current_task->has_exception();
+        if (result_base::has_exception()) return true;
+        if (!result_base::has_value()) return false;
+        const auto& result = result_base::value();
+        return result.current_task && result.current_task->has_exception();
     }
     std::exception_ptr get_exception() const noexcept override {
         if constexpr (!CanThrow) {
             return std::exception_ptr{};
         }
-        if (local_exception_set) {
-            return local_exception;
-        }
-        if (!is_executed) {
-            return std::exception_ptr{};
-        }
-        const auto* result = result_var_ptr();
-        if (!result || !result->current_task) {
-            return std::exception_ptr{};
-        }
-        return result->current_task->get_exception();
+        if (result_base::has_exception()) return result_base::get_exception();
+        if (!result_base::has_value()) return std::exception_ptr{};
+        const auto& result = result_base::value();
+        if (!result.current_task) return std::exception_ptr{};
+        return result.current_task->get_exception();
     }
 #endif
     TASK_EXECUTE_METHOD {
@@ -1643,13 +1619,12 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 return nullptr;
             }
             try {
-                if ( !is_executed ) {
+                if ( !result_base::has_value() ) {
                     __OOX_TRACE("%p do_run: start forward",this);
-                    ::new (static_cast<void*>(&my_result)) var_type(this->value()());
-                    is_executed = true;
+                    result_base::emplace(this->functor_base::value()());
                     this->start_count.store(1, std::memory_order_release);
                     arc* j = new arc(this, 0, arc::flow_only);
-                    auto& result = *result_var_ptr();
+                    auto& result = result_base::value();
                     __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
                     if(result.current_task->add_arc(j)) {
                         __OOX_TRACE("%p do_run: add_arc", this);
@@ -1661,13 +1636,12 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 this->set_exception(std::current_exception());
             }
         } else {
-            if ( !is_executed ) {
+            if ( !result_base::has_value() ) {
                 __OOX_TRACE("%p do_run: start forward",this);
-                ::new (static_cast<void*>(&my_result)) var_type(this->value()());
-                is_executed = true;
+                result_base::emplace(this->functor_base::value()());
                 this->start_count.store(1, std::memory_order_release);
                 arc* j = new arc(this, 0, arc::flow_only);
-                auto& result = *result_var_ptr();
+                auto& result = result_base::value();
                 __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
                 if(result.current_task->add_arc(j)) {
                     __OOX_TRACE("%p do_run: add_arc", this);
@@ -1677,13 +1651,12 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             }
         }
 #else
-        if( !is_executed ) {
+        if( !result_base::has_value() ) {
             __OOX_TRACE("%p do_run: start forward",this);
-            ::new (static_cast<void*>(&my_result)) var_type(this->value()());
-            is_executed = true;
+            result_base::emplace(this->functor_base::value()());
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc(this, 0, arc::flow_only);
-            auto& result = *result_var_ptr();
+            auto& result = result_base::value();
             __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
             if(result.current_task->add_arc(j)) {
                 __OOX_TRACE("%p do_run: add_arc", this);
@@ -1698,13 +1671,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     }
 
     ~functional_task() override {
-      if constexpr (CanThrow) {
-          if (is_executed) {
-              result_var_ptr()->~var_type();
-          }
-      } else {
-          result_var_ptr()->~var_type();
-        }
+        result_base::reset();
     }
 };
 
@@ -1731,7 +1698,7 @@ struct gen_oox<var<VT, CanThrow>, CanThrow> {
     using type = var<VT, CanThrow>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT, CanThrow>, CanThrow > * t) {
-        type oox; oox.bind_to( t, &t->my_result, slots+1, true ); return oox;
+        type oox; oox.bind_to( t, static_cast<internal::result_state<type, CanThrow>*>(t)->ptr(), slots+1, true ); return oox;
     }
 };
 template< typename T, bool CanThrow>
