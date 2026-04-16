@@ -840,6 +840,50 @@ TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {
 
     ASSERT_EQ(oox::wait_and_get(a), 2);
 }
+
+TEST(OOX, ExceptionCancellationHasNoExceptionControl) {
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> ran{0};
+    oox::var<int> cancelled = oox::run([&](int x) -> int {
+        ran.fetch_add(1);
+        return x + 1;
+    }, gate);
+
+    cancelled.cancel();
+    EXPECT_FALSE(cancelled.current_task->exception_control_handle());
+
+    oox::run([](int& g) { g = 1; }, gate);
+    EXPECT_THROW(oox::wait_and_get(cancelled), oox::cancelled_by_user);
+    EXPECT_EQ(ran.load(), 0);
+    EXPECT_FALSE(cancelled.current_task->exception_control_handle());
+}
+
+TEST(OOX, ExceptionFanoutSharesExceptionControl) {
+    oox::var<int> bad = oox::run([]() -> int {
+        throw dummy_exception{};
+    });
+
+    oox::var<int> left = oox::run(plus, 1, bad);
+    oox::var<int> right = oox::run(plus, 2, bad);
+
+    EXPECT_THROW(oox::wait_and_get(left), dummy_exception);
+    EXPECT_THROW(oox::wait_and_get(right), dummy_exception);
+
+    auto source_control = bad.current_task->exception_control_handle();
+    ASSERT_NE(source_control, nullptr);
+    EXPECT_EQ(left.current_task->exception_control_handle(), source_control);
+    EXPECT_EQ(right.current_task->exception_control_handle(), source_control);
+}
+
+TEST(OOX, ExceptionResultStateUsesCompactControlStorage) {
+    using void_state = oox::internal::result_state<void, true>;
+    using char_state = oox::internal::result_state<char, true>;
+    using exception_control = oox::internal::exception_control;
+
+    EXPECT_LT(sizeof(void_state), sizeof(exception_control));
+    EXPECT_LT(sizeof(char_state), sizeof(exception_control));
+    EXPECT_LT(alignof(void_state), alignof(exception_control));
+}
 #endif
 
 

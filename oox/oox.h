@@ -79,11 +79,51 @@ inline constexpr bool default_exception_policy = false;
 namespace internal {
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
+#if OOX_ENABLE_EXCEPTIONS
+inline constexpr std::uintptr_t k_task_exception_done_tag = 0x2;
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_exception_done_tag;
+#else
 inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
+#endif
 inline constexpr unsigned char k_result_state_empty = 0;
 inline constexpr unsigned char k_result_state_cancelled = 1;
 inline constexpr unsigned char k_result_state_value = 2;
 inline constexpr unsigned char k_result_state_exception = 3;
+
+#if OOX_ENABLE_EXCEPTIONS
+enum class failure_kind : std::uint8_t {
+    none = 0,
+    dependency_cancelled = 1,
+    user_cancelled = 2,
+    exception = 3
+};
+
+struct exception_control_struct {
+    std::atomic<std::uint32_t> ref_count{1};
+    std::exception_ptr exception;
+
+    explicit exception_control_struct(std::exception_ptr eptr) noexcept
+        : exception(std::move(eptr)) {}
+};
+
+using exception_control = exception_control_struct*;
+
+inline exception_control retain_exception_control(exception_control control) noexcept {
+    if (control) {
+        control->ref_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return control;
+}
+
+inline void release_exception_control(exception_control control) noexcept {
+    if (!control) {
+        return;
+    }
+    if (control->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete control;
+    }
+}
+#endif
 
 struct task_life {
     // Pointers to this structure and live output nodes
@@ -122,6 +162,7 @@ struct result_state_throw_base {
     static constexpr unsigned char state_cancelled = k_result_state_cancelled;
     static constexpr unsigned char state_value = k_result_state_value;
     static constexpr unsigned char state_exception = k_result_state_exception;
+    static constexpr unsigned char state_user_cancelled = 4;
 
   protected:
     Derived& derived() noexcept { return *static_cast<Derived*>(this); }
@@ -131,40 +172,43 @@ struct result_state_throw_base {
 
   public:
     void try_set_exception(std::exception_ptr eptr) noexcept {
-        const bool is_cancelled = !eptr;
+        set_failure(eptr ? failure_kind::exception : failure_kind::dependency_cancelled);
+    }
+    void set_failure(failure_kind kind) noexcept {
+        if (kind == failure_kind::none) {
+            return;
+        }
         const auto current = state_bits();
         if (current == state_value || current == state_exception) {
             return;
         }
-
-        auto* slot = derived().exception_ptr();
-        if (is_cancelled) {
-            if (current != state_empty) {
-                return;
-            }
-            ::new (static_cast<void*>(slot)) std::exception_ptr();
-            set_state_bits(state_cancelled);
-            return;
-        }
-        if (current == state_cancelled) {
-            *slot = std::move(eptr);
+        if (kind == failure_kind::exception) {
             set_state_bits(state_exception);
             return;
         }
-        __OOX_ASSERT_EX(current == state_empty, "unexpected result_state while storing exception");
-        ::new (static_cast<void*>(slot)) std::exception_ptr(std::move(eptr));
-        set_state_bits(state_exception);
+        if (current == state_user_cancelled ||
+            (current == state_cancelled && kind != failure_kind::user_cancelled)) {
+            return;
+        }
+        set_state_bits(kind == failure_kind::user_cancelled ? state_user_cancelled : state_cancelled);
     }
     bool has_exception() const noexcept {
-        const auto state = state_bits();
-        return state == state_exception || state == state_cancelled;
+        return failure_state() != failure_kind::none;
     }
     std::exception_ptr get_exception() const noexcept {
-        const auto state = state_bits();
-        if (state != state_exception && state != state_cancelled) {
-            return std::exception_ptr{};
+        return std::exception_ptr{};
+    }
+    failure_kind failure_state() const noexcept {
+        switch (state_bits()) {
+        case state_cancelled:
+            return failure_kind::dependency_cancelled;
+        case state_user_cancelled:
+            return failure_kind::user_cancelled;
+        case state_exception:
+            return failure_kind::exception;
+        default:
+            return failure_kind::none;
         }
-        return *derived().exception_ptr();
     }
 };
 #endif
@@ -234,6 +278,7 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
     static constexpr unsigned char state_cancelled = base_type::state_cancelled;
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
+    static constexpr unsigned char state_user_cancelled = base_type::state_user_cancelled;
 
     result_state() : state_bits_field(state_empty) {}
     result_state(const result_state&) = delete;
@@ -248,9 +293,6 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
         if (previous == state_value || previous == state_exception) {
             return;
         }
-        if (previous == state_cancelled) {
-            exception_ptr()->~exception_ptr();
-        }
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_value;
     }
@@ -260,18 +302,20 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
     T& value() { return *ptr(); }
     const T& value() const { return *ptr(); }
     using base_type::get_exception;
+    using base_type::failure_state;
     using base_type::has_exception;
+    using base_type::set_failure;
     using base_type::try_set_exception;
     void reset() {
         const auto previous = state_bits_field;
         if (previous == state_empty) {
             return;
         }
-        state_bits_field = state_empty;
         if (previous == state_value) {
+            state_bits_field = state_empty;
             ptr()->~T();
         } else {
-            exception_ptr()->~exception_ptr();
+            state_bits_field = state_empty;
         }
     }
 
@@ -279,19 +323,15 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
     const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
 
   private:
-    static constexpr std::size_t storage_size =
-        (sizeof(T) > sizeof(std::exception_ptr)) ? sizeof(T) : sizeof(std::exception_ptr);
-    static constexpr std::size_t storage_align =
-        (alignof(T) > alignof(std::exception_ptr)) ? alignof(T) : alignof(std::exception_ptr);
     struct storage_t {
-        alignas(storage_align) std::byte data[storage_size];
+        alignas(alignof(T)) std::byte data[sizeof(T)];
     };
     template <typename Derived>
     friend struct result_state_throw_base;
     unsigned char state_bits() const noexcept { return state_bits_field; }
     void set_state_bits(unsigned char state) noexcept { state_bits_field = state; }
     storage_t storage{};
-    unsigned char state_bits_field : 2;
+    unsigned char state_bits_field : 3;
     template <typename... Args>
     void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
@@ -299,12 +339,6 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
         } else {
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
-    }
-    std::exception_ptr* exception_ptr() noexcept {
-        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
-    }
-    const std::exception_ptr* exception_ptr() const noexcept {
-        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
     }
 };
 
@@ -315,6 +349,7 @@ struct result_state<void, true> : private result_state_throw_base<result_state<v
     static constexpr unsigned char state_cancelled = base_type::state_cancelled;
     static constexpr unsigned char state_value = base_type::state_value;
     static constexpr unsigned char state_exception = base_type::state_exception;
+    static constexpr unsigned char state_user_cancelled = base_type::state_user_cancelled;
 
     result_state() : state_bits_field(state_empty) {}
     result_state(const result_state&) = delete;
@@ -324,36 +359,34 @@ struct result_state<void, true> : private result_state_throw_base<result_state<v
     ~result_state() = default;
 
     using base_type::get_exception;
+    using base_type::failure_state;
     using base_type::has_exception;
+    using base_type::set_failure;
     using base_type::try_set_exception;
+    void emplace() noexcept {
+        if (state_bits_field == state_empty) {
+            state_bits_field = state_value;
+        }
+    }
+    bool has_value() const noexcept {
+        return state_bits_field == state_value;
+    }
     void reset() {
         const auto previous = state_bits_field;
         if (previous == state_empty) {
             return;
         }
-        state_bits_field = state_empty;
-        if (previous == state_exception || previous == state_cancelled) {
-            exception_ptr()->~exception_ptr();
+        {
+            state_bits_field = state_empty;
         }
     }
 
   private:
-    static constexpr std::size_t storage_size = sizeof(std::exception_ptr);
-    struct storage_t {
-        alignas(alignof(std::exception_ptr)) std::byte data[storage_size];
-    };
     template <typename Derived>
     friend struct result_state_throw_base;
     unsigned char state_bits() const noexcept { return state_bits_field; }
     void set_state_bits(unsigned char state) noexcept { state_bits_field = state; }
-    storage_t storage{};
-    unsigned char state_bits_field : 2;
-    std::exception_ptr* exception_ptr() noexcept {
-        return std::launder(reinterpret_cast<std::exception_ptr*>(storage.data));
-    }
-    const std::exception_ptr* exception_ptr() const noexcept {
-        return std::launder(reinterpret_cast<const std::exception_ptr*>(storage.data));
-    }
+    unsigned char state_bits_field : 3;
 };
 #endif
 
@@ -650,15 +683,63 @@ struct arc {
         back_only,    //< notify producer when consumer is completed TODO: unnecessary when stored in task directly
         flow_back,    //< flow_only then back_only
         flow_copy,    //< call consumer to copy its value when producer is completed
-        forward_copy  //< copy a pointer to the var storage found by producer to consumer
+        forward_copy, //< copy a pointer to the var storage found by producer to consumer
+#if OOX_ENABLE_EXCEPTIONS
+        exception_signal //< carries a refcounted exception_control for an incoming exception
+#endif
     };
     using port_int = short int;
     arc*       next;
-    task_node* node;
+    union {
+        task_node* node;
+#if OOX_ENABLE_EXCEPTIONS
+        exception_control exception_signal_control;
+#endif
+    };
     port_int   port;
     kinds      kind;
     arc( task_node* n, int p, kinds k = flow_back ) : node(n), port(port_int(p)), kind(k) {}
+#if OOX_ENABLE_EXCEPTIONS
+    explicit arc(exception_control c) : exception_signal_control(c), port(0), kind(exception_signal) {
+        __OOX_ASSERT_EX(c, "exception_signal arc requires an exception control");
+    }
+#endif
+    ~arc() {
+#if OOX_ENABLE_EXCEPTIONS
+        if (kind == exception_signal) {
+            release_exception_control(exception_signal_control);
+        }
+#endif
+    }
 };
+
+#if OOX_ENABLE_EXCEPTIONS
+static_assert(alignof(arc) >= 4, "arc pointers must leave low bits available for completion tags");
+
+inline bool is_live_arc(arc* a) noexcept {
+    const auto bits = reinterpret_cast<std::uintptr_t>(a);
+    return bits != 0 && (bits & k_task_tag_mask) == 0;
+}
+
+inline bool is_terminal_exception_arc(arc* a) noexcept {
+    return (reinterpret_cast<std::uintptr_t>(a) & k_task_exception_done_tag) != 0;
+}
+
+inline bool is_done_arc_head(arc* a) noexcept {
+    const auto bits = reinterpret_cast<std::uintptr_t>(a);
+    return bits == k_task_done_tag || (bits & k_task_exception_done_tag) != 0;
+}
+
+inline arc* terminal_exception_arc(arc* a) noexcept {
+    return reinterpret_cast<arc*>(reinterpret_cast<std::uintptr_t>(a) & ~k_task_tag_mask);
+}
+
+inline arc* tagged_terminal_exception_arc(arc* a) noexcept {
+    __OOX_ASSERT_EX((reinterpret_cast<std::uintptr_t>(a) & k_task_tag_mask) == 0,
+                    "terminal exception arc must be aligned");
+    return reinterpret_cast<arc*>(reinterpret_cast<std::uintptr_t>(a) | k_task_exception_done_tag);
+}
+#endif
 
 struct arc_list {
     // Root of list of nodes that are waiting for this node's value to be produced.
@@ -672,49 +753,110 @@ struct arc_list {
 };
 
 struct task_node : public task, arc_list {
-    // Prerequisites to start the task
-    std::atomic<int> start_count;
+    static constexpr std::uint32_t start_count_bits = 28;
+    static constexpr std::uint32_t start_count_mask = (std::uint32_t{1} << start_count_bits) - 1;
 #if OOX_ENABLE_EXCEPTIONS
+    static constexpr std::uint32_t start_failure_flag = std::uint32_t{1} << 31;
+    static constexpr std::uint32_t start_exception_bit = std::uint32_t{1} << 30;
+    static constexpr std::uint32_t start_user_cancelled_bit = std::uint32_t{1} << 29;
+    static constexpr std::uint32_t start_dependency_cancelled_bit = std::uint32_t{1} << 28;
+#endif
+    static std::uint32_t start_prerequisite_count(std::uint32_t word) noexcept {
+        return word & start_count_mask;
+    }
+
+    // Prerequisites to start the task
+    std::atomic<std::uint32_t> start_count;
+#if OOX_ENABLE_EXCEPTIONS
+    bool has_start_failure() const noexcept {
+        // Hot success-path guard. We only need the bit value here; if it is set,
+        // the slower failure path performs the ordered state/materialization work.
+        return (start_count.load(std::memory_order_relaxed) & start_failure_flag) != 0;
+    }
     virtual void try_set_exception(std::exception_ptr eptr) noexcept = 0;
+    virtual void set_failure(failure_kind kind) noexcept = 0;
     virtual bool has_exception() const noexcept = 0;
     virtual std::exception_ptr get_exception() const noexcept = 0;
-    virtual task_node* exception_origin() const noexcept = 0;
-    virtual void publish_incoming_failure(task_node* source, int source_port) noexcept = 0;
-    virtual bool apply_incoming_failure() noexcept = 0;
+    virtual failure_kind failure_state() const noexcept = 0;
+    virtual exception_control exception_control_handle() const noexcept = 0;
 
     void set_exception(std::exception_ptr ep) noexcept {
         try_set_exception(std::move(ep));
+        mark_failure(failure_kind::exception);
     }
 
     void cancel() noexcept {
-        publish_incoming_failure(nullptr, 0);
-        if (start_count.load(std::memory_order_acquire) == 0) {
-            set_exception(std::make_exception_ptr(cancelled_by_user{}));
+        mark_failure(failure_kind::user_cancelled);
+        if (start_prerequisite_count(start_count.load(std::memory_order_acquire)) == 0) {
+            set_failure(failure_kind::user_cancelled);
         }
     }
 
-    std::exception_ptr exception_for_port([[maybe_unused]] int port) const noexcept {
+    [[noreturn]] void throw_failure_for_port(int port) const {
         if (port > 0) {
-            return std::exception_ptr{}; //cancelled
+            throw cancelled_by_exception{};
         }
-        return get_exception();
+        switch (failure_state()) {
+        case failure_kind::exception:
+            if (auto ep = get_exception()) {
+                std::rethrow_exception(ep);
+            }
+            throw cancelled_by_exception{};
+        case failure_kind::user_cancelled:
+            throw cancelled_by_user{};
+        case failure_kind::dependency_cancelled:
+        case failure_kind::none:
+            throw cancelled_by_exception{};
+        }
+        throw cancelled_by_exception{};
     }
+    static failure_kind start_failure_state(std::uint32_t word) noexcept {
+        if ((word & start_failure_flag) == 0) {
+            return failure_kind::none;
+        }
+        if (word & start_exception_bit) {
+            return failure_kind::exception;
+        }
+        if (word & start_user_cancelled_bit) {
+            return failure_kind::user_cancelled;
+        }
+        if (word & start_dependency_cancelled_bit) {
+            return failure_kind::dependency_cancelled;
+        }
+        return failure_kind::none;
+    }
+    bool mark_failure(failure_kind kind) noexcept;
+    void publish_failure_from(task_node* source, int source_port) noexcept;
+    bool store_exception_control(exception_control control) noexcept;
+    exception_control local_exception_control_handle() const noexcept;
+    std::exception_ptr local_exception() const noexcept;
+    exception_control incoming_exception_control_handle() const noexcept;
+    void materialize_start_failure() noexcept;
+    void destroy_terminal_exception_arc() noexcept;
 #else
     void cancel() noexcept {}
 #endif
 
     task_node() { } // prepare the task for waiting on it directly
-    virtual ~task_node() = default;
+    virtual ~task_node() {
+#if OOX_ENABLE_EXCEPTIONS
+        destroy_terminal_exception_arc();
+#endif
+    }
 
     // Result output node
     inline output_node& out(int n) const;
     // Add a prerequisite
     int  assign_prerequisite( task_node *n, int req_port );
     // Process flow- and anti-dependence arcs
+    template<bool MayFail>
+    void do_notify_arcs_impl( arc* r, int *count );
     void do_notify_arcs( arc* r, int *count );
     // Process output dependence
     int  do_notify_out( int port, int count );
     // Process flow and output arcs. Returns number of finished output nodes
+    template<bool MayFail>
+    int  notify_successors_impl( int output_slots, int *counters );
     int  notify_successors( int output_slots, int *counters );
     // Process flow- and anti-dependence arcs. Returns number of finished output nodes
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
@@ -729,6 +871,8 @@ struct task_node : public task, arc_list {
     // Call base notify successors
     template<int slots>
     void notify_successors();
+    template<int slots>
+    void notify_successors_success();
 #if OOX_ENABLE_EXCEPTIONS
     virtual void notify_successors_virtual() = 0;
 #endif
@@ -741,16 +885,140 @@ struct task_node : public task, arc_list {
 };
 
 bool arc_list::add_arc( arc* i ) {
-    __OOX_ASSERT( uintptr_t(i->node)>2, "" );
+    __OOX_ASSERT(
+#if OOX_ENABLE_EXCEPTIONS
+        i->kind == arc::exception_signal ||
+#endif
+        uintptr_t(i->node)>2, "" );
     for(;;) {
         arc* j = head.load(std::memory_order_acquire);
-        if( j==(arc*)k_task_done_tag )
+        if( j==(arc*)k_task_done_tag
+#if OOX_ENABLE_EXCEPTIONS
+            || is_terminal_exception_arc(j)
+#endif
+          )
             return false;
         i->next = j;
         if( head.compare_exchange_weak( j, i ) ) // TODO: weak or strong? what's perf?
             return true;
     }
 }
+
+#if OOX_ENABLE_EXCEPTIONS
+bool task_node::mark_failure(failure_kind kind) noexcept {
+    std::uint32_t bit = 0;
+    switch (kind) {
+    case failure_kind::dependency_cancelled:
+        bit = start_dependency_cancelled_bit;
+        break;
+    case failure_kind::user_cancelled:
+        bit = start_user_cancelled_bit;
+        break;
+    case failure_kind::exception:
+        bit = start_exception_bit;
+        break;
+    case failure_kind::none:
+        return false;
+    }
+    const auto old = start_count.fetch_or(start_failure_flag | bit, std::memory_order_acq_rel);
+    return (old & bit) == 0;
+}
+
+bool task_node::store_exception_control(exception_control control) noexcept {
+    __OOX_ASSERT_EX(control, "exception control is required");
+    // Real-exception path only: cancellation never creates exception controls
+    // or signal arcs. The signal shares the payload until completion installs
+    // a durable terminal exception arc.
+    arc* signal = new arc(control);
+    if (add_arc(signal)) {
+        return true;
+    }
+    delete signal;
+    return false;
+}
+
+exception_control task_node::incoming_exception_control_handle() const noexcept {
+    // Exception-path lookup only. exception_signal currently lives in the same
+    // lock-free stack as successor arcs, so late consumers can be pushed above
+    // it. Normal success/cancellation paths must not call this scan.
+    arc* r = head.load(std::memory_order_acquire);
+    if (is_terminal_exception_arc(r)) {
+        return terminal_exception_arc(r)->exception_signal_control;
+    }
+    while (is_live_arc(r)) {
+        if (r->kind == arc::exception_signal) {
+            return r->exception_signal_control;
+        }
+        r = r->next;
+    }
+    return {};
+}
+
+exception_control task_node::local_exception_control_handle() const noexcept {
+    return incoming_exception_control_handle();
+}
+
+std::exception_ptr task_node::local_exception() const noexcept {
+    if (auto control = local_exception_control_handle()) {
+        return control->exception;
+    }
+    return std::exception_ptr{};
+}
+
+void task_node::destroy_terminal_exception_arc() noexcept {
+    arc* h = head.load(std::memory_order_relaxed);
+    if (is_terminal_exception_arc(h)) {
+        delete terminal_exception_arc(h);
+        head.store(reinterpret_cast<arc*>(k_task_done_tag), std::memory_order_relaxed);
+    }
+}
+
+void task_node::publish_failure_from(task_node* source, int source_port) noexcept {
+    if (!source) {
+        mark_failure(failure_kind::user_cancelled);
+        return;
+    }
+    if (source_port != 0) {
+        mark_failure(failure_kind::dependency_cancelled);
+        return;
+    }
+
+    const auto kind = source->failure_state();
+    if (kind == failure_kind::exception) {
+        if (auto control = source->exception_control_handle()) {
+            // Real-exception propagation only. Dependency/user cancellation
+            // stays allocation-free and is represented solely by start_count
+            // failure bits.
+            arc* signal = new arc(retain_exception_control(control));
+            if (!add_arc(signal)) {
+                delete signal;
+            }
+            mark_failure(failure_kind::exception);
+            return;
+        }
+        mark_failure(failure_kind::dependency_cancelled);
+        return;
+    }
+    if (kind == failure_kind::user_cancelled) {
+        mark_failure(failure_kind::user_cancelled);
+    } else if (kind == failure_kind::dependency_cancelled) {
+        mark_failure(failure_kind::dependency_cancelled);
+    }
+}
+
+void task_node::materialize_start_failure() noexcept {
+    const auto kind = start_failure_state(start_count.load(std::memory_order_acquire));
+    if (kind == failure_kind::exception) {
+        if (incoming_exception_control_handle()) {
+            set_failure(failure_kind::exception);
+            return;
+        }
+        set_failure(failure_kind::dependency_cancelled);
+        return;
+    }
+    set_failure(kind);
+}
+#endif
 
 int task_node::assign_prerequisite( task_node *n, int req_port ) {
     arc* j = new arc( this, req_port ); // TODO: embed into the task
@@ -762,7 +1030,7 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
         // Prerequisite n already produced a value. Add this as a consumer of n.
 #if OOX_ENABLE_EXCEPTIONS
         if (n->has_exception()) {
-            this->publish_incoming_failure(n, req_port);
+            this->publish_failure_from(n, req_port);
         }
 #endif
         int k = ++n->out(req_port).countdown;
@@ -776,11 +1044,27 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     return 0;
 }
 
-void task_node::do_notify_arcs( arc* r, int *count ) {
+template<bool MayFail>
+void task_node::do_notify_arcs_impl( arc* r, int *count ) {
     // Notify successors that value is available
+#if OOX_ENABLE_EXCEPTIONS
+    const bool producer_failed = MayFail &&
+        ((start_count.load(std::memory_order_acquire) & start_failure_flag) != 0);
+#endif
     do {
         arc* j = r;
         r = j->next;
+#if OOX_ENABLE_EXCEPTIONS
+        if constexpr (MayFail) {
+            if (j->kind == arc::exception_signal) {
+            // Internal payload marker, not a successor edge. It can be present
+            // only on real-exception paths because exception signals share the
+            // active arc stack until notify_successors installs the terminal arc.
+                delete j;
+                continue;
+            }
+        }
+#endif
         task_node* n = j->node;
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
@@ -806,13 +1090,17 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
 #if OOX_ENABLE_EXCEPTIONS
-            if (this->has_exception()) {
-                n->publish_incoming_failure(this, j->port);
+            if (producer_failed) {
+                n->publish_failure_from(this, j->port);
             }
 #endif
             n->remove_prerequisite();
         }
     } while( r );
+}
+
+void task_node::do_notify_arcs( arc* r, int *count ) {
+    do_notify_arcs_impl<true>(r, count);
 }
 
 int task_node::do_notify_out( int port, int count ) {
@@ -834,7 +1122,8 @@ int task_node::do_notify_out( int port, int count ) {
     return remove_back_arc( port, count );
 }
 
-int task_node::notify_successors( int output_slots, int *count ) {
+template<bool MayFail>
+int task_node::notify_successors_impl( int output_slots, int *count ) {
     for( int i = 0; i <  output_slots; i++ ) {
         // it should be safe to assign countdowns here because no successors were notified yet
         out(i).countdown.store( count[i] = std::numeric_limits<int>::max()/2, std::memory_order_release );
@@ -843,8 +1132,26 @@ int task_node::notify_successors( int output_slots, int *count ) {
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
 
-   if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
-        do_notify_arcs( r, count );
+#if OOX_ENABLE_EXCEPTIONS
+    arc* terminal = reinterpret_cast<arc*>(k_task_done_tag);
+    if constexpr (MayFail) {
+        if (start_count.load(std::memory_order_acquire) & start_exception_bit) {
+            // This is the only completion path that pays for a terminal arc. The
+            // lookup may scan the active arc stack, but it is gated by the real-exception
+            // state; successful and cancellation-only tasks keep the raw done tag.
+            if (auto control = exception_control_handle()) {
+                auto* terminal_arc = new arc(retain_exception_control(control));
+                terminal_arc->next = reinterpret_cast<arc*>(k_task_done_tag);
+                terminal = tagged_terminal_exception_arc(terminal_arc);
+            }
+        }
+    }
+#else
+    arc* terminal = reinterpret_cast<arc*>(k_task_done_tag);
+#endif
+
+   if( arc* r = head.exchange( terminal ) )
+        do_notify_arcs_impl<MayFail>( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
         refs += do_notify_out( i, count[i] );
@@ -852,13 +1159,21 @@ int task_node::notify_successors( int output_slots, int *count ) {
     return refs;
 }
 
+int task_node::notify_successors( int output_slots, int *count ) {
+    return notify_successors_impl<true>(output_slots, count);
+}
+
 void task_node::remove_prerequisite( int n ) {
-    int k = start_count-=n;
-    __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
-    if( k==0 ) {
+    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_acq_rel);
+    const auto previous_count = start_prerequisite_count(previous);
+    __OOX_ASSERT(previous_count >= static_cast<std::uint32_t>(n),
+                 "invalid start_count detected while removing prerequisite");
+    if( previous_count == static_cast<std::uint32_t>(n) ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
 #if OOX_ENABLE_EXCEPTIONS
-        if (apply_incoming_failure()) {
+        const auto updated = previous - static_cast<std::uint32_t>(n);
+        if (updated & start_failure_flag) {
+            materialize_start_failure();
             notify_successors_virtual();
             return;
         }
@@ -918,96 +1233,13 @@ void task_node::notify_successors() {
     release(n);
 }
 
-#if OOX_ENABLE_EXCEPTIONS
-template <bool CanThrow>
-struct incoming_failure_state {
-    void publish_incoming_failure(task_node*, int) noexcept {}
-    template <typename Node>
-    bool apply_incoming_failure(Node&) noexcept {
-        return false;
-    }
-};
-
-template <>
-struct incoming_failure_state<true> {
-    static constexpr uintptr_t incoming_failure_none = 0;
-    static constexpr uintptr_t incoming_failure_cancelled = 1;
-    static constexpr uintptr_t incoming_failure_source_tag = 2;
-    static constexpr uintptr_t incoming_failure_user_cancelled = 3;
-    static constexpr uintptr_t incoming_failure_tag_mask = 3;
-
-    std::atomic<uintptr_t> incoming_failure_word{incoming_failure_none};
-
-    void publish_incoming_failure(task_node* source, int source_port) noexcept {
-        if (!source) {
-            publish_user_cancelled();
-            return;
-        }
-        if (source_port != 0) {
-            publish_cancelled();
-            return;
-        }
-        // Store the originator (task that holds the actual exception_ptr), not the immediate source.
-        auto* origin = source->exception_origin();
-        if (!origin) {
-            publish_cancelled();
-            return;
-        }
-        publish_exception_source(origin);
-    }
-
-    template <typename Node>
-    bool apply_incoming_failure(Node& node) noexcept {
-        const auto state = incoming_failure_word.load(std::memory_order_acquire);
-        if (state == incoming_failure_none) {
-            return false;
-        }
-        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
-            // Real exception from predecessor — originator pointer already stored.
-            return true;
-        }
-        if (state == incoming_failure_user_cancelled) {
-            node.set_exception(std::make_exception_ptr(cancelled_by_user{}));
-            return node.has_exception();
-        }
-        if (state & incoming_failure_cancelled) {
-            node.set_exception(std::exception_ptr{});
-            return node.has_exception();
-        }
-        return false;
-    }
-
-    bool has_incoming_exception_source() const noexcept {
-        const auto state = incoming_failure_word.load(std::memory_order_acquire);
-        return (state & incoming_failure_source_tag) && state > incoming_failure_tag_mask;
-    }
-
-    task_node* incoming_exception_source() const noexcept {
-        const auto state = incoming_failure_word.load(std::memory_order_acquire);
-        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
-            return reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
-        }
-        return nullptr;
-    }
-
-  private:
-    void publish_cancelled() noexcept {
-        incoming_failure_word.fetch_or(incoming_failure_cancelled, std::memory_order_acq_rel);
-    }
-
-    void publish_user_cancelled() noexcept {
-        incoming_failure_word.fetch_or(incoming_failure_user_cancelled, std::memory_order_acq_rel);
-    }
-
-    void publish_exception_source(task_node* source) noexcept {
-        const auto source_word = reinterpret_cast<uintptr_t>(source);
-        __OOX_ASSERT_EX((source_word & incoming_failure_tag_mask) == 0,
-                        "incoming failure source pointer must be aligned");
-        const auto encoded = source_word | incoming_failure_source_tag;
-        incoming_failure_word.store(encoded, std::memory_order_release);
-    }
-};
-#endif
+template<int slots>
+void task_node::notify_successors_success() {
+    int counters[slots];
+    int n = notify_successors_impl<false>( slots, counters );
+    wakeup();
+    release(n);
+}
 
 template<int N>
 struct output_slots_storage {
@@ -1042,11 +1274,11 @@ struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false>
     storage_task(const T& t) { result_base::emplace(t); }
 #if OOX_ENABLE_EXCEPTIONS
     void try_set_exception(std::exception_ptr) noexcept override {}
+    void set_failure(failure_kind) noexcept override {}
     bool has_exception() const noexcept override { return false; }
     std::exception_ptr get_exception() const noexcept override { return std::exception_ptr{}; }
-    task_node* exception_origin() const noexcept override { return nullptr; }
-    void publish_incoming_failure(task_node*, int) noexcept override {}
-    bool apply_incoming_failure() noexcept override { return false; }
+    failure_kind failure_state() const noexcept override { return failure_kind::none; }
+    exception_control exception_control_handle() const noexcept override { return {}; }
 #endif
     ~storage_task() override { result_base::reset(); }
 };
@@ -1091,7 +1323,13 @@ struct oox_var_base {
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
             arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
-            while(r > (arc*)k_task_done_tag) {
+            while(
+#if OOX_ENABLE_EXCEPTIONS
+                is_live_arc(r)
+#else
+                r > (arc*)k_task_done_tag
+#endif
+            ) {
                 arc* j = r;
                 r = j->next;
                 j->port = arc::port_int(output_port);
@@ -1121,7 +1359,12 @@ struct oox_var_base {
         // - either a constant storage_task, or
         // - a completed functional_task.
         arc* h = current_task->head.load(std::memory_order_acquire);
-        if (k_task_done_tag == (uintptr_t)h) {
+#if OOX_ENABLE_EXCEPTIONS
+        if (is_done_arc_head(h)
+#else
+        if (k_task_done_tag == (uintptr_t)h
+#endif
+           ) {
             return;
         }
         current_task->wait();
@@ -1448,9 +1691,6 @@ struct oox_bind {
 
 template<int slots, typename F, typename R, bool CanThrow>
 struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, CanThrow>
-#if OOX_ENABLE_EXCEPTIONS
-                                  , private incoming_failure_state<CanThrow>
-#endif
 {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, CanThrow>;
@@ -1458,60 +1698,75 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
 
 #if OOX_ENABLE_EXCEPTIONS
-    using failure_base = incoming_failure_state<CanThrow>;
     void try_set_exception(std::exception_ptr eptr) noexcept override {
         if constexpr (CanThrow) {
-            result_base::try_set_exception(std::move(eptr));
+            if (eptr) {
+                if (this->store_exception_control(new exception_control_struct(std::move(eptr)))) {
+                    result_base::set_failure(failure_kind::exception);
+                }
+            } else {
+                result_base::set_failure(failure_kind::dependency_cancelled);
+            }
+            this->mark_failure(result_base::failure_state());
+        }
+    }
+    void set_failure(failure_kind kind) noexcept override {
+        if constexpr (CanThrow) {
+            result_base::set_failure(kind);
         }
     }
     bool has_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::has_exception() || failure_base::has_incoming_exception_source();
+            if (result_base::has_value()) return false;
+            return result_base::has_exception() || task_node::start_failure_state(this->start_count.load(std::memory_order_acquire)) != failure_kind::none;
         }
         return false;
     }
     std::exception_ptr get_exception() const noexcept override {
         if constexpr (CanThrow) {
-            if (result_base::has_exception()) return result_base::get_exception();
-            auto* origin = failure_base::incoming_exception_source();
-            if (origin) return origin->get_exception();
+            return this->local_exception();
         }
         return std::exception_ptr{};
     }
-    task_node* exception_origin() const noexcept override {
+    failure_kind failure_state() const noexcept override {
         if constexpr (CanThrow) {
-            if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
-            return failure_base::incoming_exception_source();
+            if (result_base::has_value()) return failure_kind::none;
+            const auto result = result_base::failure_state();
+            if (result != failure_kind::none) return result;
+            return task_node::start_failure_state(this->start_count.load(std::memory_order_acquire));
         }
-        return nullptr;
+        return failure_kind::none;
     }
-    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        failure_base::publish_incoming_failure(source, source_port);
-    }
-    bool apply_incoming_failure() noexcept override {
-        return failure_base::apply_incoming_failure(*this);
+    exception_control exception_control_handle() const noexcept override {
+        if constexpr (CanThrow) {
+            return this->local_exception_control_handle();
+        }
+        return {};
     }
 #endif
 
     TASK_EXECUTE_METHOD {
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (this->has_start_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
             try {
                 result_base::emplace(this->functor_base::value()());
+                task_node::notify_successors_success<slots>();
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
             }
         } else {
             result_base::emplace(this->functor_base::value()());
+            task_node::notify_successors_success<slots>();
         }
 #else
         result_base::emplace(this->functor_base::value()());
-#endif
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
     ~functional_task() override { result_base::reset(); }
@@ -1519,69 +1774,82 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
 
 template<int slots, typename F, bool CanThrow>
 struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, result_state<void, CanThrow>
-#if OOX_ENABLE_EXCEPTIONS
-                                                  , private incoming_failure_state<CanThrow>
-#endif
 {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<void, CanThrow>;
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
 #if OOX_ENABLE_EXCEPTIONS
-    using failure_base = incoming_failure_state<CanThrow>;
     void try_set_exception(std::exception_ptr eptr) noexcept override {
         if constexpr (CanThrow) {
-            result_base::try_set_exception(std::move(eptr));
+            if (eptr) {
+                if (this->store_exception_control(new exception_control_struct(std::move(eptr)))) {
+                    result_base::set_failure(failure_kind::exception);
+                }
+            } else {
+                result_base::set_failure(failure_kind::dependency_cancelled);
+            }
+            this->mark_failure(result_base::failure_state());
+        }
+    }
+    void set_failure(failure_kind kind) noexcept override {
+        if constexpr (CanThrow) {
+            result_base::set_failure(kind);
         }
     }
     bool has_exception() const noexcept override {
         if constexpr (CanThrow) {
-            return result_base::has_exception() || failure_base::has_incoming_exception_source();
+            if (result_base::has_value()) return false;
+            return result_base::has_exception() || task_node::start_failure_state(this->start_count.load(std::memory_order_acquire)) != failure_kind::none;
         }
         return false;
     }
     std::exception_ptr get_exception() const noexcept override {
         if constexpr (CanThrow) {
-            if (result_base::has_exception()) return result_base::get_exception();
-            auto* origin = failure_base::incoming_exception_source();
-            if (origin) return origin->get_exception();
+            return this->local_exception();
         }
         return std::exception_ptr{};
     }
-    task_node* exception_origin() const noexcept override {
+    failure_kind failure_state() const noexcept override {
         if constexpr (CanThrow) {
-            if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
-            return failure_base::incoming_exception_source();
+            if (result_base::has_value()) return failure_kind::none;
+            const auto result = result_base::failure_state();
+            if (result != failure_kind::none) return result;
+            return task_node::start_failure_state(this->start_count.load(std::memory_order_acquire));
         }
-        return nullptr;
+        return failure_kind::none;
     }
-    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        failure_base::publish_incoming_failure(source, source_port);
-    }
-    bool apply_incoming_failure() noexcept override {
-        return failure_base::apply_incoming_failure(*this);
+    exception_control exception_control_handle() const noexcept override {
+        if constexpr (CanThrow) {
+            return this->local_exception_control_handle();
+        }
+        return {};
     }
 #endif
     TASK_EXECUTE_METHOD {
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (this->has_start_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
             try {
                 this->functor_base::value()();
+                result_base::emplace();
+                task_node::notify_successors_success<slots>();
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
             }
         } else {
             this->functor_base::value()();
+            task_node::notify_successors_success<slots>();
         }
 #else
         this->functor_base::value()();
-#endif
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
     ~functional_task() override {
@@ -1594,9 +1862,6 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
 template<int slots, typename F, typename VT, bool VarCanThrow, bool CanThrow>
 struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<slots, F>
                                                                   , result_state<var<VT, VarCanThrow>, CanThrow>
-#if OOX_ENABLE_EXCEPTIONS
-                                                                  , private incoming_failure_state<CanThrow>
-#endif
 {
     // TODO: NRVO optimized forwarding
     static_assert(VarCanThrow == CanThrow, "returning var<T, P> requires task policy to match P");
@@ -1606,30 +1871,35 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
 #if OOX_ENABLE_EXCEPTIONS
-    using failure_base = incoming_failure_state<CanThrow>;
     void try_set_exception(std::exception_ptr eptr) noexcept override {
         if constexpr (!CanThrow) {
             return;
         }
-        result_base::try_set_exception(eptr);
+        if (eptr) {
+            if (this->store_exception_control(new exception_control_struct(eptr))) {
+                result_base::set_failure(failure_kind::exception);
+            }
+        } else {
+            result_base::set_failure(failure_kind::dependency_cancelled);
+        }
+        this->mark_failure(result_base::failure_state());
         if (result_base::has_value()) {
             auto& result = result_base::value();
             __OOX_ASSERT_EX(result.current_task, "forwarding result var has no current task");
             result.current_task->try_set_exception(std::move(eptr));
         }
     }
-    void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        failure_base::publish_incoming_failure(source, source_port);
-    }
-    bool apply_incoming_failure() noexcept override {
-        return failure_base::apply_incoming_failure(*this);
+    void set_failure(failure_kind kind) noexcept override {
+        if constexpr (CanThrow) {
+            result_base::set_failure(kind);
+        }
     }
     bool has_exception() const noexcept override {
         if constexpr (!CanThrow) {
             return false;
         }
         if (result_base::has_exception()) return true;
-        if (failure_base::has_incoming_exception_source()) return true;
+        if (task_node::start_failure_state(this->start_count.load(std::memory_order_acquire)) != failure_kind::none) return true;
         if (!result_base::has_value()) return false;
         const auto& result = result_base::value();
         return result.current_task && result.current_task->has_exception();
@@ -1638,32 +1908,42 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         if constexpr (!CanThrow) {
             return std::exception_ptr{};
         }
-        if (result_base::has_exception()) return result_base::get_exception();
-        auto* origin = failure_base::incoming_exception_source();
-        if (origin) return origin->get_exception();
+        if (result_base::has_exception()) return this->local_exception();
+        if (auto ep = this->local_exception()) return ep;
         if (!result_base::has_value()) return std::exception_ptr{};
         const auto& result = result_base::value();
         if (!result.current_task) return std::exception_ptr{};
         return result.current_task->get_exception();
     }
-    task_node* exception_origin() const noexcept override {
+    failure_kind failure_state() const noexcept override {
         if constexpr (!CanThrow) {
-            return nullptr;
+            return failure_kind::none;
         }
-        if (result_base::has_exception()) return const_cast<functional_task*>(static_cast<const functional_task*>(this));
-        auto* origin = failure_base::incoming_exception_source();
-        if (origin) return origin;
-        if (!result_base::has_value()) return nullptr;
+        const auto result_failure = result_base::failure_state();
+        if (result_failure != failure_kind::none) return result_failure;
+        const auto start_failure = task_node::start_failure_state(this->start_count.load(std::memory_order_acquire));
+        if (start_failure != failure_kind::none) return start_failure;
+        if (!result_base::has_value()) return failure_kind::none;
         const auto& result = result_base::value();
-        if (!result.current_task) return nullptr;
-        return result.current_task->exception_origin();
+        if (!result.current_task) return failure_kind::none;
+        return result.current_task->failure_state();
+    }
+    exception_control exception_control_handle() const noexcept override {
+        if constexpr (!CanThrow) {
+            return {};
+        }
+        if (auto control = this->local_exception_control_handle()) return control;
+        if (!result_base::has_value()) return {};
+        const auto& result = result_base::value();
+        if (!result.current_task) return {};
+        return result.current_task->exception_control_handle();
     }
 #endif
     TASK_EXECUTE_METHOD {
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (this->has_start_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
@@ -1683,6 +1963,8 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 }
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
+                return nullptr;
             }
         } else {
             if ( !result_base::has_value() ) {
@@ -1715,7 +1997,11 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         }
 #endif
         __OOX_TRACE("%p do_run: notify forward",this);
+#if OOX_ENABLE_EXCEPTIONS
+        task_node::notify_successors_success<slots>();
+#else
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
 
@@ -1785,7 +2071,7 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
-    int protect_count = std::numeric_limits<int>::max();
+    int protect_count = static_cast<int>(internal::task_node::start_count_mask);
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
     protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
@@ -1800,11 +2086,7 @@ void wait_for_all(internal::oox_var_base& on ) {
     on.wait();
 #if OOX_ENABLE_EXCEPTIONS
     if (on.current_task->has_exception()) {
-        auto ep = on.current_task->exception_for_port(on.current_port());
-        if (ep) {
-            std::rethrow_exception(ep);
-        }
-        throw cancelled_by_exception{};
+        on.current_task->throw_failure_for_port(on.current_port());
     }
 #endif
 }
@@ -1815,11 +2097,7 @@ void wait_for_all(const var<T, CanThrow>& on) {
     if constexpr (CanThrow) {
 #if OOX_ENABLE_EXCEPTIONS
         if (on.current_task->has_exception()) {
-            auto ep = on.current_task->exception_for_port(on.current_port());
-            if (ep) {
-                std::rethrow_exception(ep);
-            }
-            throw cancelled_by_exception{};
+            on.current_task->throw_failure_for_port(on.current_port());
         }
 #endif
     }
@@ -1836,11 +2114,7 @@ template<typename T, bool CanThrow>
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
             if (base->current_task->has_exception()) {
-                auto ep = base->current_task->exception_for_port(base->current_port());
-                if (ep) {
-                    std::rethrow_exception(ep);
-                }
-                throw cancelled_by_exception{};
+                base->current_task->throw_failure_for_port(base->current_port());
             }
         }
 #endif
@@ -1851,11 +2125,7 @@ template<typename T, bool CanThrow>
 #if OOX_ENABLE_EXCEPTIONS
     if constexpr (CanThrow) {
         if (base->current_task->has_exception()) {
-            auto ep = base->current_task->exception_for_port(base->current_port());
-            if (ep) {
-                std::rethrow_exception(ep);
-            }
-            throw cancelled_by_exception{};
+            base->current_task->throw_failure_for_port(base->current_port());
         }
     }
 #endif
