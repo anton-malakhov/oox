@@ -245,12 +245,18 @@ struct result_state<T, true> : private result_state_throw_base<result_state<T, t
     template <typename... Args>
     void emplace(Args&&... args) {
         const auto previous = state_bits_field;
+        if (previous == state_empty) [[likely]] {
+            construct_value(std::forward<Args>(args)...);
+            state_bits_field = state_value;
+            return;
+        }
         if (previous == state_value || previous == state_exception) {
             return;
         }
         if (previous == state_cancelled) {
             exception_ptr()->~exception_ptr();
         }
+        __OOX_ASSERT_EX(previous == state_cancelled, "unexpected result_state while storing value");
         construct_value(std::forward<Args>(args)...);
         state_bits_field = state_value;
     }
@@ -673,6 +679,12 @@ struct arc_list {
 
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
+#if OOX_ENABLE_EXCEPTIONS
+    // The high bit is a hot-path gate: when it is clear, remove_prerequisite()
+    // can spawn directly without entering virtual failure-state decoding.
+    static constexpr int start_failure_bit = std::numeric_limits<int>::min();
+    static constexpr int start_count_mask = std::numeric_limits<int>::max();
+#endif
     std::atomic<int> start_count;
 #if OOX_ENABLE_EXCEPTIONS
     virtual void try_set_exception(std::exception_ptr eptr) noexcept = 0;
@@ -682,13 +694,26 @@ struct task_node : public task, arc_list {
     virtual void publish_incoming_failure(task_node* source, int source_port) noexcept = 0;
     virtual bool apply_incoming_failure() noexcept = 0;
 
+    void mark_failure_signal() noexcept {
+        start_count.fetch_or(start_failure_bit, std::memory_order_release);
+    }
+
+    bool has_failure_signal() const noexcept {
+        return (start_count.load(std::memory_order_acquire) & start_failure_bit) != 0;
+    }
+
+    void add_suspended_prerequisite() noexcept {
+        start_count.fetch_add(1, std::memory_order_release);
+    }
+
     void set_exception(std::exception_ptr ep) noexcept {
+        mark_failure_signal();
         try_set_exception(std::move(ep));
     }
 
     void cancel() noexcept {
         publish_incoming_failure(nullptr, 0);
-        if (start_count.load(std::memory_order_acquire) == 0) {
+        if ((start_count.load(std::memory_order_acquire) & start_count_mask) == 0) {
             set_exception(std::make_exception_ptr(cancelled_by_user{}));
         }
     }
@@ -711,10 +736,14 @@ struct task_node : public task, arc_list {
     // Add a prerequisite
     int  assign_prerequisite( task_node *n, int req_port );
     // Process flow- and anti-dependence arcs
+    template<bool MayFail>
+    void do_notify_arcs_impl( arc* r, int *count );
     void do_notify_arcs( arc* r, int *count );
     // Process output dependence
     int  do_notify_out( int port, int count );
     // Process flow and output arcs. Returns number of finished output nodes
+    template<bool MayFail>
+    int  notify_successors_impl( int output_slots, int *counters );
     int  notify_successors( int output_slots, int *counters );
     // Process flow- and anti-dependence arcs. Returns number of finished output nodes
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
@@ -729,6 +758,8 @@ struct task_node : public task, arc_list {
     // Call base notify successors
     template<int slots>
     void notify_successors();
+    template<int slots>
+    void notify_successors_success();
 #if OOX_ENABLE_EXCEPTIONS
     virtual void notify_successors_virtual() = 0;
 #endif
@@ -761,7 +792,7 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     } else {
         // Prerequisite n already produced a value. Add this as a consumer of n.
 #if OOX_ENABLE_EXCEPTIONS
-        if (n->has_exception()) {
+        if (n->has_failure_signal()) [[unlikely]] {
             this->publish_incoming_failure(n, req_port);
         }
 #endif
@@ -776,8 +807,15 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     return 0;
 }
 
-void task_node::do_notify_arcs( arc* r, int *count ) {
+template<bool MayFail>
+void task_node::do_notify_arcs_impl( arc* r, int *count ) {
     // Notify successors that value is available
+#if OOX_ENABLE_EXCEPTIONS
+    bool producer_failed = false;
+    if constexpr (MayFail) {
+        producer_failed = this->has_failure_signal();
+    }
+#endif
     do {
         arc* j = r;
         r = j->next;
@@ -806,13 +844,19 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
 #if OOX_ENABLE_EXCEPTIONS
-            if (this->has_exception()) {
-                n->publish_incoming_failure(this, j->port);
+            if constexpr (MayFail) {
+                if (producer_failed) [[unlikely]] {
+                    n->publish_incoming_failure(this, j->port);
+                }
             }
 #endif
             n->remove_prerequisite();
         }
     } while( r );
+}
+
+void task_node::do_notify_arcs( arc* r, int *count ) {
+    do_notify_arcs_impl<true>( r, count );
 }
 
 int task_node::do_notify_out( int port, int count ) {
@@ -834,7 +878,8 @@ int task_node::do_notify_out( int port, int count ) {
     return remove_back_arc( port, count );
 }
 
-int task_node::notify_successors( int output_slots, int *count ) {
+template<bool MayFail>
+int task_node::notify_successors_impl( int output_slots, int *count ) {
     for( int i = 0; i <  output_slots; i++ ) {
         // it should be safe to assign countdowns here because no successors were notified yet
         out(i).countdown.store( count[i] = std::numeric_limits<int>::max()/2, std::memory_order_release );
@@ -844,7 +889,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
     // Note that countdowns can change asynchronously after this point
 
    if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
-        do_notify_arcs( r, count );
+        do_notify_arcs_impl<MayFail>( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
         refs += do_notify_out( i, count[i] );
@@ -852,19 +897,36 @@ int task_node::notify_successors( int output_slots, int *count ) {
     return refs;
 }
 
+int task_node::notify_successors( int output_slots, int *count ) {
+    return notify_successors_impl<true>( output_slots, count );
+}
+
 void task_node::remove_prerequisite( int n ) {
+#if OOX_ENABLE_EXCEPTIONS
+    int k = start_count-=n;
+    if ( k==0 ) {
+        __OOX_TRACE("%p remove_prerequisite: spawning",this);
+        spawn();
+        return;
+    }
+    const int count = k & start_count_mask;
+    __OOX_ASSERT(count <= start_count_mask - n, "invalid start_count detected while removing prerequisite");
+    if( count==0 ) {
+        __OOX_TRACE("%p remove_prerequisite: spawning",this);
+        if (apply_incoming_failure()) [[unlikely]] {
+            notify_successors_virtual();
+            return;
+        }
+        spawn();
+    }
+#else
     int k = start_count-=n;
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
-#if OOX_ENABLE_EXCEPTIONS
-        if (apply_incoming_failure()) {
-            notify_successors_virtual();
-            return;
-        }
-#endif
         spawn();
     }
+#endif
 }
 
 int task_node::notify_next_writer( task_node* d ) {
@@ -918,10 +980,19 @@ void task_node::notify_successors() {
     release(n);
 }
 
+template<int slots>
+void task_node::notify_successors_success() {
+    int counters[slots];
+    int n = notify_successors_impl<false>( slots, counters );
+    wakeup();
+    release(n);
+}
+
 #if OOX_ENABLE_EXCEPTIONS
 template <bool CanThrow>
 struct incoming_failure_state {
     void publish_incoming_failure(task_node*, int) noexcept {}
+    bool has_incoming_failure() const noexcept { return false; }
     template <typename Node>
     bool apply_incoming_failure(Node&) noexcept {
         return false;
@@ -931,10 +1002,12 @@ struct incoming_failure_state {
 template <>
 struct incoming_failure_state<true> {
     static constexpr uintptr_t incoming_failure_none = 0;
-    static constexpr uintptr_t incoming_failure_cancelled = 1;
+    static constexpr uintptr_t incoming_failure_flag = 1;
     static constexpr uintptr_t incoming_failure_source_tag = 2;
-    static constexpr uintptr_t incoming_failure_user_cancelled = 3;
-    static constexpr uintptr_t incoming_failure_tag_mask = 3;
+    static constexpr uintptr_t incoming_failure_cancelled = incoming_failure_flag;
+    static constexpr uintptr_t incoming_failure_user_cancelled = incoming_failure_flag | 4;
+    static constexpr uintptr_t incoming_failure_source = incoming_failure_flag | incoming_failure_source_tag;
+    static constexpr uintptr_t incoming_failure_tag_mask = 7;
 
     std::atomic<uintptr_t> incoming_failure_word{incoming_failure_none};
 
@@ -962,7 +1035,8 @@ struct incoming_failure_state<true> {
         if (state == incoming_failure_none) {
             return false;
         }
-        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
+        if ((state & incoming_failure_source) == incoming_failure_source &&
+            state > incoming_failure_tag_mask) {
             // Real exception from predecessor — originator pointer already stored.
             return true;
         }
@@ -977,14 +1051,20 @@ struct incoming_failure_state<true> {
         return false;
     }
 
+    bool has_incoming_failure() const noexcept {
+        return (incoming_failure_word.load(std::memory_order_relaxed) & incoming_failure_flag) != 0;
+    }
+
     bool has_incoming_exception_source() const noexcept {
         const auto state = incoming_failure_word.load(std::memory_order_acquire);
-        return (state & incoming_failure_source_tag) && state > incoming_failure_tag_mask;
+        return (state & incoming_failure_source) == incoming_failure_source &&
+               state > incoming_failure_tag_mask;
     }
 
     task_node* incoming_exception_source() const noexcept {
         const auto state = incoming_failure_word.load(std::memory_order_acquire);
-        if ((state & incoming_failure_source_tag) && state > incoming_failure_tag_mask) {
+        if ((state & incoming_failure_source) == incoming_failure_source &&
+            state > incoming_failure_tag_mask) {
             return reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
         }
         return nullptr;
@@ -1003,7 +1083,7 @@ struct incoming_failure_state<true> {
         const auto source_word = reinterpret_cast<uintptr_t>(source);
         __OOX_ASSERT_EX((source_word & incoming_failure_tag_mask) == 0,
                         "incoming failure source pointer must be aligned");
-        const auto encoded = source_word | incoming_failure_source_tag;
+        const auto encoded = source_word | incoming_failure_source;
         incoming_failure_word.store(encoded, std::memory_order_release);
     }
 };
@@ -1486,6 +1566,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
         return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        task_node::mark_failure_signal();
         failure_base::publish_incoming_failure(source, source_port);
     }
     bool apply_incoming_failure() noexcept override {
@@ -1496,22 +1577,25 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     TASK_EXECUTE_METHOD {
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (failure_base::has_incoming_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
             try {
                 result_base::emplace(this->functor_base::value()());
+                task_node::notify_successors_success<slots>();
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
             }
         } else {
             result_base::emplace(this->functor_base::value()());
+            task_node::notify_successors_success<slots>();
         }
 #else
         result_base::emplace(this->functor_base::value()());
-#endif
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
     ~functional_task() override { result_base::reset(); }
@@ -1556,6 +1640,7 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
         return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        task_node::mark_failure_signal();
         failure_base::publish_incoming_failure(source, source_port);
     }
     bool apply_incoming_failure() noexcept override {
@@ -1566,22 +1651,25 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (failure_base::has_incoming_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
             try {
                 this->functor_base::value()();
+                task_node::notify_successors_success<slots>();
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
             }
         } else {
             this->functor_base::value()();
+            task_node::notify_successors_success<slots>();
         }
 #else
         this->functor_base::value()();
-#endif
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
     ~functional_task() override {
@@ -1615,10 +1703,11 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         if (result_base::has_value()) {
             auto& result = result_base::value();
             __OOX_ASSERT_EX(result.current_task, "forwarding result var has no current task");
-            result.current_task->try_set_exception(std::move(eptr));
+            result.current_task->set_exception(std::move(eptr));
         }
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
+        task_node::mark_failure_signal();
         failure_base::publish_incoming_failure(source, source_port);
     }
     bool apply_incoming_failure() noexcept override {
@@ -1663,7 +1752,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (this->has_exception()) {
+            if (failure_base::has_incoming_failure()) [[unlikely]] {
                 task_node::notify_successors<slots>();
                 return nullptr;
             }
@@ -1671,7 +1760,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 if ( !result_base::has_value() ) {
                     __OOX_TRACE("%p do_run: start forward",this);
                     result_base::emplace(this->functor_base::value()());
-                    this->start_count.store(1, std::memory_order_release);
+                    this->add_suspended_prerequisite();
                     arc* j = new arc(this, 0, arc::flow_only);
                     auto& result = result_base::value();
                     __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
@@ -1680,15 +1769,24 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                         return nullptr;
                     }
                     delete j;
+                    if (result.current_task->has_failure_signal()) [[unlikely]] {
+                        this->publish_incoming_failure(result.current_task, 0);
+                        if (this->apply_incoming_failure()) {
+                            task_node::notify_successors<slots>();
+                            return nullptr;
+                        }
+                    }
                 }
             } catch(...) {
                 this->set_exception(std::current_exception());
+                task_node::notify_successors<slots>();
+                return nullptr;
             }
         } else {
             if ( !result_base::has_value() ) {
                 __OOX_TRACE("%p do_run: start forward",this);
                 result_base::emplace(this->functor_base::value()());
-                this->start_count.store(1, std::memory_order_release);
+                this->add_suspended_prerequisite();
                 arc* j = new arc(this, 0, arc::flow_only);
                 auto& result = result_base::value();
                 __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
@@ -1699,6 +1797,8 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 delete j;
             }
         }
+        __OOX_TRACE("%p do_run: notify forward",this);
+        task_node::notify_successors_success<slots>();
 #else
         if( !result_base::has_value() ) {
             __OOX_TRACE("%p do_run: start forward",this);
@@ -1713,9 +1813,9 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             }
             else delete j;
         }
-#endif
         __OOX_TRACE("%p do_run: notify forward",this);
         task_node::notify_successors<slots>();
+#endif
         return nullptr;
     }
 
