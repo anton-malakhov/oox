@@ -14,13 +14,6 @@
 #define STR(x) STR_(x)
 const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
-namespace {
-    const bool kBenchmarkContext = []() {
-        benchmark::AddCustomContext("policy", policy_str);
-        return true;
-    }();
-}
-
 constexpr int FibN = 30;
 int cutoff = 8;
 constexpr int max_cutoff = 20;
@@ -193,5 +186,12 @@ static void Fib_TF(benchmark::State& state) {
 }
 BENCHMARK(Fib_TF)->Unit(benchmark::kMillisecond)->UseRealTime()->DenseRange(cutoff, max_cutoff, cutoff_step);
 #endif //HAVE_TF
+
+namespace {
+const bool kBenchmarkContext = []() {
+    benchmark::AddCustomContext("policy", policy_str);
+    return true;
+}();
+}
 
 BENCHMARK_MAIN();

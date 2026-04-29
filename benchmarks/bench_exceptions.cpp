@@ -19,12 +19,6 @@ const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 #endif
 
 namespace {
-    const bool kBenchmarkContext = []() {
-        benchmark::AddCustomContext("parallel", parallel_str);
-        benchmark::AddCustomContext("policy", policy_str);
-        return true;
-    }();
-
 #if OOX_BENCH_RUNTIME_EXCEPTIONS
     struct dummy_throw : std::exception {
         const char *what() const noexcept override {
@@ -160,5 +154,13 @@ Iterations(kMinIterations);
 BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
 Iterations(kMinIterations);
 #endif
+
+namespace {
+const bool kBenchmarkContext = []() {
+    benchmark::AddCustomContext("parallel", parallel_str);
+    benchmark::AddCustomContext("policy", policy_str);
+    return true;
+}();
+}
 
 BENCHMARK_MAIN();
