@@ -19,12 +19,6 @@
 namespace {
 const std::string kExceptionPolicy = STR(TBB_EXCEPTION_POLICY_STR);
 
-const bool kContext = []() {
-    benchmark::AddCustomContext("backend", "tbb");
-    benchmark::AddCustomContext("policy", kExceptionPolicy);
-    return true;
-}();
-
 void BM_TBB_TaskGroup_NoThrow(benchmark::State& state) {
     const int tasks = static_cast<int>(state.range(0));
     constexpr int kInnerIters = 256;
@@ -88,5 +82,13 @@ BENCHMARK(BM_TBB_TaskGroup_OneThrow)
     ->RangeMultiplier(2)
     ->Range(64, 4096);
 #endif
+
+namespace {
+const bool kContext = []() {
+    benchmark::AddCustomContext("backend", "tbb");
+    benchmark::AddCustomContext("policy", kExceptionPolicy);
+    return true;
+}();
+}
 
 BENCHMARK_MAIN();
