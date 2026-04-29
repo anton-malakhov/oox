@@ -904,21 +904,19 @@ int task_node::notify_successors( int output_slots, int *count ) {
 void task_node::remove_prerequisite( int n ) {
 #if OOX_ENABLE_EXCEPTIONS
     int k = start_count-=n;
-    if ( k==0 ) {
-        __OOX_TRACE("%p remove_prerequisite: spawning",this);
-        spawn();
-        return;
-    }
     const int count = k & start_count_mask;
     __OOX_ASSERT(count <= start_count_mask - n, "invalid start_count detected while removing prerequisite");
-    if( count==0 ) {
-        __OOX_TRACE("%p remove_prerequisite: spawning",this);
+    if( count != 0 ) [[likely]] {
+        return;
+    }
+    __OOX_TRACE("%p remove_prerequisite: spawning",this);
+    if (k < 0) [[unlikely]] {
         if (apply_incoming_failure()) [[unlikely]] {
             notify_successors_virtual();
             return;
         }
-        spawn();
     }
+    spawn();
 #else
     int k = start_count-=n;
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
