@@ -327,6 +327,42 @@ TEST(OOX, ExceptionExplicitVarCancelSkipsBodyAndPropagates) {
     EXPECT_EQ(ran_b.load(), 0);
 }
 
+TEST(OOX, ExceptionWaitStatusReportsUserCancelWithoutThrowing) {
+    oox::var<int> gate(oox::deferred);
+    std::atomic<int> ran_a{0};
+    std::atomic<int> ran_b{0};
+
+    oox::var<int> a = oox::run([&](int x) -> int {
+        ran_a.fetch_add(1);
+        return x + 1;
+    }, gate);
+    oox::var<int> b = oox::run([&](int x) -> int {
+        ran_b.fetch_add(1);
+        return x + 1;
+    }, a);
+
+    a.cancel();
+    oox::run([](int& g) { g = 1; }, gate);
+
+    oox::wait_status a_status = oox::wait_status::ready;
+    oox::wait_status b_status = oox::wait_status::ready;
+    EXPECT_NO_THROW(a_status = oox::wait_for_all_status<false>(a));
+    EXPECT_NO_THROW(b_status = oox::wait_for_all_status<false>(b));
+    EXPECT_EQ(a_status, oox::wait_status::user_cancelled);
+    EXPECT_EQ(b_status, oox::wait_status::user_cancelled);
+    EXPECT_THROW(oox::wait_and_get(a), oox::cancelled_by_user);
+    EXPECT_EQ(ran_a.load(), 0);
+    EXPECT_EQ(ran_b.load(), 0);
+}
+
+TEST(OOX, ExceptionWaitStatusStillRethrowsRealException) {
+    oox::var<int> a = oox::run([]() -> int {
+        throw dummy_exception{};
+    });
+
+    EXPECT_THROW(oox::wait_for_all_status<false>(a), dummy_exception);
+}
+
 TEST(OOX, ExceptionExplicitTaskCancelSkipsBodyAndPropagates) {
     oox::var<int> gate(oox::deferred);
     std::atomic<int> ran_a{0};

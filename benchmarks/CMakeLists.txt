@@ -129,3 +129,22 @@ if(TBB_FOUND)
   add_test(bench_tbb_exceptions_exc
     bench_tbb_exceptions_exc --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=NoThrow)
 endif()
+
+if(TBB_FOUND AND OOX_ENABLE_EXCEPTIONS)
+  add_executable(bench_branching_cancel bench_branching_cancel.cpp)
+  target_compile_definitions(bench_branching_cancel PRIVATE
+    HAVE_TBB
+    OOX_DEFAULT_EXCEPTION_POLICY=1
+    OOX_EXCEPTION_POLICY_STR=exc
+    TBB_USE_EXCEPTIONS=1
+  )
+  target_compile_options(bench_branching_cancel PRIVATE
+    -UOOX_ENABLE_EXCEPTIONS
+    -DOOX_ENABLE_EXCEPTIONS=1
+    -fexceptions
+  )
+  target_link_libraries(bench_branching_cancel PRIVATE ${PROJECT_NAME} ${TBB_BENCHMARK_LIBS})
+  target_include_directories(bench_branching_cancel PRIVATE ${PROJECT_NAME})
+  add_test(bench_branching_cancel
+    bench_branching_cancel --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/10)
+endif()

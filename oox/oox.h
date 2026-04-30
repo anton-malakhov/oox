@@ -76,6 +76,12 @@ inline constexpr bool default_exception_policy = true;
 inline constexpr bool default_exception_policy = false;
 #endif
 
+enum class wait_status {
+    ready,
+    user_cancelled,
+    dependency_cancelled
+};
+
 namespace internal {
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
@@ -2082,25 +2088,69 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     return r;
 }
 
-void wait_for_all(internal::oox_var_base& on ) {
+#if OOX_ENABLE_EXCEPTIONS
+namespace internal {
+template <bool ThrowOnCancellation>
+wait_status failure_wait_status(task_node* task, int port) {
+    if (!task || !task->has_exception()) {
+        return wait_status::ready;
+    }
+
+    if constexpr (ThrowOnCancellation) {
+        task->throw_failure_for_port(port);
+    } else {
+        if (port > 0) {
+            return wait_status::dependency_cancelled;
+        }
+
+        switch (task->failure_state()) {
+        case failure_kind::exception:
+            if (auto ep = task->get_exception()) {
+                std::rethrow_exception(ep);
+            }
+            return wait_status::dependency_cancelled;
+        case failure_kind::user_cancelled:
+            return wait_status::user_cancelled;
+        case failure_kind::dependency_cancelled:
+        case failure_kind::none:
+            return wait_status::dependency_cancelled;
+        }
+        return wait_status::dependency_cancelled;
+    }
+
+    return wait_status::ready;
+}
+} // namespace internal
+#endif
+
+template <bool ThrowOnCancellation = true>
+wait_status wait_for_all_status(internal::oox_var_base& on) {
     on.wait();
 #if OOX_ENABLE_EXCEPTIONS
-    if (on.current_task->has_exception()) {
-        on.current_task->throw_failure_for_port(on.current_port());
-    }
+    return internal::failure_wait_status<ThrowOnCancellation>(on.current_task, on.current_port());
+#else
+    return wait_status::ready;
 #endif
+}
+
+void wait_for_all(internal::oox_var_base& on ) {
+    wait_for_all_status<true>(on);
+}
+
+template <bool ThrowOnCancellation = true, typename T, bool CanThrow>
+wait_status wait_for_all_status(const var<T, CanThrow>& on) {
+    const_cast<var<T, CanThrow>&>(on).wait();
+    if constexpr (CanThrow) {
+#if OOX_ENABLE_EXCEPTIONS
+        return internal::failure_wait_status<ThrowOnCancellation>(on.current_task, on.current_port());
+#endif
+    }
+    return wait_status::ready;
 }
 
 template<typename T, bool CanThrow>
 void wait_for_all(const var<T, CanThrow>& on) {
-    const_cast<var<T, CanThrow>&>(on).wait();
-    if constexpr (CanThrow) {
-#if OOX_ENABLE_EXCEPTIONS
-        if (on.current_task->has_exception()) {
-            on.current_task->throw_failure_for_port(on.current_port());
-        }
-#endif
-    }
+    wait_for_all_status<true>(on);
 }
 
 template<typename T, bool CanThrow>
@@ -2113,9 +2163,7 @@ template<typename T, bool CanThrow>
     while (base->current_port_and_flags.is_forwarded) {
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
-            if (base->current_task->has_exception()) {
-                base->current_task->throw_failure_for_port(base->current_port());
-            }
+            internal::failure_wait_status<true>(base->current_task, base->current_port());
         }
 #endif
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
@@ -2124,9 +2172,7 @@ template<typename T, bool CanThrow>
 
 #if OOX_ENABLE_EXCEPTIONS
     if constexpr (CanThrow) {
-        if (base->current_task->has_exception()) {
-            base->current_task->throw_failure_for_port(base->current_port());
-        }
+        internal::failure_wait_status<true>(base->current_task, base->current_port());
     }
 #endif
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");

@@ -22,7 +22,6 @@ int main() {
 #if OOX_ENABLE_EXCEPTIONS
     oox::var<int, false> base = oox::run<false>([]() { return 1; });
     oox::var<int, true> dep = oox::run<true>([](int x) { return x + 1; }, base);
-    (void)dep;
 #endif
     return 0;
 }
@@ -46,7 +45,6 @@ file(WRITE \"${OOX_TRY_SRC_DIR}/fail.cpp\" \"
 int main() {
     oox::var<int, true> base = oox::run<true>([]() { return 1; });
     oox::var<int, false> dep = oox::run<false>([](int x) { return x + 1; }, base);
-    (void)dep;
     return 0;
 }
 \")
