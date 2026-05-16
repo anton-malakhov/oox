@@ -1035,8 +1035,12 @@ struct incoming_failure_state<true> {
         }
         if ((state & incoming_failure_source) == incoming_failure_source &&
             state > incoming_failure_tag_mask) {
-            // Real exception from predecessor — originator pointer already stored.
-            return true;
+            if (node.has_exception()) {
+                return true;
+            }
+            auto* origin = reinterpret_cast<task_node*>(state & ~incoming_failure_tag_mask);
+            node.set_exception(origin->get_exception());
+            return node.has_exception();
         }
         if (state == incoming_failure_user_cancelled) {
             node.set_exception(std::make_exception_ptr(cancelled_by_user{}));
@@ -1050,7 +1054,7 @@ struct incoming_failure_state<true> {
     }
 
     bool has_incoming_failure() const noexcept {
-        return (incoming_failure_word.load(std::memory_order_relaxed) & incoming_failure_flag) != 0;
+        return (incoming_failure_word.load(std::memory_order_acquire) & incoming_failure_flag) != 0;
     }
 
     bool has_incoming_exception_source() const noexcept {
@@ -1343,6 +1347,8 @@ public:
         if constexpr (CanThrow) {
             this->cancel_current_task();
         }
+#else
+        __OOX_ASSERT_EX(false, "cancel when exceptions are disabled is not supported");
 #endif
     }
 };
@@ -1364,6 +1370,8 @@ public:
         if constexpr (CanThrow) {
             this->cancel_current_task();
         }
+#else
+        __OOX_ASSERT_EX(false, "cancel when exceptions are disabled is not supported");
 #endif
     }
 };
@@ -1564,8 +1572,15 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
         return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        task_node::mark_failure_signal();
+        if constexpr (CanThrow) {
+            if (source && source_port == 0) {
+                if (auto eptr = source->get_exception()) {
+                    try_set_exception(std::move(eptr));
+                }
+            }
+        }
         failure_base::publish_incoming_failure(source, source_port);
+        task_node::mark_failure_signal();
     }
     bool apply_incoming_failure() noexcept override {
         return failure_base::apply_incoming_failure(*this);
@@ -1638,8 +1653,15 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
         return nullptr;
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        task_node::mark_failure_signal();
+        if constexpr (CanThrow) {
+            if (source && source_port == 0) {
+                if (auto eptr = source->get_exception()) {
+                    try_set_exception(std::move(eptr));
+                }
+            }
+        }
         failure_base::publish_incoming_failure(source, source_port);
+        task_node::mark_failure_signal();
     }
     bool apply_incoming_failure() noexcept override {
         return failure_base::apply_incoming_failure(*this);
@@ -1705,8 +1727,15 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         }
     }
     void publish_incoming_failure(task_node* source, int source_port) noexcept override {
-        task_node::mark_failure_signal();
+        if constexpr (CanThrow) {
+            if (source && source_port == 0) {
+                if (auto eptr = source->get_exception()) {
+                    try_set_exception(std::move(eptr));
+                }
+            }
+        }
         failure_base::publish_incoming_failure(source, source_port);
+        task_node::mark_failure_signal();
     }
     bool apply_incoming_failure() noexcept override {
         return failure_base::apply_incoming_failure(*this);
@@ -1785,7 +1814,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 __OOX_TRACE("%p do_run: start forward",this);
                 result_base::emplace(this->functor_base::value()());
                 this->add_suspended_prerequisite();
-                arc* j = new arc(this, 0, arc::flow_only);
+                arc* j = new arc(this, 0, arc::flow_only); // TODO: embed into the task
                 auto& result = result_base::value();
                 __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
                 if(result.current_task->add_arc(j)) {
@@ -1802,7 +1831,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
             __OOX_TRACE("%p do_run: start forward",this);
             result_base::emplace(this->functor_base::value()());
             this->start_count.store(1, std::memory_order_release);
-            arc* j = new arc(this, 0, arc::flow_only);
+            arc* j = new arc(this, 0, arc::flow_only); // TODO: embed into the task
             auto& result = result_base::value();
             __OOX_ASSERT_EX(result.current_task, "forwarding functor returned empty var");
             if(result.current_task->add_arc(j)) {

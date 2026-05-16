@@ -14,22 +14,51 @@ const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 #if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS
 #define OOX_BENCH_RUNTIME_EXCEPTIONS 1
+#include <vector>
 #else
 #define OOX_BENCH_RUNTIME_EXCEPTIONS 0
 #endif
 
 namespace {
+    const std::plus<int> plus{};
+
 #if OOX_BENCH_RUNTIME_EXCEPTIONS
     struct dummy_throw : std::exception {
         const char *what() const noexcept override {
             return "dummy throw";
         }
     };
+
+    template <typename Exception>
+    bool wait_for_failure(oox::var<int>& value) {
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(value));
+        } catch (const Exception&) {
+            return true;
+        }
+        return false;
+    }
+
+    std::vector<oox::var<int>> make_fanout(oox::var<int>& input, int N) {
+        std::vector<oox::var<int>> leaves;
+        leaves.reserve(static_cast<std::size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            leaves.push_back(oox::run(plus, i, input));
+        }
+        return leaves;
+    }
+
+    template <typename Exception>
+    bool wait_all_failed(std::vector<oox::var<int>>& values) {
+        bool all_failed = true;
+        for (auto& value : values) {
+            all_failed = wait_for_failure<Exception>(value) && all_failed;
+        }
+        return all_failed;
+    }
 #endif
 
-    const std::plus<int> plus{};
-
-    constexpr int kMaxN = 65536;
+    constexpr int kMaxN = 8;
     constexpr int kMinIterations = 10;
 
     void OOX_Single_NoExcept(benchmark::State &state) {
@@ -133,26 +162,64 @@ namespace {
         }
         state.SetItemsProcessed(state.iterations() * (3LL * N + 1));
     }
+
+    void OOX_Fanout_RootThrows(benchmark::State &state) {
+        const auto N = static_cast<int>(state.range(0));
+
+        for (auto _: state) {
+            oox::var<int> bad = oox::run([]() -> int {
+                throw dummy_throw{};
+            });
+            auto leaves = make_fanout(bad, N);
+            if (!wait_all_failed<dummy_throw>(leaves)) {
+                state.SkipWithError("fanout leaf did not receive the root exception");
+                break;
+            }
+        }
+
+        state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(N) + 1));
+    }
+
+    void OOX_LateConsumers_AfterRootThrows(benchmark::State &state) {
+        const auto N = static_cast<int>(state.range(0));
+
+        for (auto _: state) {
+            oox::var<int> bad = oox::run([]() -> int {
+                throw dummy_throw{};
+            });
+            if (!wait_for_failure<dummy_throw>(bad)) {
+                state.SkipWithError("root did not throw");
+                break;
+            }
+
+            auto leaves = make_fanout(bad, N);
+            if (!wait_all_failed<dummy_throw>(leaves)) {
+                state.SkipWithError("late consumer did not receive the root exception");
+                break;
+            }
+        }
+
+        state.SetItemsProcessed(state.iterations() * (static_cast<int64_t>(N) + 1));
+    }
+
 #endif
 } // namespace
 
-BENCHMARK(OOX_Single_NoExcept)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
+BENCHMARK(OOX_Single_NoExcept)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(300)->Arg(8);
 #if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Single_Throw)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(kMinIterations)->Arg(8);
+BENCHMARK(OOX_Single_Throw)->UseRealTime()->Unit(benchmark::kNanosecond)->Iterations(300)->Arg(8);
 #endif
 
-BENCHMARK(OOX_Chain_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
-Iterations(kMinIterations);
+BENCHMARK(OOX_Chain_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
 #if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Chain_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
-Iterations(kMinIterations);
+BENCHMARK(OOX_Chain_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
 #endif
 
-BENCHMARK(OOX_Diamond_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
-Iterations(kMinIterations);
+BENCHMARK(OOX_Diamond_NoExcept)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
 #if OOX_BENCH_RUNTIME_EXCEPTIONS && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
-BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->
-Iterations(kMinIterations);
+BENCHMARK(OOX_Diamond_ThrowMiddle)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
+BENCHMARK(OOX_Fanout_RootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
+BENCHMARK(OOX_LateConsumers_AfterRootThrows)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(300);
 #endif
 
 namespace {
