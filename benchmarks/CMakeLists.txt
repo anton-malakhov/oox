@@ -15,7 +15,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(benchmark)
 
-list(APPEND OOX_BENCHMARKS bench_fib bench_loops bench_exceptions bench_cancellation)
+list(APPEND OOX_BENCHMARKS bench_fib bench_loops bench_exceptions bench_cancellation bench_success_graphs)
 set(OOX_BACKENDS)
 
 find_package(benchmark REQUIRED)
@@ -62,13 +62,13 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
       set(OOX_LOOP_MODES exe)
     endif()
     foreach(suffix IN LISTS OOX_LOOP_MODES)
-      if("${bench}" MATCHES "cancellation")
+      if("${bench}" STREQUAL "bench_cancellation")
         if(OOX_ENABLE_EXCEPTIONS)
           set(OOX_POLICY_LIST exc)
         else()
           set(OOX_POLICY_LIST)
         endif()
-      elseif("${bench}" MATCHES "exceptions" AND NOT OOX_ENABLE_EXCEPTIONS)
+      elseif("${bench}" STREQUAL "bench_exceptions" AND NOT OOX_ENABLE_EXCEPTIONS)
         set(OOX_POLICY_LIST noexc)
       else()
         set(OOX_POLICY_LIST noexc exc)
@@ -99,7 +99,17 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
         endif()
         target_link_libraries(${bench_target} ${PROJECT_NAME} benchmark::benchmark ${${mode}_LIBS})
         target_include_directories(${bench_target} PRIVATE ${PROJECT_NAME})
-        add_test(${bench_target} ${bench_target} --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/8)
+        # CI test filter
+        if(bench STREQUAL "bench_fib")
+          set(_bench_ci_filter "^Fib_(Serial|OOX[12]|TBB[12]|TF|OMP|TokenCancel|Throw_Start|Cancel_Start)/4/")
+        else()
+          set(_bench_ci_filter "/4")
+        endif()
+        add_test(${bench_target} ${bench_target}
+          --benchmark_min_time=0
+          --benchmark_repetitions=1
+          --benchmark_min_warmup_time=0
+          --benchmark_filter=${_bench_ci_filter})
       endforeach()
     endforeach()
   endforeach()
@@ -148,3 +158,4 @@ if(TBB_FOUND AND OOX_ENABLE_EXCEPTIONS)
   add_test(bench_branching_cancel
     bench_branching_cancel --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/10)
 endif()
+

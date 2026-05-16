@@ -18,6 +18,7 @@ constexpr int FibN = 30;
 int cutoff = 8;
 constexpr int max_cutoff = 20;
 constexpr int cutoff_step = 2;
+constexpr int max_cutoff_inject = 12;
 
 namespace Serial { // Original problem statement
 
@@ -186,6 +187,152 @@ static void Fib_TF(benchmark::State& state) {
 }
 BENCHMARK(Fib_TF)->Unit(benchmark::kMillisecond)->UseRealTime()->DenseRange(cutoff, max_cutoff, cutoff_step);
 #endif //HAVE_TF
+
+#include <atomic>
+#include <memory>
+
+namespace InjectToken {
+    using stop_flag = std::shared_ptr<std::atomic<bool>>;
+    inline int leaf_or_stop(volatile int n, stop_flag stop) {
+        if (stop->load(std::memory_order_relaxed)) return 0;
+        return Serial::Fib(n);
+    }
+    oox::var<int> Fib(volatile int n, stop_flag stop) {
+        if (n < cutoff) {
+            return oox::run([stop](volatile int nn) {
+                return leaf_or_stop(nn, stop);
+            }, n);
+        }
+        if (stop->load(std::memory_order_relaxed)) {
+            return oox::run([]() -> int { return 0; });
+        }
+        auto left  = Fib(n - 1, stop);
+        auto right = Fib(n - 2, stop);
+        return oox::run(std::plus<int>(), std::move(left), std::move(right));
+    }
+} // namespace InjectToken
+
+static void Fib_TokenCancel(benchmark::State& state) {
+    cutoff = state.range(0);
+    for (auto _ : state) {
+        auto stop = std::make_shared<std::atomic<bool>>(false);
+        auto root = InjectToken::Fib(FibN + cutoff, stop);
+        stop->store(true, std::memory_order_relaxed);
+        auto v = oox::wait_and_get(root);
+        benchmark::DoNotOptimize(v);
+    }
+}
+
+BENCHMARK(Fib_TokenCancel)
+    ->Unit(benchmark::kMillisecond)
+    ->UseRealTime()
+    ->Iterations(20)
+    ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+
+#if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS && \
+    defined(OOX_DEFAULT_EXCEPTION_POLICY) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
+#include <exception>
+
+struct dummy_throw_inject : std::exception {
+    const char* what() const noexcept override { return "dummy_throw_inject"; }
+};
+
+namespace InjectThrow {
+    oox::var<int> Fib(volatile int n, int depth, int target_depth, std::atomic<int>* tok) {
+        if (n < cutoff) return Serial::Fib(n);
+        if (depth == target_depth) {
+            int e = 0;
+            if (tok->compare_exchange_strong(e, 1,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+                return oox::run([]() -> int { throw dummy_throw_inject{}; });
+            }
+        }
+        auto left  = Fib(n - 1, depth + 1, target_depth, tok);
+        auto right = Fib(n - 2, depth + 1, target_depth, tok);
+        // Pass by lvalue ref so OOX uses assign_prerequisite (reader path)
+        return oox::run(std::plus<int>(), left, right);
+    }
+} // namespace InjectThrow
+
+static void run_fib_throw(benchmark::State& state, int td) {
+    cutoff = state.range(0);
+    int caught = 0;
+    int fired = 0;
+    for (auto _ : state) {
+        std::atomic<int> tok{0};
+        auto root = InjectThrow::Fib(FibN + cutoff, 0, td, &tok);
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(root));
+        } catch (const dummy_throw_inject&) { ++caught; }
+        catch (const oox::cancelled_by_exception&) { ++caught; }
+        catch (...) { ++caught; }
+        fired += tok.load(std::memory_order_relaxed);
+    }
+    state.counters["caught"] = caught;
+    state.counters["fired"] = fired;
+    state.counters["target_depth"] = td;
+}
+
+static void Fib_Throw_Start (benchmark::State& s) { run_fib_throw(s, 0); }
+static void Fib_Throw_Middle(benchmark::State& s) { run_fib_throw(s, FibN / 2); }
+static void Fib_Throw_End   (benchmark::State& s) { run_fib_throw(s, (FibN * 4) / 5); }
+
+BENCHMARK(Fib_Throw_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(20)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Throw_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Throw_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+
+namespace InjectCancel {
+    oox::var<int> Fib(volatile int n, int depth, int target_depth,
+                      std::atomic<int>* tok, oox::var<int>& cancel_pred) {
+        if (n < cutoff) return Serial::Fib(n);
+        if (depth == target_depth) {
+            int e = 0;
+            if (tok->compare_exchange_strong(e, 1,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+                return oox::run([](int g) { return g + 1; }, cancel_pred);
+            }
+        }
+        auto left  = Fib(n - 1, depth + 1, target_depth, tok, cancel_pred);
+        auto right = Fib(n - 2, depth + 1, target_depth, tok, cancel_pred);
+        // Pass by lvalue ref so OOX uses the reader path
+        return oox::run(std::plus<int>(), left, right);
+    }
+} // namespace InjectCancel
+
+static void run_fib_cancel(benchmark::State& state, int td) {
+    cutoff = state.range(0);
+    int caught = 0;
+    int fired = 0;
+    for (auto _ : state) {
+        oox::var<int> gate(oox::deferred);
+        oox::var<int> cancel_pred = oox::run([](int g) { return g + 1; }, gate);
+        std::atomic<int> tok{0};
+        auto root = InjectCancel::Fib(FibN + cutoff, 0, td, &tok, cancel_pred);
+        cancel_pred.cancel();
+        oox::run([](int& g) { g = 1; }, gate);
+        try {
+            benchmark::DoNotOptimize(oox::wait_and_get(root));
+        } catch (const oox::cancelled_by_user&) { ++caught; }
+        catch (const oox::cancelled_by_exception&) { ++caught; }
+        catch (...) { ++caught; }
+        fired += tok.load(std::memory_order_relaxed);
+    }
+    state.counters["caught"] = caught;
+    state.counters["fired"] = fired;
+    state.counters["target_depth"] = td;
+}
+
+static void Fib_Cancel_Start (benchmark::State& s) { run_fib_cancel(s, 0); }
+static void Fib_Cancel_Middle(benchmark::State& s) { run_fib_cancel(s, FibN / 2); }
+static void Fib_Cancel_End   (benchmark::State& s) { run_fib_cancel(s, (FibN * 4) / 5); }
+
+BENCHMARK(Fib_Cancel_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(20)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Cancel_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Cancel_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+
+#endif // OOX_ENABLE_EXCEPTIONS && OOX_DEFAULT_EXCEPTION_POLICY
 
 namespace {
 const bool kBenchmarkContext = []() {
