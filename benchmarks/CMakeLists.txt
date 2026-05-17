@@ -15,7 +15,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(benchmark)
 
-list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
+list(APPEND OOX_BENCHMARKS bench_fib bench_loops
+                          bench_success_graphs bench_branch_cancellation)
 set(OOX_BACKENDS)
 
 find_package(benchmark REQUIRED)
@@ -64,3 +65,21 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
     endforeach()
   endforeach()
 endforeach()
+
+# Context-cancellation benches require the OOX_CONTEXTS_ENABLED machinery
+# introduced on this branch. Build them only when the option is on.
+if(OOX_CONTEXTS_ENABLED OR OOX_ENABLE_EXCEPTIONS)
+  foreach(mode IN LISTS OOX_BACKENDS)
+    set(ctx_target bench_context_cancellation_${mode}.exe)
+    add_executable(${ctx_target} bench_context_cancellation.cpp)
+    target_compile_definitions(${ctx_target} PRIVATE
+      PARALLEL=exe HAVE_${mode}
+      OOX_CONTEXTS_ENABLED=1)
+    target_link_libraries(${ctx_target} ${PROJECT_NAME} benchmark::benchmark ${${mode}_LIBS})
+    target_include_directories(${ctx_target} PRIVATE ${PROJECT_NAME})
+    add_test(${ctx_target} ${ctx_target}
+      --benchmark_min_time=0 --benchmark_repetitions=1
+      --benchmark_min_warmup_time=0 --benchmark_filter=Single)
+  endforeach()
+endif()
+
