@@ -886,12 +886,12 @@ TEST(OOX, ExceptionCancellationHasNoExceptionControl) {
     }, gate);
 
     cancelled.cancel();
-    EXPECT_FALSE(cancelled.current_task->exception_control_handle());
+    EXPECT_FALSE(cancelled.current_task->local_exception_control_handle());
 
     oox::run([](int& g) { g = 1; }, gate);
     EXPECT_THROW(oox::wait_and_get(cancelled), oox::cancelled_by_user);
     EXPECT_EQ(ran.load(), 0);
-    EXPECT_FALSE(cancelled.current_task->exception_control_handle());
+    EXPECT_FALSE(cancelled.current_task->local_exception_control_handle());
 }
 
 TEST(OOX, ExceptionFanoutSharesExceptionControl) {
@@ -905,20 +905,51 @@ TEST(OOX, ExceptionFanoutSharesExceptionControl) {
     EXPECT_THROW(oox::wait_and_get(left), dummy_exception);
     EXPECT_THROW(oox::wait_and_get(right), dummy_exception);
 
-    auto source_control = bad.current_task->exception_control_handle();
+    auto source_control = bad.current_task->local_exception_control_handle();
     ASSERT_NE(source_control, nullptr);
-    EXPECT_EQ(left.current_task->exception_control_handle(), source_control);
-    EXPECT_EQ(right.current_task->exception_control_handle(), source_control);
+    EXPECT_EQ(left.current_task->local_exception_control_handle(), source_control);
+    EXPECT_EQ(right.current_task->local_exception_control_handle(), source_control);
 }
 
-TEST(OOX, ExceptionResultStateUsesCompactControlStorage) {
-    using void_state = oox::internal::result_state<void, true>;
-    using char_state = oox::internal::result_state<char, true>;
-    using exception_control = oox::internal::exception_control;
+TEST(OOX, ExceptionResultStateLayoutMatchesNonThrowing) {
+    static_assert(sizeof(oox::internal::result_state<int, true>) ==
+                  sizeof(oox::internal::result_state<int, false>),
+                  "throwing result_state must not carry extra failure storage");
+    static_assert(sizeof(oox::internal::result_state<char, true>) ==
+                  sizeof(oox::internal::result_state<char, false>),
+                  "throwing result_state must not carry extra failure storage");
+    static_assert(std::is_empty_v<oox::internal::result_state<void, true>>,
+                  "throwing void result_state must be empty");
+    static_assert(std::is_empty_v<oox::internal::result_state<void, false>>,
+                  "non-throwing void result_state must be empty");
+    static_assert(oox::internal::oox_var_base::k_port_bits == 14,
+                  "var port field must be 14 bits");
+    static_assert(sizeof(oox::internal::oox_var_base::current_port_and_flags_t) ==
+                  sizeof(std::uint16_t),
+                  "var packed port/flags must stay 16-bit");
+}
 
-    EXPECT_LT(sizeof(void_state), sizeof(exception_control));
-    EXPECT_LT(sizeof(char_state), sizeof(exception_control));
-    EXPECT_LT(alignof(void_state), alignof(exception_control));
+TEST(OOX, ExceptionGetRethrowsOriginalForVarT) {
+    oox::var<int, true> a = oox::run<true>([]() -> int { throw dummy_exception{}; });
+    EXPECT_THROW(a.get(), dummy_exception);
+}
+
+TEST(OOX, ExceptionGetReportsUserCancellation) {
+    oox::var<int, true> a(oox::deferred);
+    a.cancel();
+    oox::run<true>([](int& A) { A = 42; }, a);
+    // a was deferred, so cancel() is a no-op and the writer publishes 42.
+    EXPECT_EQ(a.get(), 42);
+}
+
+TEST(OOX, ExceptionForwardingReturnsAlreadyFailedVar) {
+    auto failed = oox::run<true>([]() -> int { throw dummy_exception{}; });
+    EXPECT_THROW(oox::wait_for_all(failed), dummy_exception);
+
+    auto forwarded = oox::run<true>([&]() -> oox::var<int, true> {
+        return std::move(failed);
+    });
+    EXPECT_THROW(oox::wait_and_get(forwarded), dummy_exception);
 }
 #endif
 
