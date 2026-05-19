@@ -984,7 +984,8 @@ void task_node::notify_successors() {
     int counters[slots];
     int n = notify_successors( slots, counters );
     wakeup();
-    release(n);
+    if( n )
+        release(n);
 }
 
 template<int slots>
@@ -992,7 +993,8 @@ void task_node::notify_successors_success() {
     int counters[slots];
     int n = notify_successors_impl<false>( slots, counters );
     wakeup();
-    release(n);
+    if( n )
+        release(n);
 }
 
 #if OOX_ENABLE_EXCEPTIONS
