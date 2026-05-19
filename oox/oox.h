@@ -688,11 +688,11 @@ struct arc_list {
 
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
+    static constexpr int start_count_mask = std::numeric_limits<int>::max();
 #if OOX_ENABLE_EXCEPTIONS
     // The high bit is a hot-path gate: when it is clear, remove_prerequisite()
     // can spawn directly without entering virtual failure-state decoding.
     static constexpr int start_failure_bit = std::numeric_limits<int>::min();
-    static constexpr int start_count_mask = std::numeric_limits<int>::max();
 #endif
     std::atomic<int> start_count;
 #if OOX_ENABLE_EXCEPTIONS
@@ -912,7 +912,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
 
 void task_node::remove_prerequisite( int n ) {
 #if OOX_ENABLE_EXCEPTIONS
-    int k = start_count-=n;
+    int k = start_count.fetch_sub(n, std::memory_order_release) - n;
     const int count = k & start_count_mask;
     __OOX_ASSERT(count <= start_count_mask - n, "invalid start_count detected while removing prerequisite");
     if( count != 0 ) [[likely]] {
@@ -927,7 +927,7 @@ void task_node::remove_prerequisite( int n ) {
     }
     spawn();
 #else
-    int k = start_count-=n;
+    int k = start_count.fetch_sub(n, std::memory_order_release) - n;
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
