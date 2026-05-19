@@ -1,7 +1,3 @@
-// Copyright (C) 2026 OOX contributors
-//
-// SPDX-License-Identifier: Apache-2.0
-//
 // Success-path benchmarks for the OOX benchmark suite. These benchmarks
 // measure normal, exception-free graph execution. They are intentionally
 // branch-agnostic: the same source compiles on main, PR24, PR28 and PR29.

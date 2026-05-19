@@ -7,6 +7,8 @@ include(FetchContent)
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_USE_BUNDLED_GTEST OFF CACHE BOOL "" FORCE)
+set(OOX_BENCHMARK_CTEST_MIN_TIME "0.05s" CACHE STRING "Minimum Google Benchmark run time for benchmark CTest smoke tests")
+set(OOX_BENCHMARK_CTEST_FILTER "/8" CACHE STRING "Google Benchmark filter used by benchmark CTest smoke tests")
 
 FetchContent_Declare(
         benchmark
@@ -101,7 +103,12 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
         target_include_directories(${bench_target} PRIVATE ${PROJECT_NAME})
         # The no-exception exception benchmark is build-only; the Release CI showed some strange tbb behaviour
         if(NOT ("${bench}" MATCHES "exceptions" AND "${policy}" STREQUAL "noexc"))
-          add_test(${bench_target} ${bench_target} --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/4)
+          add_test(NAME ${bench_target}
+                   COMMAND ${bench_target}
+                           --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
+                           --benchmark_repetitions=1
+                           --benchmark_min_warmup_time=0
+                           --benchmark_filter=${OOX_BENCHMARK_CTEST_FILTER})
         endif()
       endforeach()
     endforeach()
