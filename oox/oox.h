@@ -601,7 +601,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
 }
 
 void task_node::remove_prerequisite( int n ) {
-    int k = start_count-=n;
+    int k = start_count.fetch_sub(n, std::memory_order_release) - n;
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
@@ -758,6 +758,8 @@ struct oox_var_base {
             return;
         }
         current_task->wait();
+        h = current_task->head.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX(k_task_done_tag == (uintptr_t)h, "wait returned before task completed");
     }
     void release() {
         if( current_task ) {
@@ -1025,6 +1027,8 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using result_base = result_state<R, false>;
     using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1039,6 +1043,8 @@ template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1053,6 +1059,8 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );
