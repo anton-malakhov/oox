@@ -21,8 +21,8 @@ namespace {
     const auto plus = [](int x, int y) -> int {
         return x + y;
     };
-    constexpr int kMaxN = 64;
-    constexpr int kMinIterations = 10;
+    constexpr int kMaxN = 1024;
+    constexpr double kBenchmarkMinTime = 1.0;
 
     bool wait_cancelled_by_user(oox::var<int>& value) {
         try {
@@ -104,8 +104,8 @@ namespace {
 } // namespace
 
 #if OOX_BENCH_CANCELLATION
-BENCHMARK(OOX_Cancel_Chain)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(2500);
-BENCHMARK(OOX_Cancel_Fanout)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->Iterations(2500);
+BENCHMARK(OOX_Cancel_Chain)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->MinTime(kBenchmarkMinTime);
+BENCHMARK(OOX_Cancel_Fanout)->UseRealTime()->Unit(benchmark::kMicrosecond)->Range(8, kMaxN)->MinTime(kBenchmarkMinTime);
 #endif
 
 namespace {

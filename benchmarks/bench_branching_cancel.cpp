@@ -8,13 +8,24 @@
 #include <oox/oox.h>
 #include <tbb/task_group.h>
 
+#if defined(__SANITIZE_THREAD__)
+#define OOX_BENCHMARK_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define OOX_BENCHMARK_TSAN 1
+#endif
+#endif
+#ifndef OOX_BENCHMARK_TSAN
+#define OOX_BENCHMARK_TSAN 0
+#endif
+
 namespace {
 constexpr int kSplitDepth = 8;
-constexpr int kMinDepth = 10;
-constexpr int kMaxDepth = 20;
+constexpr int kMinDepth = 14;
+constexpr int kMaxDepth = 22;
 constexpr int kDepthStep = 2;
 constexpr int kLeafWork = 64;
-constexpr int kMinIterations = 3;
+constexpr double kBenchmarkMinTime = 1.0;
 
 struct SearchConfig {
     int depth;
@@ -94,13 +105,14 @@ void BM_TBB_BranchingSearchCancel(benchmark::State& state) {
     for (auto _ : state) {
         std::atomic<int> found{-1};
         std::atomic<std::int64_t> visited{0};
-        tbb::task_group tg;
+        tbb::task_group_context ctx;
+        tbb::task_group tg(ctx);
 
         for (int branch = 0; branch < cfg.branch_count; ++branch) {
-            tg.run([&, branch] {
+            tg.run([cfg, branch, &found, &visited, &ctx] {
                 const int first_leaf = branch * cfg.leaves_per_branch;
                 if (search_branch(first_leaf, cfg.leaves_per_branch, cfg.target, found, visited)) {
-                    tg.cancel();
+                    ctx.cancel_group_execution();
                 }
             });
         }
@@ -123,7 +135,7 @@ void BM_TBB_BranchingSearchThrow(benchmark::State& state) {
         tbb::task_group tg;
 
         for (int branch = 0; branch < cfg.branch_count; ++branch) {
-            tg.run([&, branch] {
+            tg.run([cfg, branch, &found, &visited] {
                 const int first_leaf = branch * cfg.leaves_per_branch;
                 search_branch_throw(first_leaf, cfg.leaves_per_branch, cfg.target, found, visited);
             });
@@ -211,29 +223,31 @@ void BM_OOX_BranchingSearchThrow(benchmark::State& state) {
 }
 } // namespace
 
+#if !OOX_BENCHMARK_TSAN
 BENCHMARK(BM_TBB_BranchingSearchCancel)
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond)
     ->DenseRange(kMinDepth, kMaxDepth, kDepthStep)
-    ->Iterations(kMinIterations);
+    ->MinTime(kBenchmarkMinTime);
 
 BENCHMARK(BM_TBB_BranchingSearchThrow)
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond)
     ->DenseRange(kMinDepth, kMaxDepth, kDepthStep)
-    ->Iterations(kMinIterations);
+    ->MinTime(kBenchmarkMinTime);
+#endif
 
 BENCHMARK(BM_OOX_BranchingSearchCancel)
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond)
     ->DenseRange(kMinDepth, kMaxDepth, kDepthStep)
-    ->Iterations(kMinIterations);
+    ->MinTime(kBenchmarkMinTime);
 
 BENCHMARK(BM_OOX_BranchingSearchThrow)
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond)
     ->DenseRange(kMinDepth, kMaxDepth, kDepthStep)
-    ->Iterations(kMinIterations);
+    ->MinTime(kBenchmarkMinTime);
 
 namespace {
 const bool kBenchmarkContext = []() {

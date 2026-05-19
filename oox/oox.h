@@ -950,7 +950,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
 }
 
 void task_node::remove_prerequisite( int n ) {
-    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_acq_rel);
+    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_release);
     const auto previous_count = start_prerequisite_count(previous);
     __OOX_ASSERT(previous_count >= static_cast<std::uint32_t>(n),
                  "invalid start_count detected while removing prerequisite");
@@ -1015,7 +1015,8 @@ void task_node::notify_successors() {
     int counters[slots];
     int n = notify_successors( slots, counters );
     wakeup();
-    release(n);
+    if( n )
+        release(n);
 }
 
 template<int slots>
@@ -1023,7 +1024,8 @@ void task_node::notify_successors_success() {
     int counters[slots];
     int n = notify_successors_impl<false>( slots, counters );
     wakeup();
-    release(n);
+    if( n )
+        release(n);
 }
 
 template<int N>
@@ -1143,6 +1145,12 @@ struct oox_var_base {
             return;
         }
         current_task->wait();
+        h = current_task->head.load(std::memory_order_acquire);
+#if OOX_ENABLE_EXCEPTIONS
+        __OOX_ASSERT_EX(is_done_arc_head(h), "wait returned before task completed");
+#else
+        __OOX_ASSERT_EX(k_task_done_tag == (uintptr_t)h, "wait returned before task completed");
+#endif
     }
     void cancel_current_task() noexcept {
 #if OOX_ENABLE_EXCEPTIONS
@@ -1460,6 +1468,8 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
 
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
             if (this->has_start_failure()) [[unlikely]] {
@@ -1495,6 +1505,8 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
@@ -1535,6 +1547,8 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
