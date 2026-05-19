@@ -7,6 +7,8 @@ include(FetchContent)
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_USE_BUNDLED_GTEST OFF CACHE BOOL "" FORCE)
+set(OOX_BENCHMARK_CTEST_MIN_TIME "0.05s" CACHE STRING "Minimum Google Benchmark run time for benchmark CTest smoke tests")
+set(OOX_BENCHMARK_CTEST_FILTER "/8" CACHE STRING "Google Benchmark filter used by benchmark CTest smoke tests")
 
 FetchContent_Declare(
         benchmark
@@ -106,7 +108,7 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
           set(_bench_ci_filter "/4")
         endif()
         add_test(${bench_target} ${bench_target}
-          --benchmark_min_time=0
+          --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
           --benchmark_repetitions=1
           --benchmark_min_warmup_time=0
           --benchmark_filter=${_bench_ci_filter})
@@ -156,6 +158,5 @@ if(TBB_FOUND AND OOX_ENABLE_EXCEPTIONS)
   target_link_libraries(bench_branching_cancel PRIVATE ${PROJECT_NAME} ${TBB_BENCHMARK_LIBS})
   target_include_directories(bench_branching_cancel PRIVATE ${PROJECT_NAME})
   add_test(bench_branching_cancel
-    bench_branching_cancel --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/10)
+    bench_branching_cancel --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME} --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=/10)
 endif()
-

@@ -77,3 +77,7 @@ if (OOX_ENABLE_EXCEPTIONS)
                    -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                    -P ${CMAKE_CURRENT_LIST_DIR}/exception_policy_compile.cmake)
 endif ()
+
+if (OOX_BUILD_TWIST_TESTS)
+  add_subdirectory(twist)
+endif ()

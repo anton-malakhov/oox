@@ -1,7 +1,3 @@
-// Copyright (C) 2026 OOX contributors
-//
-// SPDX-License-Identifier: Apache-2.0
-//
 // Shared benchmark utilities for the OOX benchmark suite. This header is
 // intentionally branch-agnostic: it defines a benchmark-local cooperative
 // cancellation token/source and a deterministic CPU work helper. Branch
