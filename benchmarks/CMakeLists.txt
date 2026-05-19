@@ -7,6 +7,8 @@ include(FetchContent)
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_USE_BUNDLED_GTEST OFF CACHE BOOL "" FORCE)
+set(OOX_BENCHMARK_CTEST_MIN_TIME "0.05s" CACHE STRING "Minimum Google Benchmark run time for benchmark CTest smoke tests")
+set(OOX_BENCHMARK_CTEST_FILTER "/8" CACHE STRING "Google Benchmark filter used by benchmark CTest smoke tests")
 
 FetchContent_Declare(
         benchmark
@@ -60,7 +62,10 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
       target_compile_definitions(${bench}_${mode}.${suffix} PRIVATE PARALLEL=${suffix} HAVE_${mode})
       target_link_libraries(${bench}_${mode}.${suffix} ${PROJECT_NAME} benchmark::benchmark ${${mode}_LIBS})
       target_include_directories(${bench}_${mode}.${suffix} PRIVATE ${PROJECT_NAME})
-      add_test(${bench}_${mode}.${suffix} ${bench}_${mode}.${suffix} --benchmark_min_time=0 --benchmark_repetitions=1  --benchmark_min_warmup_time=0 --benchmark_filter=/8)
+      add_test(NAME ${bench}_${mode}.${suffix}
+               COMMAND ${bench}_${mode}.${suffix}
+                       --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
+                       --benchmark_filter=${OOX_BENCHMARK_CTEST_FILTER})
     endforeach()
   endforeach()
 endforeach()

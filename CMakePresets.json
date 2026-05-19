@@ -1,0 +1,77 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "twist-sim-dfs",
+      "displayName": "Twist deterministic simulation",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/twist-sim-dfs",
+      "cacheVariables": {
+        "OOX_BUILD_TESTS": "ON",
+        "OOX_BUILD_TWIST_TESTS": "ON",
+        "OOX_BUILD_BENCHMARKS": "OFF",
+        "OOX_ENABLE_TBB": "OFF",
+        "OOX_ENABLE_TF": "OFF",
+        "OOX_ENABLE_FOLLY": "OFF",
+        "OOX_ENABLE_OMP": "OFF",
+        "TWIST_SIM": "ON",
+        "TWIST_SIM_ISOLATION": "ON",
+        "TWIST_FAULTY": "ON"
+      }
+    },
+    {
+      "name": "twist-fault-tsan",
+      "displayName": "Twist faulty threads with TSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/twist-fault-tsan",
+      "cacheVariables": {
+        "OOX_BUILD_TESTS": "ON",
+        "OOX_BUILD_TWIST_TESTS": "ON",
+        "OOX_BUILD_BENCHMARKS": "OFF",
+        "OOX_ENABLE_TBB": "OFF",
+        "OOX_ENABLE_TF": "OFF",
+        "OOX_ENABLE_FOLLY": "OFF",
+        "OOX_ENABLE_OMP": "OFF",
+        "TWIST_FAULTY": "ON",
+        "TWIST_SIM": "OFF",
+        "OOX_SANITIZE": "thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "twist-sim-dfs",
+      "configurePreset": "twist-sim-dfs"
+    },
+    {
+      "name": "twist-fault-tsan",
+      "configurePreset": "twist-fault-tsan"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "twist-sim-dfs",
+      "configurePreset": "twist-sim-dfs",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "twist"
+        }
+      }
+    },
+    {
+      "name": "twist-fault-tsan",
+      "configurePreset": "twist-fault-tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "twist"
+        }
+      }
+    }
+  ]
+}

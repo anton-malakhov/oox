@@ -20,6 +20,7 @@ FetchContent_MakeAvailable(googletest)
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
 option(OOX_BUILD_TESTS "Enables builds of tests" ON)
+option(OOX_BUILD_TWIST_TESTS "Build Twist-based concurrency tests" OFF)
 option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_LOCAL_TBB "Force local copy of TBB" OFF)
 option(OOX_ENABLE_TF "Enable Taskflow for threading" ON)
@@ -28,6 +29,10 @@ option(OOX_ENABLE_FOLLY "Enable Folly for threading" ON)
 option(OOX_LOCAL_FOLLY "Force local copy of Folly" OFF)
 option(OOX_ENABLE_OMP "Enable OpenMP for comparison (if found)" ON)
 option(OOX_ENABLE_EXCEPTIONS "Enable OOX exception-aware state machinery" OFF)
+set(OOX_TWIST_GIT_TAG "master" CACHE STRING "Twist git tag/commit to fetch")
+set(OOX_TWIST_RANDOM_SEEDS "32" CACHE STRING "Number of randomized Twist seeds for regular CI")
+set(OOX_TWIST_MAX_STEPS "10000" CACHE STRING "Default Twist simulator step limit")
+set(OOX_TWIST_MAX_PREEMPTS "3" CACHE STRING "Default DFS preemption bound")
 
 # Global features
 if (OOX_SANITIZE)
@@ -132,6 +137,15 @@ if (OOX_ENABLE_FOLLY)
     add_subdirectory(thirdparty/folly folly)
     set(folly_FOUND ON)
   endif ()
+endif ()
+
+if (OOX_BUILD_TWIST_TESTS)
+  FetchContent_Declare(
+          twist
+          GIT_REPOSITORY https://gitlab.com/Lipovsky/twist.git
+          GIT_TAG ${OOX_TWIST_GIT_TAG}
+  )
+  FetchContent_MakeAvailable(twist)
 endif ()
 
 
