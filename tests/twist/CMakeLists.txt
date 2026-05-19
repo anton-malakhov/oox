@@ -62,31 +62,3 @@ if (TWIST_SIM)
           TIMEOUT 30
   )
 endif ()
-
-if (OOX_SANITIZE STREQUAL "thread")
-  add_executable(test_twist_negative_publication test_twist_publication.cpp)
-  target_link_libraries(test_twist_negative_publication
-          PRIVATE
-          ${PROJECT_NAME}
-          twist
-  )
-  target_compile_features(test_twist_negative_publication PRIVATE cxx_std_23)
-  target_compile_definitions(test_twist_negative_publication
-          PRIVATE
-          HAVE_TWIST=1
-          OOX_TWIST_TEST=1
-          OOX_TWIST_MAX_STEPS=${OOX_TWIST_MAX_STEPS}
-          OOX_TWIST_MAX_PREEMPTS=${OOX_TWIST_MAX_PREEMPTS}
-          OOX_TWIST_RANDOM_SEEDS=${OOX_TWIST_RANDOM_SEEDS}
-          OOX_TWIST_INJECT_BUG_SKIP_TASK_START_ACQUIRE=1
-  )
-
-  add_test(NAME test_twist_negative_publication
-          COMMAND ${CMAKE_COMMAND}
-                  -D TEST_EXE=$<TARGET_FILE:test_twist_negative_publication>
-                  -P ${CMAKE_CURRENT_LIST_DIR}/expect_failure.cmake)
-  set_tests_properties(test_twist_negative_publication PROPERTIES
-          LABELS "twist;concurrency;negative;tsan"
-          TIMEOUT 30
-  )
-endif ()

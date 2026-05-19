@@ -1222,10 +1222,8 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using result_base = result_state<R, false>;
     using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
-#if !OOX_TWIST_INJECT_BUG_SKIP_TASK_START_ACQUIRE
         [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
-#endif
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1240,10 +1238,8 @@ template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
-#if !OOX_TWIST_INJECT_BUG_SKIP_TASK_START_ACQUIRE
         [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
-#endif
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1258,10 +1254,8 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
-#if !OOX_TWIST_INJECT_BUG_SKIP_TASK_START_ACQUIRE
         [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX(start_count == 0, "task execution started before task setup was published");
-#endif
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );

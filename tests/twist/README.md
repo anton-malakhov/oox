@@ -49,9 +49,6 @@ cmake --build --preset twist-fault-tsan
 ctest --preset twist-fault-tsan
 ```
 
-The TSAN preset also builds `test_twist_negative_publication`, an expected-fail
-sentinel that removes the task-body acquire edge and should trip ThreadSanitizer.
-
 Add new tests as small scenario functions with strong oracles. Use
 `RunRandomSeeds` for regular PR coverage, and add `RunDfs` only for scenarios
 that have been measured to keep the explored state space tiny.
