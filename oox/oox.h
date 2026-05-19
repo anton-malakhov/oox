@@ -444,6 +444,15 @@ struct task : task_life {
 };
 #elif HAVE_TBB ///////////////////////// TBB ///////////////////////////////////////////
 #define OOX_USING_TBB
+#if !defined(OOX_USE_STDMALLOC)
+#if defined(__SANITIZE_THREAD__)
+#define OOX_USE_STDMALLOC 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define OOX_USE_STDMALLOC 1
+#endif
+#endif
+#endif
 using tbb::detail::d1::execution_data;
 using tbb_task = tbb::detail::d1::task;
 using tbb::detail::d1::small_object_allocator;
@@ -1207,6 +1216,8 @@ struct oox_var_base {
             return;
         }
         current_task->wait();
+        h = current_task->head.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX(k_task_done_tag == (uintptr_t)h, "wait returned before task completed");
     }
     void cancel_current_task() noexcept {
 #if OOX_ENABLE_EXCEPTIONS
@@ -1588,6 +1599,8 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
 #endif
 
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
             if (failure_base::has_incoming_failure()) [[unlikely]] {
@@ -1668,6 +1681,8 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
     }
 #endif
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
@@ -1776,6 +1791,8 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     }
 #endif
     TASK_EXECUTE_METHOD {
+        [[maybe_unused]] const int start_count = this->start_count.load(std::memory_order_acquire);
+        __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
 #if OOX_ENABLE_EXCEPTIONS
         if constexpr (CanThrow) {
