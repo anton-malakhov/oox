@@ -341,12 +341,19 @@ using tbb_task = tbb::detail::d1::task;
 using tbb::detail::d1::small_object_allocator;
 static tbb::task_group_context tbb_context;
 #define TASK_EXECUTE_METHOD tbb_task* execute(execution_data&) override
+#define OOX_TASK_EXECUTE_LIFETIME_GUARD ::oox::internal::task::execute_lifetime_guard oox_execute_lifetime_guard{this}
 
 struct task : public tbb_task, task_life {
     tbb::detail::d1::wait_context waiter{1};
 #ifndef OOX_USE_STDMALLOC
     small_object_allocator alloc{};
 #endif
+    struct execute_lifetime_guard {
+        task* self;
+        ~execute_lifetime_guard() {
+            self->release(1);
+        }
+    };
 #if TBB_USE_ASSERT
     std::atomic<bool> is_spawned{false};
     virtual ~task() {
@@ -390,6 +397,7 @@ struct task : public tbb_task, task_life {
 #if TBB_USE_ASSERT
         is_spawned.store(true, std::memory_order_release);
 #endif
+        life_count.fetch_add(1, std::memory_order_acq_rel);
         tbb::detail::d1::spawn(*this, tbb_context);
     }
     void wait() {
@@ -563,6 +571,10 @@ struct task : task_life {
     }
 };
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
+
+#ifndef OOX_TASK_EXECUTE_LIFETIME_GUARD
+#define OOX_TASK_EXECUTE_LIFETIME_GUARD do { } while (false)
+#endif
 
 struct task_node;
 struct oox_var_base;
@@ -1614,6 +1626,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
 
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
 #if OOX_ENABLE_EXCEPTIONS
@@ -1651,6 +1664,7 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
         __OOX_TRACE("%p do_run: start",this);
@@ -1693,6 +1707,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         [[maybe_unused]] const auto start_count = this->start_count.load(std::memory_order_acquire);
         __OOX_ASSERT_EX((start_count & task_node::start_count_mask) == 0, "task execution started before task setup was published");
     //explicit copy paste below, but we cannot afford creating lambda. The compiler might not optimize it.
