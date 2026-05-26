@@ -638,13 +638,6 @@ struct task_node : public task, arc_list {
 
     // Result output node
     inline output_node& out(int n) const;
-    // Synchronize with release updates that publish prerequisite results before spawning this task.
-    // A standalone acquire fence is not enough here: it is not tied to the
-    // start_count release sequence, so both the C++ model and TSan can miss
-    // the publication edge from producer result writes to this consumer.
-    void acquire_prerequisite_publication() const {
-        [[maybe_unused]] const auto unused = start_count.load(std::memory_order_acquire);
-    }
     // Add a prerequisite
     int  assign_prerequisite( task_node *n, int req_port );
     // Process flow- and anti-dependence arcs
@@ -691,8 +684,7 @@ bool arc_list::add_arc( arc* i ) {
 
 int task_node::assign_prerequisite( task_node *n, int req_port ) {
     arc* j = new arc( this, req_port ); // TODO: embed into the task
-    __OOX_ASSERT(j && n, "");
-
+    __OOX_ASSERT_EX(j && n, "");
     if( n->add_arc(j) ) {
         __OOX_TRACE("%p assign_prerequisite: assigned to %p, %d",this,n,req_port);
         return 1; // Prerequisite n will decrement start_count when it produces a value
@@ -720,11 +712,11 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     sync::preemption_point();
     int k = ++n->out(req_port).countdown;
     __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
-    __OOX_ASSERT(k>1,"risk that a prerequisite might be prematurely destroyed");
+    __OOX_ASSERT_EX(k>1,"risk that a prerequisite might be prematurely destroyed");
     j->node = n;
     j->kind = arc::back_only;
     bool success = add_arc(j); //TODO: add_arc_unsafe?
-    __OOX_ASSERT(success, "");
+    __OOX_ASSERT_EX(success, "");
     return 0;
 }
 
@@ -741,7 +733,6 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 n->release( k );
             delete j;
         } else {
-            bool delete_arc = false;
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
                 // Add back arc so that "n" can notify this when it is done consuming the value.
@@ -749,21 +740,16 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 j->kind = arc::back_only;
                 if( out(j->port).next_writer.load(std::memory_order_acquire) != (task_node*)uintptr_t(3) ) {
                     bool b = n->add_arc( j );
-                    __OOX_ASSERT(b, "corrupted?");
+                    __OOX_ASSERT_EX(b, "corrupted?");
                     --count[j->port];
-                } else delete_arc = true; // very unlikely?
-            } else if( j->kind == arc::flow_copy ) {
+                } else delete j; // very unlikely?
+            } else if( j->kind == arc::flow_copy )
                 n->on_ready( j->port );
-                delete_arc = true;
-            } else if( j->kind == arc::flow_only ) {
-                delete_arc = true;
-            } else if( j->kind == arc::forward_copy )
+            else if( j->kind == arc::forward_copy )
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
             n->remove_prerequisite();
-            if( delete_arc )
-                delete j;
         }
     } while( r );
 }
@@ -807,7 +793,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
 }
 
 void task_node::remove_prerequisite( int n ) {
-    int k = start_count.fetch_sub(n, std::memory_order_release) - n;
+    int k = start_count-=n;
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
@@ -921,11 +907,8 @@ struct oox_var_base {
         return static_cast<int>(current_port_and_flags.port);
     }
     void set_current_port(int port) noexcept {
-        __OOX_ASSERT(port >= 0 && port <= k_max_port, "oox::var port does not fit packed field");
+        __OOX_ASSERT_EX(port >= 0 && port <= k_max_port, "oox::var port does not fit packed field");
         current_port_and_flags.port = static_cast<std::uint16_t>(port);
-    }
-    bool is_deferred() const noexcept {
-        return current_port_and_flags.is_deferred;
     }
 
     void set_next_writer( int output_port, task_node* d ) {
@@ -946,7 +929,7 @@ struct oox_var_base {
                 r = j->next;
                 j->port = arc::port_int(output_port);
                 bool ok = d->add_arc(j);
-                __OOX_ASSERT(ok, "unexpected: writer task already completed while forwarding deferred arcs");
+                __OOX_ASSERT_EX(ok, "unexpected: writer task already completed while forwarding deferred arcs");
             }
             current_port_and_flags.is_deferred = false;
         }
@@ -963,7 +946,7 @@ struct oox_var_base {
         __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
     }
     void wait() {
-        __OOX_ASSERT(current_task, "wait for empty oox::var");
+        __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
         // if head is done marker, the producer is already done:
         // - either a constant storage_task, or
         // - a completed functional_task.
@@ -1089,7 +1072,7 @@ public:
     var& operator=(var<T>&& t) {
         release();
         new(this) internal::oox_var_base(std::move(t));
-        __OOX_ASSERT(current_task, "");
+        __OOX_ASSERT_EX(current_task, "");
         t.current_task = nullptr;
         return *this;
     }
@@ -1194,14 +1177,14 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         } else {
             state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
-        __OOX_ASSERT(state, "null result_state storage");
+        __OOX_ASSERT_EX(state, "null result_state storage");
 
         if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
         }
-        __OOX_ASSERT(state->has_value(), "read from empty result_state");
+        __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         return static_cast<C&&>(state->value());
     }
 };
@@ -1244,14 +1227,18 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, false>;
     functional_task(F&& f) : functor_base(std::move(f)) {
+      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
         this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      }
     }
+
     functional_task(const F& f) : functor_base(f) {
+      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
         this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      }
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
-        this->acquire_prerequisite_publication();
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1273,7 +1260,6 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
-        this->acquire_prerequisite_publication();
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1289,15 +1275,18 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     bool is_executed : 1 = false;
 
     functional_task(F&& f) : functor_base(std::move(f)) {
+      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
         this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      }
     }
     functional_task(const F& f) : functor_base(f) {
+      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
         this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      }
     }
 
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
-        this->acquire_prerequisite_publication();
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );
@@ -1414,11 +1403,11 @@ template<typename T>
     // Follow forwarding chain until we reach a non-forward var
     internal::oox_var_base* base = &v;
     while (base->current_port_and_flags.is_forwarded) {
-        __OOX_ASSERT(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
+        __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
         base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
     }
 
-    __OOX_ASSERT(base->storage_ptr, "var has null storage_ptr in wait_and_get");
+    __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
     return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
 }
 
