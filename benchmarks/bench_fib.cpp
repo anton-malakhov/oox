@@ -226,7 +226,7 @@ static void Fib_TokenCancel(benchmark::State& state) {
 BENCHMARK(Fib_TokenCancel)
     ->Unit(benchmark::kMillisecond)
     ->UseRealTime()
-    ->Iterations(20)
+    ->Iterations(1)
     ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 
 #if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED && \
@@ -278,9 +278,9 @@ static void Fib_Throw_Start (benchmark::State& s) { run_fib_throw(s, 0); }
 static void Fib_Throw_Middle(benchmark::State& s) { run_fib_throw(s, FibN / 2); }
 static void Fib_Throw_End   (benchmark::State& s) { run_fib_throw(s, (FibN * 4) / 5); }
 
-BENCHMARK(Fib_Throw_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(20)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
-BENCHMARK(Fib_Throw_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
-BENCHMARK(Fib_Throw_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Throw_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Throw_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Throw_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 
 namespace InjectCancel {
     oox::var<int> Fib(volatile int n, int depth, int target_depth,
@@ -328,9 +328,9 @@ static void Fib_Cancel_Start (benchmark::State& s) { run_fib_cancel(s, 0); }
 static void Fib_Cancel_Middle(benchmark::State& s) { run_fib_cancel(s, FibN / 2); }
 static void Fib_Cancel_End   (benchmark::State& s) { run_fib_cancel(s, (FibN * 4) / 5); }
 
-BENCHMARK(Fib_Cancel_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(20)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
-BENCHMARK(Fib_Cancel_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
-BENCHMARK(Fib_Cancel_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Cancel_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Cancel_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
+BENCHMARK(Fib_Cancel_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(1)->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 
 #endif // OOX_EXCEPTIONS_ENABLED && OOX_DEFAULT_EXCEPTION_POLICY
 
