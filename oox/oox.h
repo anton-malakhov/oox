@@ -730,12 +730,17 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         arc* j = r;
         r = j->next;
         task_node* n = j->node;
+        // Leak trace that motivated explicit ownership here:
+        // - test_twist_forwarding / NestedForwardingChain: 72 byte(s), 3 allocation(s) of arc
+        // - test_twist_lifetime / ChainedResultDestroyedWhileChildPending: 24 byte(s), 1 allocation(s) of arc
+        // Arc is deleted in this loop unless ownership is transferred via n->add_arc(j).
+        bool delete_arc = true;
+
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
             __OOX_TRACE("%p notify: %p->remove_back_arc(%d)",this,n,j->port);
             if( int k = n->remove_back_arc( j->port ) )
                 n->release( k );
-            delete j;
         } else {
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
@@ -746,14 +751,19 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                     bool b = n->add_arc( j );
                     __OOX_ASSERT_EX(b, "corrupted?");
                     --count[j->port];
-                } else delete j; // very unlikely?
-            } else if( j->kind == arc::flow_copy )
+                    delete_arc = false; // ownership transferred to n
+                }
+            } else if( j->kind == arc::flow_copy ) {
                 n->on_ready( j->port );
-            else if( j->kind == arc::forward_copy )
+            } else if( j->kind == arc::forward_copy ) {
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
+            }
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
             n->remove_prerequisite();
+        }
+        if (delete_arc) {
+            delete j;
         }
     } while( r );
 }
@@ -878,12 +888,16 @@ output_node& task_node::out(int n) const {
     return self->output_nodes[n];
 }
 
-template<int slots, typename T>
+template<int slots, typename T, int InitialLifetime = 0>
 struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
-    storage_task() = default;
-    storage_task(T&& t) { this->emplace(std::move(t)); }
-    storage_task(const T& t) { this->emplace(t); }
+    storage_task() {
+        if constexpr (InitialLifetime != 0) {
+            this->life_set_count(InitialLifetime);
+        }
+    }
+    storage_task(T&& t) : storage_task() { this->emplace(std::move(t)); }
+    storage_task(const T& t) : storage_task() { this->emplace(t); }
     ~storage_task() { this->reset(); }
 };
 
@@ -941,13 +955,12 @@ struct oox_var_base {
         current_task = d;
         set_current_port(output_port);
     }
-    void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false, bool deferred = false ) {
+    void bind_to( task_node * t, void* ptr, bool fwd = false, bool deferred = false ) {
         current_task = t, storage_ptr = ptr, current_port_and_flags = {};
         current_port_and_flags.is_forwarded = fwd;
         current_port_and_flags.is_deferred = deferred;
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
-        t->life_add_count(lifetime);
-        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
+        __OOX_TRACE("%p bind: store=%p fwd=%d deferred=%d",t,ptr,fwd,deferred);
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
@@ -1039,23 +1052,23 @@ class var : public internal::oox_var_base {
                   "for const types use shared_ptr<T>.");
 
     void* allocate_new() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
+        auto *v = internal::task::allocate<internal::storage_task<1, T, 2>>();
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
-        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
+        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v) );
         return storage_ptr;
     }
 
     void* allocate_deferred() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
+        auto *v = internal::task::allocate<internal::storage_task<1, T, 2>>();
         __OOX_TRACE("%p oox::var(deferred)", v);
         // Make writers behave like for a normal initial value (next_writer ready),
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
-        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), false, true);
         return storage_ptr;
     }
 
@@ -1230,12 +1243,13 @@ template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, false>;
+    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1;
     functional_task(F&& f) : functor_base(std::move(f)) {
-      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      this->life_set_count(k_lifetime_init);
     }
 
     functional_task(const F& f) : functor_base(f) {
-      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      this->life_set_count(k_lifetime_init);
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1252,11 +1266,12 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
 template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using functor_base = storage_task<slots, F>;
+    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots;
     functional_task(F&& f) : functor_base(std::move(f)) {
-        this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+        this->life_set_count(k_lifetime_init);
     }
     functional_task(const F& f) : functor_base(f) {
-        this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+        this->life_set_count(k_lifetime_init);
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1271,14 +1286,15 @@ template<int slots, typename F, typename VT> // forwarding task
 struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
     using functor_base = storage_task<slots, F>;
+    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1;
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
 
     functional_task(F&& f) : functor_base(std::move(f)) {
-      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      this->life_set_count(k_lifetime_init);
     }
     functional_task(const F& f) : functor_base(f) {
-      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+      this->life_set_count(k_lifetime_init);
     }
 
     TASK_EXECUTE_METHOD {
@@ -1323,7 +1339,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1); return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t)); return oox;
     }
 };
 template<>
@@ -1331,7 +1347,7 @@ struct gen_oox<void> {
     using type = var<void>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, void> * t) {
-        type oox; oox.bind_to( t, t, slots ); return oox;
+        type oox; oox.bind_to( t, t ); return oox;
     }
 };
 template< typename VT >
@@ -1339,7 +1355,7 @@ struct gen_oox<var<VT> > {
     using type = var<VT>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
-        type oox; oox.bind_to( t, &t->my_result, slots+1, true ); return oox;
+        type oox; oox.bind_to( t, &t->my_result, true ); return oox;
     }
 };
 template< typename T>
