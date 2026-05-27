@@ -18,7 +18,7 @@ bool g_oox_verbose = false;
 #include <numeric>
 #include <vector>
 #include <functional>
-#if OOX_ENABLE_EXCEPTIONS
+#if OOX_EXCEPTIONS_ENABLED
 #include <stdexcept>
 #include <atomic>
 #endif
@@ -223,7 +223,7 @@ TEST(OOX, DeferredArrayLayered) {
 
 /////////////////////////////////////// EXCEPTIONS ////////////////////////////////////////
 
-#if OOX_ENABLE_EXCEPTIONS
+#if OOX_EXCEPTIONS_ENABLED
 struct dummy_exception final : std::exception {
     [[nodiscard]] const char* what() const noexcept override { return "dummy throw"; }
 };
@@ -962,7 +962,7 @@ int main(int argc, char** argv) {
     }
 
     int err{0};
-#if OOX_ENABLE_EXCEPTIONS
+#if OOX_EXCEPTIONS_ENABLED
     try {
         err = RUN_ALL_TESTS();
     } catch (const std::exception& e) {

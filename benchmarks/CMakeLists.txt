@@ -65,12 +65,12 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
     endif()
     foreach(suffix IN LISTS OOX_LOOP_MODES)
       if("${bench}" STREQUAL "bench_cancellation")
-        if(OOX_ENABLE_EXCEPTIONS)
+        if(OOX_EXCEPTIONS_ENABLED)
           set(OOX_POLICY_LIST exc)
         else()
           set(OOX_POLICY_LIST)
         endif()
-      elseif("${bench}" STREQUAL "bench_exceptions" AND NOT OOX_ENABLE_EXCEPTIONS)
+      elseif("${bench}" STREQUAL "bench_exceptions" AND NOT OOX_EXCEPTIONS_ENABLED)
         set(OOX_POLICY_LIST noexc)
       else()
         set(OOX_POLICY_LIST noexc exc)
@@ -91,8 +91,8 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
                                    OOX_DEFAULT_EXCEPTION_POLICY=${OOX_POLICY_VALUE}
                                    OOX_EXCEPTION_POLICY_STR=${policy})
         target_compile_options(${bench_target} PRIVATE
-                                -UOOX_ENABLE_EXCEPTIONS
-                                -DOOX_ENABLE_EXCEPTIONS=${OOX_POLICY_VALUE})
+                                -UOOX_EXCEPTIONS_ENABLED
+                                -DOOX_EXCEPTIONS_ENABLED=${OOX_POLICY_VALUE})
         if ("${mode}" STREQUAL "TBB")
           if (OOX_POLICY_VALUE)
             target_compile_definitions(${bench_target} PRIVATE TBB_USE_EXCEPTIONS=1)
@@ -142,7 +142,7 @@ if(TBB_FOUND)
     bench_tbb_exceptions_exc --benchmark_min_time=0 --benchmark_repetitions=1 --benchmark_min_warmup_time=0 --benchmark_filter=NoThrow)
 endif()
 
-if(TBB_FOUND AND OOX_ENABLE_EXCEPTIONS)
+if(TBB_FOUND AND OOX_EXCEPTIONS_ENABLED)
   add_executable(bench_branching_cancel bench_branching_cancel.cpp)
   target_compile_definitions(bench_branching_cancel PRIVATE
     HAVE_TBB
@@ -151,8 +151,8 @@ if(TBB_FOUND AND OOX_ENABLE_EXCEPTIONS)
     TBB_USE_EXCEPTIONS=1
   )
   target_compile_options(bench_branching_cancel PRIVATE
-    -UOOX_ENABLE_EXCEPTIONS
-    -DOOX_ENABLE_EXCEPTIONS=1
+    -UOOX_EXCEPTIONS_ENABLED
+    -DOOX_EXCEPTIONS_ENABLED=1
     -fexceptions
   )
   target_link_libraries(bench_branching_cancel PRIVATE ${PROJECT_NAME} ${TBB_BENCHMARK_LIBS})

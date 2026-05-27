@@ -229,7 +229,7 @@ BENCHMARK(Fib_TokenCancel)
     ->Iterations(20)
     ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 
-#if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS && \
+#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED && \
     defined(OOX_DEFAULT_EXCEPTION_POLICY) && (OOX_DEFAULT_EXCEPTION_POLICY != 0)
 #include <exception>
 
@@ -332,7 +332,7 @@ BENCHMARK(Fib_Cancel_Start) ->Unit(benchmark::kMillisecond)->UseRealTime()->Iter
 BENCHMARK(Fib_Cancel_Middle)->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 BENCHMARK(Fib_Cancel_End)   ->Unit(benchmark::kMillisecond)->UseRealTime()->Iterations(3) ->DenseRange(cutoff, max_cutoff_inject, cutoff_step);
 
-#endif // OOX_ENABLE_EXCEPTIONS && OOX_DEFAULT_EXCEPTION_POLICY
+#endif // OOX_EXCEPTIONS_ENABLED && OOX_DEFAULT_EXCEPTION_POLICY
 
 namespace {
 const bool kBenchmarkContext = []() {
