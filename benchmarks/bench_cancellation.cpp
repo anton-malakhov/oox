@@ -8,7 +8,7 @@ const std::string policy_str = STR(OOX_EXCEPTION_POLICY_STR);
 
 #include <oox/oox.h>
 
-#if defined(__cpp_exceptions) && defined(OOX_ENABLE_EXCEPTIONS) && OOX_ENABLE_EXCEPTIONS && \
+#if defined(__cpp_exceptions) && defined(OOX_EXCEPTIONS_ENABLED) && OOX_EXCEPTIONS_ENABLED && \
     defined(OOX_DEFAULT_EXCEPTION_POLICY) && OOX_DEFAULT_EXCEPTION_POLICY
 #define OOX_BENCH_CANCELLATION 1
 #include <vector>

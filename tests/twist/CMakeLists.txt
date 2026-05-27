@@ -32,8 +32,8 @@ function(oox_add_twist_exception_test target source)
   )
   target_compile_options(${target}
           PRIVATE
-          -UOOX_ENABLE_EXCEPTIONS
-          -DOOX_ENABLE_EXCEPTIONS=1
+          -UOOX_EXCEPTIONS_ENABLED
+          -DOOX_EXCEPTIONS_ENABLED=1
   )
 endfunction()
 
