@@ -34,6 +34,7 @@ oox_add_twist_test(test_twist_publication test_twist_publication.cpp)
 oox_add_twist_test(test_twist_forwarding test_twist_forwarding.cpp)
 oox_add_twist_test(test_twist_ordering test_twist_ordering.cpp)
 oox_add_twist_test(test_twist_lifetime test_twist_lifetime.cpp)
+oox_add_twist_test(test_twist_lifetime_trace_model test_twist_lifetime_trace_model.cpp)
 
 if (TWIST_SIM)
   oox_add_twist_test(test_twist_known_deferred_race test_twist_known_deferred_race.cpp)
