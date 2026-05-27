@@ -118,6 +118,10 @@ struct task_life {
         life_count.fetch_add(lifetime, std::memory_order_release);
     }
 
+    void life_set_count(int lifetime) {
+        life_count.store(lifetime, std::memory_order_release);
+    }
+
     int  life_get_count() {
         return life_count.load(std::memory_order_acquire);
     }
@@ -1227,15 +1231,11 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, false>;
     functional_task(F&& f) : functor_base(std::move(f)) {
-      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-      }
+      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
 
     functional_task(const F& f) : functor_base(f) {
-      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-      }
+      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1253,10 +1253,10 @@ template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using functor_base = storage_task<slots, F>;
     functional_task(F&& f) : functor_base(std::move(f)) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+        this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
     functional_task(const F& f) : functor_base(f) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+        this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1275,14 +1275,10 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     bool is_executed : 1 = false;
 
     functional_task(F&& f) : functor_base(std::move(f)) {
-      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-      }
+      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
     functional_task(const F& f) : functor_base(f) {
-      if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-      }
+      this->life_set_count(OOX_TASK_EXECUTE_LIFETIME_REF);
     }
 
     TASK_EXECUTE_METHOD {
