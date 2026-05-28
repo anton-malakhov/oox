@@ -33,4 +33,6 @@
 
 # Dirs
 build*/
+output/
+results/
 .vscode/

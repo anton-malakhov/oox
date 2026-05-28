@@ -1,4 +1,4 @@
-function(oox_add_twist_test target source)
+function(oox_add_twist_executable target source)
   add_executable(${target} ${source})
 
   target_link_libraries(${target}
@@ -16,6 +16,10 @@ function(oox_add_twist_test target source)
           OOX_TWIST_MAX_PREEMPTS=${OOX_TWIST_MAX_PREEMPTS}
           OOX_TWIST_RANDOM_SEEDS=${OOX_TWIST_RANDOM_SEEDS}
   )
+endfunction()
+
+function(oox_add_twist_test target source)
+  oox_add_twist_executable(${target} ${source})
 
   add_test(NAME ${target} COMMAND ${target})
   set_tests_properties(${target} PROPERTIES
@@ -43,6 +47,8 @@ oox_add_twist_test(test_twist_publication test_twist_publication.cpp)
 oox_add_twist_test(test_twist_forwarding test_twist_forwarding.cpp)
 oox_add_twist_test(test_twist_ordering test_twist_ordering.cpp)
 oox_add_twist_test(test_twist_lifetime test_twist_lifetime.cpp)
+oox_add_twist_test(test_twist_lifetime_trace_model test_twist_lifetime_trace_model.cpp)
+oox_add_twist_test(test_twist_api_coverage test_twist_api_coverage.cpp)
 oox_add_twist_exception_test(test_twist_exceptions test_twist_exceptions.cpp)
 
 if (TWIST_SIM)

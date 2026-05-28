@@ -16,7 +16,8 @@
         "OOX_ENABLE_OMP": "OFF",
         "TWIST_SIM": "ON",
         "TWIST_SIM_ISOLATION": "ON",
-        "TWIST_FAULTY": "ON"
+        "TWIST_FAULTY": "ON",
+        "TWIST_FAULT_PLACEMENT": "BOTH"
       }
     },
     {
@@ -33,6 +34,7 @@
         "OOX_ENABLE_FOLLY": "OFF",
         "OOX_ENABLE_OMP": "OFF",
         "TWIST_FAULTY": "ON",
+        "TWIST_FAULT_PLACEMENT": "BOTH",
         "TWIST_SIM": "OFF",
         "OOX_SANITIZE": "thread"
       }
