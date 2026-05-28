@@ -282,20 +282,12 @@ using tbb_task = tbb::detail::d1::task;
 using tbb::detail::d1::small_object_allocator;
 static tbb::task_group_context tbb_context;
 #define TASK_EXECUTE_METHOD tbb_task* execute(execution_data&) override
-#define OOX_TASK_EXECUTE_LIFETIME_GUARD ::oox::internal::task::execute_lifetime_guard oox_execute_lifetime_guard{this}
-#define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
 struct task : public tbb_task, task_life {
     tbb::detail::d1::wait_context waiter{1};
 #ifndef OOX_USE_STDMALLOC
     small_object_allocator alloc{};
 #endif
-    struct execute_lifetime_guard {
-        task* self;
-        ~execute_lifetime_guard() {
-            self->release(1);
-        }
-    };
 #if TBB_USE_ASSERT
     std::atomic<bool> is_spawned{false};
     virtual ~task() {
@@ -353,7 +345,6 @@ struct task : public tbb_task, task_life {
 #include <mutex>
 #define OOX_USING_TF
 #define TASK_EXECUTE_METHOD void* execute() override
-#define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
 tf::Executor& get_tf_pool() {
     static tf::Executor* tf_pool = new tf::Executor();
@@ -396,7 +387,6 @@ struct task : task_life {
 #elif HAVE_TWIST /////////////////////// Twist ///////////////////////////////////////
 #define OOX_USING_TWIST
 #define TASK_EXECUTE_METHOD void* execute() override
-#define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
 struct task : task_life {
     sync::mutex waiter_mutex;
@@ -511,12 +501,7 @@ struct task : task_life {
 };
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
 
-#ifndef OOX_TASK_EXECUTE_LIFETIME_GUARD
-#define OOX_TASK_EXECUTE_LIFETIME_GUARD do { } while (false)
-#endif
-#ifndef OOX_TASK_EXECUTE_LIFETIME_REF
-#define OOX_TASK_EXECUTE_LIFETIME_REF 0
-#endif
+#define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
 struct task_node;
 struct oox_var_base;
@@ -796,7 +781,6 @@ int task_node::notify_successors( int output_slots, int *count ) {
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
 
-   sync::preemption_point();
    if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
         do_notify_arcs( r, count );
     int refs = 0;
@@ -837,7 +821,6 @@ int task_node::remove_back_arc( int output_port, int n ) {
     __OOX_TRACE("%p remove_back_arc port %d: %d (next_writer is %p)",this,output_port,k,out(output_port).next_writer.load(std::memory_order_acquire));
     if( k==0 ) {
         // Next writer was waiting on all consumers of me to finish.
-        sync::preemption_point();
         return notify_next_writer( out(output_port).next_writer.load(std::memory_order_acquire) );
     }
     return 0;
@@ -845,9 +828,7 @@ int task_node::remove_back_arc( int output_port, int n ) {
 
 void task_node::set_next_writer( int output_port, task_node* d ) {
     __OOX_ASSERT( !details::is_next_writer_ready_marker(d), "" );
-    sync::preemption_point();
     task_node* o = out(output_port).next_writer.exchange(d);
-    sync::preemption_point();
     __OOX_TRACE("%p set_next_writer(%d, %p): next_writer was %p",this,output_port,d,o);
     if( o ) {
         if( details::is_next_writer_ready_marker(o) ) {
@@ -888,16 +869,12 @@ output_node& task_node::out(int n) const {
     return self->output_nodes[n];
 }
 
-template<int slots, typename T, int InitialLifetime = 0>
+template<int slots, typename T>
 struct alignas(64) storage_task : task_node_slots<slots>, result_state<T, false> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
-    storage_task() {
-        if constexpr (InitialLifetime != 0) {
-            this->life_set_count(InitialLifetime);
-        }
-    }
-    storage_task(T&& t) : storage_task() { this->emplace(std::move(t)); }
-    storage_task(const T& t) : storage_task() { this->emplace(t); }
+    storage_task() = default;
+    storage_task(T&& t) { this->emplace(std::move(t)); }
+    storage_task(const T& t) { this->emplace(t); }
     ~storage_task() { this->reset(); }
 };
 
@@ -955,12 +932,13 @@ struct oox_var_base {
         current_task = d;
         set_current_port(output_port);
     }
-    void bind_to( task_node * t, void* ptr, bool fwd = false, bool deferred = false ) {
+    void bind_to( task_node * t, void* ptr, int lifetime, bool fwd = false, bool deferred = false ) {
         current_task = t, storage_ptr = ptr, current_port_and_flags = {};
         current_port_and_flags.is_forwarded = fwd;
         current_port_and_flags.is_deferred = deferred;
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
-        __OOX_TRACE("%p bind: store=%p fwd=%d deferred=%d",t,ptr,fwd,deferred);
+        t->life_set_count(lifetime);
+        __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
@@ -1052,23 +1030,23 @@ class var : public internal::oox_var_base {
                   "for const types use shared_ptr<T>.");
 
     void* allocate_new() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T, 2>>();
+        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
-        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v) );
+        this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
         return storage_ptr;
     }
 
     void* allocate_deferred() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T, 2>>();
+        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var(deferred)", v);
         // Make writers behave like for a normal initial value (next_writer ready),
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
-        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), false, true);
+        this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
         return storage_ptr;
     }
 
@@ -1243,16 +1221,8 @@ template<int slots, typename F, typename R>
 struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, false>;
-    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1;
-    functional_task(F&& f) : functor_base(std::move(f)) {
-      this->life_set_count(k_lifetime_init);
-    }
-
-    functional_task(const F& f) : functor_base(f) {
-      this->life_set_count(k_lifetime_init);
-    }
+    using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1265,16 +1235,8 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
 
 template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
-    using functor_base = storage_task<slots, F>;
-    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots;
-    functional_task(F&& f) : functor_base(std::move(f)) {
-        this->life_set_count(k_lifetime_init);
-    }
-    functional_task(const F& f) : functor_base(f) {
-        this->life_set_count(k_lifetime_init);
-    }
+    using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1285,20 +1247,10 @@ struct functional_task<slots, F, void> : storage_task<slots, F> {
 template<int slots, typename F, typename VT> // forwarding task
 struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
-    using functor_base = storage_task<slots, F>;
-    static constexpr int k_lifetime_init = OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1;
+    using storage_task<slots, F>::storage_task;
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
-
-    functional_task(F&& f) : functor_base(std::move(f)) {
-      this->life_set_count(k_lifetime_init);
-    }
-    functional_task(const F& f) : functor_base(f) {
-      this->life_set_count(k_lifetime_init);
-    }
-
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );
@@ -1310,17 +1262,13 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
-            if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-                this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-            }
+            this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
             if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
                 __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
                 return nullptr;
             }
             else {
-                if constexpr (OOX_TASK_EXECUTE_LIFETIME_REF != 0) {
-                    this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
-                }
+                this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
                 delete j;
             }
         }
@@ -1339,7 +1287,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t)); return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1); return oox;
     }
 };
 template<>
@@ -1347,7 +1295,7 @@ struct gen_oox<void> {
     using type = var<void>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, void> * t) {
-        type oox; oox.bind_to( t, t ); return oox;
+        type oox; oox.bind_to( t, t, OOX_TASK_EXECUTE_LIFETIME_REF + slots ); return oox;
     }
 };
 template< typename VT >
@@ -1355,7 +1303,7 @@ struct gen_oox<var<VT> > {
     using type = var<VT>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
-        type oox; oox.bind_to( t, &t->my_result, true ); return oox;
+        type oox; oox.bind_to( t, &t->my_result, OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1, true ); return oox;
     }
 };
 template< typename T>
