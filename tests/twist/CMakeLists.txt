@@ -50,6 +50,7 @@ oox_add_twist_test(test_twist_lifetime test_twist_lifetime.cpp)
 oox_add_twist_test(test_twist_lifetime_trace_model test_twist_lifetime_trace_model.cpp)
 oox_add_twist_test(test_twist_api_coverage test_twist_api_coverage.cpp)
 oox_add_twist_exception_test(test_twist_exceptions test_twist_exceptions.cpp)
+oox_add_twist_exception_test(test_twist_exception_coverage test_twist_exception_coverage.cpp)
 
 if (TWIST_SIM)
   oox_add_twist_test(test_twist_known_deferred_race test_twist_known_deferred_race.cpp)

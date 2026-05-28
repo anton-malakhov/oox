@@ -5,11 +5,9 @@
 namespace {
 
 void ReturnDeferredVarFromTask() {
-    auto forwarded = oox::run([]() -> oox::var<int> {
+    [[maybe_unused]] auto forwarded = oox::run([]() -> oox::var<int> {
         return oox::var<int>(oox::deferred);
     });
-
-    (void)forwarded;
 }
 
 } // namespace
