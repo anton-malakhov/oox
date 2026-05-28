@@ -18,6 +18,8 @@ void wait_until_non_zero(const twist::ed::std::atomic<int>& flag) {
     }
 }
 
+// Mirrors the observed race: outer task result gets dropped while nested
+// work is still in-flight, so task lifetime protection must keep objects alive.
 void DroppedForwardingTreeStillCompletes() {
     twist::ed::std::atomic<int> terminal_done{0};
 

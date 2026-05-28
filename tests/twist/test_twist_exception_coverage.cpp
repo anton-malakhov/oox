@@ -64,8 +64,7 @@ void ThrowingProducerSkipsAllDependentShapes() {
         return v + 1;
     }, bad);
 
-    auto void_dep = oox::run([&](int v) {
-        (void)v;
+    auto void_dep = oox::run([&]([[maybe_unused]] int v) {
         ran.fetch_add(1, std::memory_order_relaxed);
     }, bad);
 

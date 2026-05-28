@@ -135,7 +135,7 @@ def configure(root, build_dir, out_dir, mode, jobs, allocator):
         "-DOOX_BUILD_TESTS=OFF",
         "-DOOX_BUILD_BENCHMARKS=ON",
         "-DOOX_BUILD_TASKBENCH=ON",
-        "-DOOX_EXCEPTIONS_ENABLED=ON",
+        "-DOOX_ENABLE_EXCEPTIONS=ON",
         "-DOOX_ENABLE_TBB=ON",
         f"-DOOX_ENABLE_TF={'ON' if enable_comparison else 'OFF'}",
         f"-DOOX_ENABLE_OMP={'ON' if enable_comparison else 'OFF'}",

@@ -61,38 +61,38 @@ struct test_hooks {
         storage_task<1, int> c_null;
         c_null.publish_failure_from(nullptr, 0);
         const bool null_user =
-            (c_null.failure_bits_relaxed() & task_node::start_user_cancelled_bit) != 0;
+            (c_null.failure_bits() & task_node::start_user_cancelled_bit) != 0;
 
         // Failure observed on a non-zero consumer port collapses to dependency cancellation.
         storage_task<1, int> src_port, c_port;
         c_port.publish_failure_from(&src_port, 1);
         const bool port_dep =
-            (c_port.failure_bits_relaxed() & task_node::start_dependency_cancelled_bit) != 0;
+            (c_port.failure_bits() & task_node::start_dependency_cancelled_bit) != 0;
 
         // A user-cancelled source propagates as user cancellation.
         storage_task<1, int> src_user, c_user;
         src_user.cancel();
         c_user.publish_failure_from(&src_user, 0);
         const bool prop_user =
-            (c_user.failure_bits_relaxed() & task_node::start_user_cancelled_bit) != 0;
+            (c_user.failure_bits() & task_node::start_user_cancelled_bit) != 0;
 
         // A dependency-cancelled source (set via a null exception) propagates as dependency
         // cancellation; this also exercises the null-eptr branch of try_set_exception().
         storage_task<1, int> src_dep, c_dep;
         src_dep.try_set_exception(std::exception_ptr{});
         const bool src_dep_set =
-            (src_dep.failure_bits_relaxed() & task_node::start_dependency_cancelled_bit) != 0;
+            (src_dep.failure_bits() & task_node::start_dependency_cancelled_bit) != 0;
         c_dep.publish_failure_from(&src_dep, 0);
         const bool prop_dep =
-            (c_dep.failure_bits_relaxed() & task_node::start_dependency_cancelled_bit) != 0;
+            (c_dep.failure_bits() & task_node::start_dependency_cancelled_bit) != 0;
 
         // Exception bit set but no exception control available: must degrade to dependency
         // cancellation rather than dereference a missing control.
         storage_task<1, int> src_exc, c_exc;
-        src_exc.visible_failure_bits.fetch_or(task_node::start_exception_bit, std::memory_order_release);
+        src_exc.start_count.fetch_or(task_node::start_exception_bit, std::memory_order_release);
         c_exc.publish_failure_from(&src_exc, 0);
         const bool prop_exc =
-            (c_exc.failure_bits_relaxed() & task_node::start_dependency_cancelled_bit) != 0;
+            (c_exc.failure_bits() & task_node::start_dependency_cancelled_bit) != 0;
 
         return null_user && port_dep && prop_user && src_dep_set && prop_dep && prop_exc;
     }
@@ -101,7 +101,7 @@ struct test_hooks {
     static bool hit_failure_accessors_clean() {
         storage_task<1, int> t;
         const bool no_failure =
-            !t.has_start_failure() && !t.has_failure() && t.failure_bits() == 0u;
+            !t.has_start_failure() && !t.has_failure();
         const bool no_exception =
             t.local_exception() == nullptr &&
             t.local_exception_control_handle() == nullptr &&
@@ -134,7 +134,7 @@ struct test_hooks {
             failure_wait_status<false>(&dep_cancelled, 0) == wait_status::dependency_cancelled;
 
         storage_task<1, int> exc_no_control;
-        exc_no_control.visible_failure_bits.fetch_or(task_node::start_exception_bit, std::memory_order_release);
+        exc_no_control.start_count.fetch_or(task_node::start_exception_bit, std::memory_order_release);
         const bool exc =
             failure_wait_status<false>(&exc_no_control, 0) == wait_status::dependency_cancelled;
 
@@ -161,7 +161,7 @@ struct test_hooks {
         done_marked.head.store(reinterpret_cast<arc*>(k_task_done_tag), std::memory_order_release);
         const bool mark_rejected =
             !done_marked.mark_failure(task_node::start_user_cancelled_bit) &&
-            done_marked.failure_bits_relaxed() == 0u;
+            done_marked.failure_bits() == 0u;
 
         storage_task<1, int> done_store;
         done_store.head.store(reinterpret_cast<arc*>(k_task_done_tag), std::memory_order_release);
@@ -185,7 +185,7 @@ struct test_hooks {
         a->next = nullptr;
         producer.template do_notify_arcs<true>(a, count);
 
-        return (consumer.failure_bits_relaxed() & task_node::start_user_cancelled_bit) != 0;
+        return (consumer.failure_bits() & task_node::start_user_cancelled_bit) != 0;
     }
 
     // publish_failure_from on a completed consumer: the exception signal cannot be installed,
@@ -194,13 +194,13 @@ struct test_hooks {
         storage_task<1, int> source;
         source.try_set_exception(std::make_exception_ptr(int{0}));  // real exception + control on source
         const bool source_has_exception =
-            (source.failure_bits_relaxed() & task_node::start_exception_bit) != 0;
+            (source.failure_bits() & task_node::start_exception_bit) != 0;
 
         storage_task<1, int> done_consumer;
         done_consumer.head.store(reinterpret_cast<arc*>(k_task_done_tag), std::memory_order_release);
         done_consumer.publish_failure_from(&source, 0);  // add_arc on done consumer fails -> delete signal
         // mark_failure is rejected on the completed consumer, so its bits stay clear.
-        const bool consumer_clear = done_consumer.failure_bits_relaxed() == 0u;
+        const bool consumer_clear = done_consumer.failure_bits() == 0u;
 
         // Drain the source's pending exception signal so it can be destroyed cleanly.
         arc* h = source.head.exchange(reinterpret_cast<arc*>(k_task_done_tag), std::memory_order_acq_rel);

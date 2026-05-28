@@ -152,6 +152,8 @@ void InternalHooksRareBranches() {
 
 void ForwardingImmediateVarPath() {
     auto forwarded = oox::run([]() -> oox::var<int> {
+        // Return an already-ready storage var: forwarding add_arc should fail,
+        // forcing execute() fallback path in forwarding functional_task.
         return oox::var<int>(5);
     });
 

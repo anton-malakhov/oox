@@ -20,7 +20,7 @@ file(WRITE \"${OOX_TRY_SRC_DIR}/ok.cpp\" \"
 #include <oox/oox.h>
 int main() {
 #if OOX_EXCEPTIONS_ENABLED
-    oox::var<int, false> base = oox::run<false>([]() { return 1; });
+    oox::var<int, false> base = oox::run<false>([]() noexcept { return 1; });
     oox::var<int, true> dep = oox::run<true>([](int x) { return x + 1; }, base);
 #endif
     return 0;
@@ -44,7 +44,7 @@ file(WRITE \"${OOX_TRY_SRC_DIR}/fail.cpp\" \"
 #include <oox/oox.h>
 int main() {
     oox::var<int, true> base = oox::run<true>([]() { return 1; });
-    oox::var<int, false> dep = oox::run<false>([](int x) { return x + 1; }, base);
+    oox::var<int, false> dep = oox::run<false>([](int x) noexcept { return x + 1; }, base);
     return 0;
 }
 \")

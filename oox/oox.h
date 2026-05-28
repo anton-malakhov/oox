@@ -88,8 +88,7 @@ struct cancelled_by_user final : std::exception {
 #endif
 
 #if defined(OOX_DEFAULT_EXCEPTION_POLICY)
-inline constexpr bool default_exception_policy =
-    OOX_EXCEPTIONS_ENABLED && (OOX_DEFAULT_EXCEPTION_POLICY != 0);
+inline constexpr bool default_exception_policy = OOX_EXCEPTIONS_ENABLED && (OOX_DEFAULT_EXCEPTION_POLICY != 0);
 #elif OOX_EXCEPTIONS_ENABLED
 inline constexpr bool default_exception_policy = true;
 #else
@@ -110,8 +109,7 @@ inline constexpr std::uintptr_t k_task_exception_done_tag = 0x2;
 #endif
 inline constexpr std::uintptr_t k_task_deferred_redirect_tag = 0x4;
 #if OOX_EXCEPTIONS_ENABLED
-inline constexpr std::uintptr_t k_task_tag_mask =
-    k_task_done_tag | k_task_exception_done_tag | k_task_deferred_redirect_tag;
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_exception_done_tag | k_task_deferred_redirect_tag;
 #else
 inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_deferred_redirect_tag;
 #endif
@@ -559,9 +557,8 @@ struct task : task_life {
 
 #define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
-// Releases the bind-acquired execute reference at execute() scope-exit, on the worker
-// that ran the task. Used by every backend so the ref is always dropped *after* the work
-// finishes (releasing it right after spawn() would race the worker -> use-after-free).
+// unfortunately, execute method is now significantly harder
+// so cleanest way is to use this
 struct execute_lifetime_guard {
     task* self;
     ~execute_lifetime_guard() { self->release(OOX_TASK_EXECUTE_LIFETIME_REF); }
@@ -697,7 +694,7 @@ inline bool is_arc_list_tagged(arc* p) {
     return uintptr_t(p)&k_task_tag_mask;
 }
 
-// The completed-task sentinel stored in task_node::head once a task has produced
+// completed-task sentinel stored in task_node::head once a task has produced
 // its value (and has no real-exception terminal arc).
 inline arc* task_done_marker() {
     return reinterpret_cast<arc*>(k_task_done_tag);
@@ -772,57 +769,15 @@ struct task_node : public task, arc_list {
     // Prerequisites to start the task
     sync::atomic<std::uint32_t> start_count{0};
 #if OOX_EXCEPTIONS_ENABLED
-    sync::atomic<std::uint32_t> visible_failure_bits{0};
-    bool has_start_failure() const noexcept {
-        return visible_failure_bits.load(std::memory_order_relaxed) != 0;
-    }
-    bool has_non_user_start_failure() const noexcept {
-        const auto bits = visible_failure_bits.load(std::memory_order_relaxed);
-        return (bits & (start_dependency_cancelled_bit | start_exception_bit)) != 0;
-    }
-
-    void set_exception(std::exception_ptr ep) noexcept {
-        try_set_exception(std::move(ep));
-    }
-
-    void cancel() noexcept {
-        mark_failure(start_user_cancelled_bit);
-    }
-
-    [[noreturn]] void throw_failure_for_port(int port) const {
-        if (port > 0) {
-            throw cancelled_by_exception{};
-        }
-        // This path is used after wait-style synchronization.
-        const auto bits = failure_bits_relaxed();
-        if (bits & start_exception_bit) {
-            if (auto ep = local_exception()) {
-                std::rethrow_exception(ep);
-            }
-        } else if (bits & start_user_cancelled_bit) {
-            throw cancelled_by_user{};
-        }
-        throw cancelled_by_exception{};
-    }
+    bool has_start_failure() const noexcept;
+    bool has_non_user_start_failure() const noexcept;
+    void set_exception(std::exception_ptr ep) noexcept;
+    void cancel() noexcept;
+    void throw_failure_for_port(int port) const;
     bool mark_failure(std::uint32_t failure_bit) noexcept;
-    std::uint32_t failure_bits() const noexcept {
-        return visible_failure_bits.load(std::memory_order_acquire);
-    }
-    std::uint32_t failure_bits_relaxed() const noexcept {
-        return visible_failure_bits.load(std::memory_order_relaxed);
-    }
-    bool has_failure() const noexcept {
-        return failure_bits_relaxed() != 0u;
-    }
-    void try_set_exception(std::exception_ptr eptr) noexcept {
-        if (eptr) {
-            if (store_exception_control(new exception_control_struct(std::move(eptr)))) {
-                mark_failure(start_exception_bit);
-                return;
-            }
-        }
-        mark_failure(start_dependency_cancelled_bit);
-    }
+    std::uint32_t failure_bits() const noexcept;
+    bool has_failure() const noexcept;
+    void try_set_exception(std::exception_ptr eptr) noexcept;
     void publish_failure_from(task_node* source, int source_port) noexcept;
     bool store_exception_control(exception_control control) noexcept;
     exception_control local_exception_control_handle() const noexcept;
@@ -845,13 +800,12 @@ struct task_node : public task, arc_list {
     // Add a prerequisite
     int  assign_prerequisite( task_node *n, int req_port );
     // Process flow- and anti-dependence arcs
-    template<bool MayFail>
+    template<bool CanThrow>
     void do_notify_arcs( arc* r, int *count );
     // Process output dependence
     int  do_notify_out( int port, int count );
     // Process flow and output arcs. Returns number of finished output nodes
-    template<bool MayFail>
-    int  notify_successors_impl( int output_slots, int *counters );
+    template<bool CanThrow>
     int  notify_successors( int output_slots, int *counters );
     // Process flow- and anti-dependence arcs. Returns number of finished output nodes
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
@@ -863,11 +817,11 @@ struct task_node : public task, arc_list {
     int  remove_back_arc( int output_port, int n=1 );
     // Set new output dependence
     void set_next_writer( int output_port, task_node* n );
-    // Call base notify successors
-    template<int slots>
+    // Call base notify successors. CanThrow==true takes the failure-aware path
+    // (may install a terminal exception arc); CanThrow==false is the
+    // completed-without-failure path.
+    template<int slots, bool CanThrow = true>
     void notify_successors();
-    template<int slots>
-    void notify_successors_success();
 #if OOX_EXCEPTIONS_ENABLED
     virtual void notify_successors_virtual() = 0;
 #endif
@@ -899,6 +853,57 @@ bool arc_list::add_arc( arc* i ) {
 }
 
 #if OOX_EXCEPTIONS_ENABLED
+bool task_node::has_start_failure() const noexcept {
+    return (start_count.load(std::memory_order_relaxed) & start_failure_bits_mask) != 0;
+}
+
+bool task_node::has_non_user_start_failure() const noexcept {
+    const auto bits = start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
+    return (bits & (start_dependency_cancelled_bit | start_exception_bit)) != 0;
+}
+
+void task_node::set_exception(std::exception_ptr ep) noexcept {
+    try_set_exception(std::move(ep));
+}
+
+void task_node::cancel() noexcept {
+    mark_failure(start_user_cancelled_bit);
+}
+
+void task_node::throw_failure_for_port(int port) const {
+    if (port > 0) {
+        throw cancelled_by_exception{};
+    }
+
+    const auto bits = failure_bits();
+    if (bits & start_exception_bit) {
+        if (auto ep = local_exception()) {
+            std::rethrow_exception(ep);
+        }
+    } else if (bits & start_user_cancelled_bit) {
+        throw cancelled_by_user{};
+    }
+    throw cancelled_by_exception{};
+}
+
+std::uint32_t task_node::failure_bits() const noexcept {
+    return start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
+}
+
+bool task_node::has_failure() const noexcept {
+    return failure_bits() != 0u;
+}
+
+void task_node::try_set_exception(std::exception_ptr eptr) noexcept {
+    if (eptr) {
+        if (store_exception_control(new exception_control_struct(std::move(eptr)))) {
+            mark_failure(start_exception_bit);
+            return;
+        }
+    }
+    mark_failure(start_dependency_cancelled_bit);
+}
+
 bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
     __OOX_ASSERT_EX(failure_bit != 0 && (failure_bit & ~start_failure_bits_mask) == 0,
                     "mark_failure expects exactly one failure bit");
@@ -914,7 +919,6 @@ bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
         if (start_count.compare_exchange_weak(word, next,
                                               std::memory_order_acq_rel,
                                               std::memory_order_relaxed)) {
-            visible_failure_bits.fetch_or(failure_bit, std::memory_order_release);
             return (word & failure_bit) == 0;
         }
     }
@@ -979,7 +983,7 @@ void task_node::publish_failure_from(task_node* source, int source_port) noexcep
         return;
     }
 
-    const auto bits = source->visible_failure_bits.load(std::memory_order_acquire);
+    const auto bits = source->start_count.load(std::memory_order_acquire) & start_failure_bits_mask;
     if (bits & start_exception_bit) {
         if (auto control = source->local_exception_control_handle()) {
             // Real-exception propagation only. Dependency/user cancellation
@@ -1047,18 +1051,18 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     return 0;
 }
 
-template<bool MayFail>
+template<bool CanThrow>
 void task_node::do_notify_arcs( arc* r, int *count ) {
     // Notify successors that value is available
 #if OOX_EXCEPTIONS_ENABLED
-    const bool producer_failed = MayFail &&
+    const bool producer_failed = CanThrow &&
         ((start_count.load(std::memory_order_acquire) & start_failure_flag) != 0);
 #endif
     do {
         arc* j = r;
         r = j->next;
 #if OOX_EXCEPTIONS_ENABLED
-        if constexpr (MayFail) {
+        if constexpr (CanThrow) {
             if (j->kind == arc::exception_signal) {
             // Internal payload marker, not a successor edge. It can be present
             // only on real-exception paths because exception signals share the
@@ -1069,14 +1073,20 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         }
 #endif
         task_node* n = j->node;
+        // Leak trace that motivated explicit ownership here:
+        // - test_twist_forwarding / NestedForwardingChain: 72 byte(s), 3 allocation(s) of arc
+        // - test_twist_lifetime / ChainedResultDestroyedWhileChildPending: 24 byte(s), 1 allocation(s) of arc
+        // Arc is deleted in this loop unless ownership is transferred via n->add_arc(j).
+        bool delete_arc = true;
+#if OOX_EXCEPTIONS_ENABLED
+        const auto arc_port = j->port;
+#endif
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
             __OOX_TRACE("%p notify: %p->remove_back_arc(%d)",this,n,j->port);
             if( int k = n->remove_back_arc( j->port ) )
                 n->release( k );
-            delete j;
         } else {
-            const auto arc_port = j->port;
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
                 // Add back arc so that "n" can notify this when it is done consuming the value.
@@ -1086,13 +1096,13 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                     bool b = n->add_arc( j );
                     __OOX_ASSERT_EX(b, "corrupted?");
                     --count[j->port];
-                } else delete j; // very unlikely?
-            } else if( j->kind == arc::flow_copy )
+                    delete_arc = false; // ownership transferred to n
+                }
+            } else if( j->kind == arc::flow_copy ) {
                 n->on_ready( j->port );
-            else if( j->kind == arc::flow_only )
-                delete j;
-            else if( j->kind == arc::forward_copy )
+            } else if( j->kind == arc::forward_copy ) {
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
+            }
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
 #if OOX_EXCEPTIONS_ENABLED
@@ -1101,6 +1111,9 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
             }
 #endif
             n->remove_prerequisite();
+        }
+        if (delete_arc) {
+            delete j;
         }
     } while( r );
 }
@@ -1124,8 +1137,8 @@ int task_node::do_notify_out( int port, int count ) {
     return remove_back_arc( port, count );
 }
 
-template<bool MayFail>
-int task_node::notify_successors_impl( int output_slots, int *count ) {
+template<bool CanThrow>
+int task_node::notify_successors( int output_slots, int *count ) {
     for( int i = 0; i <  output_slots; i++ ) {
         // it should be safe to assign countdowns here because no successors were notified yet
         out(i).countdown.store( count[i] = std::numeric_limits<int>::max()/2, std::memory_order_release );
@@ -1136,7 +1149,7 @@ int task_node::notify_successors_impl( int output_slots, int *count ) {
 
 #if OOX_EXCEPTIONS_ENABLED
     arc* terminal = details::task_done_marker();
-    if constexpr (MayFail) {
+    if constexpr (CanThrow) {
         if (start_count.load(std::memory_order_acquire) & start_exception_bit) {
             // This is the only completion path that pays for a terminal arc. The
             // lookup may scan the active arc stack, but it is gated by the real-exception
@@ -1154,16 +1167,12 @@ int task_node::notify_successors_impl( int output_slots, int *count ) {
 
    sync::preemption_point();
    if( arc* r = head.exchange( terminal ) )
-        do_notify_arcs<MayFail>( r, count );
+        do_notify_arcs<CanThrow>( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
         refs += do_notify_out( i, count[i] );
     __OOX_ASSERT(refs>=0, "");
     return refs;
-}
-
-int task_node::notify_successors( int output_slots, int *count ) {
-    return notify_successors_impl<true>(output_slots, count);
 }
 
 void task_node::remove_prerequisite( int n ) {
@@ -1229,25 +1238,14 @@ void task_node::set_next_writer( int output_port, task_node* d ) {
     }
 }
 
-template<int slots>
+template<int slots, bool CanThrow>
 void task_node::notify_successors() {
     int counters[slots];
-    int n = notify_successors( slots, counters );
+    int n = notify_successors<CanThrow>( slots, counters );
     wakeup();
-    // With user-cancel, execute() can still run and
-    // wake a waiter that immediately drops the last ref. A trailing release(0)
-    // would then touch lifetime atomics on a reclaimed task which is UB.
-    if( n )
-        release(n);
-}
-
-template<int slots>
-void task_node::notify_successors_success() {
-    int counters[slots];
-    int n = notify_successors_impl<false>( slots, counters );
-    wakeup();
-    // Same race as above: after wakeup(), waiter-side teardown may destroy this
-    // task before completion thread reaches release(). Skip zero-release paths.
+    // With user-cancel, execute() can still run and wake a waiter that
+    // immediately drops the last ref. A trailing release(0) would then touch
+    // lifetime atomics on a reclaimed task which is UB, so skip zero-releases.
     if( n )
         release(n);
 }
@@ -1262,7 +1260,7 @@ struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
 #if OOX_EXCEPTIONS_ENABLED
     void notify_successors_virtual() override {
-        task_node::notify_successors<slots>();
+        task_node::notify_successors<slots, true>();
     }
 #endif
 };
@@ -1682,24 +1680,24 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
-            if (this->has_non_user_start_failure()) [[unlikely]] {
-                task_node::notify_successors<slots>();
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
                 return nullptr;
             }
             try {
                 result_base::emplace(this->functor_base::value()());
-                task_node::notify_successors_success<slots>();
+                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
-                task_node::notify_successors<slots>();
+                task_node::notify_successors<slots, true>();
             }
         } else {
             result_base::emplace(this->functor_base::value()());
-            task_node::notify_successors_success<slots>();
+            task_node::notify_successors<slots, false>();
         }
 #else
         result_base::emplace(this->functor_base::value()());
-        task_node::notify_successors<slots>();
+        task_node::notify_successors<slots, true>();
 #endif
         return nullptr;
     }
@@ -1720,24 +1718,24 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
         __OOX_TRACE("%p do_run: start",this);
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
-            if (this->has_non_user_start_failure()) [[unlikely]] {
-                task_node::notify_successors<slots>();
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
                 return nullptr;
             }
             try {
                 this->functor_base::value()();
-                task_node::notify_successors_success<slots>();
+                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
-                task_node::notify_successors<slots>();
+                task_node::notify_successors<slots, true>();
             }
         } else {
             this->functor_base::value()();
-            task_node::notify_successors_success<slots>();
+            task_node::notify_successors<slots, false>();
         }
 #else
         this->functor_base::value()();
-        task_node::notify_successors<slots>();
+        task_node::notify_successors<slots, true>();
 #endif
         return nullptr;
     }
@@ -1779,8 +1777,8 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
-            if (this->has_non_user_start_failure()) [[unlikely]] {
-                task_node::notify_successors<slots>();
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
                 return nullptr;
             }
             try {
@@ -1790,13 +1788,13 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                     }
                     if (result_base::value().current_task->has_failure()) {
                         this->publish_failure_from(result_base::value().current_task, 0);
-                        task_node::notify_successors<slots>();
+                        task_node::notify_successors<slots, true>();
                         return nullptr;
                     }
                 }
             } catch(...) {
                 this->set_exception(std::current_exception());
-                task_node::notify_successors<slots>();
+                task_node::notify_successors<slots, true>();
                 return nullptr;
             }
         } else {
@@ -1811,9 +1809,9 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
 #endif
         __OOX_TRACE("%p do_run: notify forward",this);
 #if OOX_EXCEPTIONS_ENABLED
-        task_node::notify_successors_success<slots>();
+        task_node::notify_successors<slots, false>();
 #else
-        task_node::notify_successors<slots>();
+        task_node::notify_successors<slots, true>();
 #endif
         return nullptr;
     }
@@ -1861,12 +1859,27 @@ template< typename R, typename C, typename... Args >
 functor_info<R, Args...> get_functor_info(R (C::*)(Args...)) { return functor_info<R, Args...>(); }
 template< typename R, typename C, typename... Args >
 functor_info<R, Args...> get_functor_info(R (C::*)(Args...) const) { return functor_info<R, Args...>(); }
+template< typename R, typename... Args >
+functor_info<R, Args...> get_functor_info(R (&)(Args...) noexcept) { return functor_info<R, Args...>(); }
+template< typename R, typename C, typename... Args >
+functor_info<R, Args...> get_functor_info(R (C::*)(Args...) noexcept) { return functor_info<R, Args...>(); }
+template< typename R, typename C, typename... Args >
+functor_info<R, Args...> get_functor_info(R (C::*)(Args...) const noexcept) { return functor_info<R, Args...>(); }
 template< typename F >
 auto get_functor_info(F&&) { return get_functor_info( &std::remove_reference_t<F>::operator() ); }
 template< typename F >
 using result_type_of = typename decltype( get_functor_info(std::declval<F>()) )::result_type;
 template< typename F >
 using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::args_list_type;
+
+template< typename F, typename ArgsList >
+struct functor_is_nothrow_invocable : std::false_type {};
+template< typename F, typename... Args >
+struct functor_is_nothrow_invocable<F, types<Args...>>
+    : std::bool_constant<std::is_nothrow_invocable_v<F, Args...>> {};
+template< typename F, typename ArgsList >
+inline constexpr bool functor_is_nothrow_invocable_v =
+    functor_is_nothrow_invocable<F, ArgsList>::value;
 
 } //namespace internal
 
@@ -1876,13 +1889,18 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::run<true>(...) requires OOX_EXCEPTIONS_ENABLED=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
+    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
+                      || internal::functor_is_nothrow_invocable_v<F, call_args_type>,
+        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
+        "the callable must satisfy std::is_nothrow_invocable for its argument types. "
+        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
     using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
     using functor_type = internal::oox_bind<F, args_type>;
     using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
-    int protect_count = static_cast<int>(internal::task_node::start_count_mask);
+    int protect_count = internal::task_node::start_count_mask;
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
     protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
@@ -1907,7 +1925,7 @@ wait_status failure_wait_status(task_node* task, int port) {
         if (port > 0) {
             return wait_status::dependency_cancelled;
         }
-        const auto bits = task->failure_bits_relaxed();
+        const auto bits = task->failure_bits();
         if (bits & task_node::start_exception_bit) {
             if (auto ep = task->local_exception()) {
                 std::rethrow_exception(ep);

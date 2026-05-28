@@ -7,7 +7,6 @@
 #undef NDEBUG
 #include <benchmark/benchmark.h>
 #include <cassert>
-#include <string>
 #include <oox/oox.h>
 
 #define STR_(x) #x
@@ -250,7 +249,6 @@ namespace InjectThrow {
         }
         auto left  = Fib(n - 1, depth + 1, target_depth, tok);
         auto right = Fib(n - 2, depth + 1, target_depth, tok);
-        // Pass by lvalue ref so OOX uses assign_prerequisite (reader path)
         return oox::run(std::plus<int>(), left, right);
     }
 } // namespace InjectThrow
@@ -296,7 +294,6 @@ namespace InjectCancel {
         }
         auto left  = Fib(n - 1, depth + 1, target_depth, tok, cancel_pred);
         auto right = Fib(n - 2, depth + 1, target_depth, tok, cancel_pred);
-        // Pass by lvalue ref so OOX uses the reader path
         return oox::run(std::plus<int>(), left, right);
     }
 } // namespace InjectCancel
