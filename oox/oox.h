@@ -371,8 +371,7 @@ struct task : task_life {
     }
     void spawn() {
         get_tf_pool().silent_async([this]{
-            this->execute();
-            this->release(1);
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         });
     }
     void wait() {
@@ -407,8 +406,7 @@ struct task : task_life {
     void spawn() {
         sync::thread([this] {
             sync::preemption_point();
-            this->execute();
-            this->release(1);
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         }).detach();
     }
     void wait() {
@@ -502,6 +500,14 @@ struct task : task_life {
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
 
 #define OOX_TASK_EXECUTE_LIFETIME_REF 1
+
+// Each execute() invocation owns one OOX_TASK_EXECUTE_LIFETIME_REF.
+// This RAII guard drops it on every return path
+struct execute_lifetime_guard {
+    task* self;
+    ~execute_lifetime_guard() { self->release(OOX_TASK_EXECUTE_LIFETIME_REF); }
+};
+#define OOX_TASK_EXECUTE_LIFETIME_GUARD ::oox::internal::execute_lifetime_guard oox_execute_lifetime_guard{this}
 
 struct task_node;
 struct oox_var_base;
@@ -1223,6 +1229,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using result_base = result_state<R, false>;
     using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1237,6 +1244,7 @@ template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1251,6 +1259,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );
@@ -1379,6 +1388,7 @@ template<typename T>
 #undef TASK_EXECUTE_METHOD
 #undef OOX_DEBUG_ONLY
 #undef OOX_TASK_EXECUTE_LIFETIME_REF
+#undef OOX_TASK_EXECUTE_LIFETIME_GUARD
 
 } // namespace oox
 #endif // __OOX_H__
