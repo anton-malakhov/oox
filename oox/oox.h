@@ -1176,7 +1176,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
 }
 
 void task_node::remove_prerequisite( int n ) {
-    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_release);
+    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_acq_rel);
     const auto previous_count = start_prerequisite_count(previous);
     __OOX_ASSERT(previous_count >= static_cast<std::uint32_t>(n),
                  "invalid start_count detected while removing prerequisite");
