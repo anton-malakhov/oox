@@ -427,7 +427,7 @@ struct task : task_life {
     }
     void spawn() {
         get_tf_pool().silent_async([this]{
-            this->execute();
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         });
     }
     void wait() {
@@ -462,7 +462,7 @@ struct task : task_life {
     void spawn() {
         sync::thread([this] {
             sync::preemption_point();
-            this->execute();
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         }).detach();
     }
     void wait() {
@@ -557,8 +557,8 @@ struct task : task_life {
 
 #define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
-// unfortunately, execute method is now significantly harder
-// so cleanest way is to use this
+// Each execute() invocation owns one OOX_TASK_EXECUTE_LIFETIME_REF.
+// This RAII guard drops it on every return path
 struct execute_lifetime_guard {
     task* self;
     ~execute_lifetime_guard() { self->release(OOX_TASK_EXECUTE_LIFETIME_REF); }
@@ -2006,6 +2006,7 @@ template<typename T, bool CanThrow>
 
 #undef TASK_EXECUTE_METHOD
 #undef OOX_TASK_EXECUTE_LIFETIME_REF
+#undef OOX_TASK_EXECUTE_LIFETIME_GUARD
 
 } // namespace oox
 #endif // __OOX_H__

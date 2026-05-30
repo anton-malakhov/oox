@@ -1,17 +1,15 @@
 # Copyright (C) 2021 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
-
 cmake_minimum_required(VERSION 3.12)
 
 if(NOT TARGET OOX)
-  project(OOX_BENCHMARKS_STANDALONE CXX)
-  include(CTest)
-  enable_testing()
-  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_CURRENT_BINARY_DIR}/oox-root")
-  return()
+    project(OOX_BENCHMARKS_STANDALONE CXX)
+    include(CTest)
+    enable_testing()
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_CURRENT_BINARY_DIR}/oox-root")
+    return()
 endif()
-
 include(FetchContent)
 
 if(POLICY CMP0079)
@@ -31,7 +29,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(benchmark)
 
-list(APPEND OOX_BENCHMARKS bench_loops)
+list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
 option(OOX_BUILD_TASKBENCH "Build Task-Bench-style benchmarks" ON)
 set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tasks: tbb, system, or jemalloc")
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
