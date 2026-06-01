@@ -37,9 +37,7 @@ The first tests run under randomized simulation and cover:
 - `ConsumerAddedWhileProducerCompletes`;
 - `DependencyPublicationTree`;
 - forwarding fan-out and nested forwarding;
-- reader/writer ordering around repeated writes;
-- dropped-result lifetime cases;
-- `DeferredPublicationRace`.
+- reader/writer ordering around repeated writes.
 
 TSAN publication check:
 

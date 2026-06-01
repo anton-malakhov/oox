@@ -21,12 +21,13 @@ void DeferredDiamond() {
     auto right = oox::run([](int value) { return value + 2; }, source);
     auto joined = oox::run([](int a, int b) { return a + b; }, left, right);
 
-    oox::run([](int& value) { value = 5; }, source);
+    auto writer = oox::run([](int& value) { value = 5; }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(source) == 5, "deferred source value");
     TWIST_ASSERT_M(oox::wait_and_get(left) == 6, "deferred left value");
     TWIST_ASSERT_M(oox::wait_and_get(right) == 7, "deferred right value");
     TWIST_ASSERT_M(oox::wait_and_get(joined) == 13, "deferred diamond join");
+    oox::wait_for_all(writer);
 }
 
 } // namespace

@@ -5,7 +5,6 @@
 
 #include <twist/assist/assert.hpp>
 #include <twist/assist/preempt.hpp>
-#include <twist/test/body/wg.hpp>
 
 namespace {
 
@@ -18,20 +17,22 @@ void DeferredTwoInputs() {
         return x + y;
     }, a, b);
 
-    oox::run([](int& value) { value = 3; }, b);
-    oox::run([](int& value) { value = 2; }, a);
+    auto write_b = oox::run([](int& value) { value = 3; }, b);
+    auto write_a = oox::run([](int& value) { value = 2; }, a);
 
     TWIST_ASSERT_M(oox::wait_and_get(a) == 2, "deferred input a");
     TWIST_ASSERT_M(oox::wait_and_get(b) == 3, "deferred input b");
     TWIST_ASSERT_M(oox::wait_and_get(c) == 5, "deferred two-input join");
+    oox::wait_for_all(write_a);
+    oox::wait_for_all(write_b);
 }
 
 void DeferredChainWithMultipleWriters() {
     oox::var<int> a(oox::deferred);
     auto b = oox::run([](int value) { return value + 1; }, a);
 
-    oox::run([](int& value) { value = 1; }, a);
-    oox::run([](int& value) { value = 10; }, a);
+    auto write1 = oox::run([](int& value) { value = 1; }, a);
+    auto write10 = oox::run([](int& value) { value = 10; }, a);
 
     int aval = oox::wait_and_get(a);
     int bval = oox::wait_and_get(b);
@@ -39,27 +40,30 @@ void DeferredChainWithMultipleWriters() {
     TWIST_ASSERT_M(aval == 10, "last writer must win for source");
     // Depending on scheduling, b can consume either before or after overwrite.
     TWIST_ASSERT_M(bval == 2 || bval == 11, "multiple-writers chain result");
+    oox::wait_for_all(write1);
+    oox::wait_for_all(write10);
 }
 
 void DeferredForwardingLayer() {
     oox::var<int> source(oox::deferred);
 
-    auto inner = [](oox::var<int> input) -> oox::var<int> {
+    auto inner = [](int input) -> oox::var<int> {
         return oox::run([](int v) {
             twist::assist::PreemptionPoint();
             return v + 1;
         }, input);
     };
 
-    auto outer = [inner](oox::var<int> input) -> oox::var<int> {
+    auto outer = [inner](int input) -> oox::var<int> {
         return oox::run(inner, input);  // forwarding task
     };
 
     auto result = oox::run(outer, source);
-    oox::run([](int& value) { value = 41; }, source);
+    auto writer = oox::run([](int& value) { value = 41; }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(source) == 41, "forwarding source");
     TWIST_ASSERT_M(oox::wait_and_get(result) == 42, "forwarding layer result");
+    oox::wait_for_all(writer);
 }
 
 void DeferredArrayLayered() {
@@ -72,11 +76,12 @@ void DeferredArrayLayered() {
     nodes[1] = oox::run([](int x) { return x + 1; }, nodes[0]);
     nodes[2] = oox::run([](int x) { return x + 1; }, nodes[1]);
 
-    oox::run([](int& x) { x = 100; }, nodes[0]);
+    auto writer = oox::run([](int& x) { x = 100; }, nodes[0]);
 
     TWIST_ASSERT_M(oox::wait_and_get(nodes[0]) == 100, "array layer source");
     TWIST_ASSERT_M(oox::wait_and_get(nodes[1]) == 101, "array layer mid");
     TWIST_ASSERT_M(oox::wait_and_get(nodes[2]) == 102, "array layer sink");
+    oox::wait_for_all(writer);
 }
 
 void ImmediateValueConsistency() {
@@ -92,25 +97,21 @@ void DeferredRedirectLateConsumer() {
         return value + 1;
     }, source);
 
-    oox::var<int> late;
-    twist::test::body::WaitGroup wg;
-    wg.Add(1, [&] {
-        oox::run([](int& value) {
-            twist::assist::PreemptionPoint();
-            value = 10;
-        }, source);
-    });
-    wg.Add(1, [&] {
+    auto writer = oox::run([](int& value) {
         twist::assist::PreemptionPoint();
-        late = oox::run([](int value) {
-            twist::assist::PreemptionPoint();
-            return value + 2;
-        }, source);
-    });
-    wg.Join();
+        value = 10;
+    }, source);
+
+    twist::assist::PreemptionPoint();
+
+    auto late = oox::run([](int value) {
+        twist::assist::PreemptionPoint();
+        return value + 2;
+    }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(source) == 10, "redirect source value");
     TWIST_ASSERT_M(oox::wait_and_get(early) == 11, "early consumer through deferred");
+    oox::wait_for_all(writer);
     TWIST_ASSERT_M(oox::wait_and_get(late) == 12, "late consumer through deferred redirect");
 }
 

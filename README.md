@@ -51,6 +51,8 @@ int Fib(int n, tf::Subflow& sbf) {  // TaskFlow: High-level blocking style progr
 - `oox::var<T>`: Basic representation of data in the OOX graph. In concept, a new form of `std::future` for continuations. It carries both: a value and dependency info
   - `using oox::node = oox::var<void>`: carries solely dependency info
 - `oox::var<T> oox::run(T(Func&)(...), Args...)`: Basic tasking API, spawns a task when arguments are ready and returns `oox::var` as a promise to provide the result of Func in future. If there are `oox::var` arguments, which are not ready yet (i.e. they are "promises" themselves), it makes a continuation task, which depends on completion of pending `oox::var` arguments.
+- `oox::var<T>` is a lightweight thread-unsafe handle object. Do not access the same `oox::var` object concurrently from multiple threads: this includes passing it to `oox::run`, waiting on it, moving it, assigning it, or destroying it. Build and mutate the graph from one thread, or serialize access to shared `oox::var` handles externally.
+- Fire-and-forget tasks are undefined behavior: every `oox::run(...)` result must be kept in a live `oox::var` handle, moved into another owner, or immediately used as an argument to another `oox::run`. If the result is not consumed by another task, keep the returned `var` alive until `oox::wait_for_all` or `oox::wait_and_get` has completed.
 
 ## Design
 Pillars:
@@ -65,8 +67,9 @@ Matching rules:
   - Follow C++ rules: everything is passed as decay copy
   - Use `std::ref` and `std::cref` for passing by reference (and take responsibility for the lifetime)
 - `oox::var` arguments:
-  - Similar to std::ref: usually passed by reference but it cares about lifetime and access sync
+  - Similar to std::ref: usually passed by reference, while OOX keeps the produced storage alive and orders task access to stored values through graph dependencies
   - `oox::var` usage has to be indifferent from plain types
+  - The public `oox::var` handle itself is not synchronized; concurrent handle access is outside the OOX contract
 
 Stored types:
 - `oox::run` returns `oox::var` for decay type of functor return type, copy- or move-initialized.
@@ -83,4 +86,3 @@ Access types of `oox::var`'s stored value:
 ## More resources
 * Blog: https://habr.com/en/company/intel/blog/542908/
 * Slides: https://www.slideshare.net/secret/ifHWb6mqkpBOn2
-

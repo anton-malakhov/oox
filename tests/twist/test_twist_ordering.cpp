@@ -15,7 +15,7 @@ void ReaderBetweenTwoWriters() {
         return v;
     }, value);
 
-    oox::run([](int& v) {
+    auto w1 = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 1;
     }, value);
@@ -25,7 +25,7 @@ void ReaderBetweenTwoWriters() {
         return v;
     }, value);
 
-    oox::run([](int& v) {
+    auto w2 = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 2;
     }, value);
@@ -39,6 +39,8 @@ void ReaderBetweenTwoWriters() {
     TWIST_ASSERT_M(oox::wait_and_get(r1) == 1, "middle reader sees first write");
     TWIST_ASSERT_M(oox::wait_and_get(r2) == 2, "last reader sees second write");
     TWIST_ASSERT_M(oox::wait_and_get(value) == 2, "final value after two writers");
+    oox::wait_for_all(w1);
+    oox::wait_for_all(w2);
 }
 
 void ManyReadersBeforeWriter() {
@@ -48,7 +50,7 @@ void ManyReadersBeforeWriter() {
     auto r2 = oox::run([](const int& v) { return v + 2; }, value);
     auto r3 = oox::run([](const int& v) { return v + 3; }, value);
 
-    oox::run([](int& v) {
+    auto writer = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 10;
     }, value);
@@ -57,25 +59,29 @@ void ManyReadersBeforeWriter() {
     TWIST_ASSERT_M(oox::wait_and_get(r2) == 5, "reader 2");
     TWIST_ASSERT_M(oox::wait_and_get(r3) == 6, "reader 3");
     TWIST_ASSERT_M(oox::wait_and_get(value) == 10, "writer after readers");
+    oox::wait_for_all(writer);
 }
 
 void MultipleWritersSerialize() {
     oox::var<int> value = 0;
 
-    oox::run([](int& v) {
+    auto w1 = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 1;
     }, value);
-    oox::run([](int& v) {
+    auto w2 = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 2;
     }, value);
-    oox::run([](int& v) {
+    auto w3 = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 3;
     }, value);
 
     TWIST_ASSERT_M(oox::wait_and_get(value) == 3, "multiple writers final value");
+    oox::wait_for_all(w1);
+    oox::wait_for_all(w2);
+    oox::wait_for_all(w3);
 }
 
 void MixedFanInReadyAndPending() {
@@ -87,12 +93,13 @@ void MixedFanInReadyAndPending() {
         return a + b;
     }, deferred, ready);
 
-    oox::run([](int& v) {
+    auto writer = oox::run([](int& v) {
         twist::assist::PreemptionPoint();
         v = 37;
     }, deferred);
 
     TWIST_ASSERT_M(oox::wait_and_get(sum) == 42, "mixed ready and pending fan-in");
+    oox::wait_for_all(writer);
 }
 
 } // namespace

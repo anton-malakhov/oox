@@ -9,6 +9,12 @@
 
 namespace oox_bench::taskbench {
 
+inline void wait_all_oox_vars(std::vector<oox::var<Token>>& vars) {
+  for (auto& task : vars) {
+    oox::wait_for_all(task);
+  }
+}
+
 inline RunResult run_oox(const Config& cfg) {
   Graph graph(cfg);
   const int width = graph.width();
@@ -32,9 +38,7 @@ inline RunResult run_oox(const Config& cfg) {
       }
     }
 
-    for (auto& task : tasks) {
-      oox::wait_for_all(task);
-    }
+    wait_all_oox_vars(tasks);
 
     const auto stop = clock::now();
     const double wall_s = std::chrono::duration<double>(stop - start).count();
@@ -74,9 +78,11 @@ inline RunResult run_oox(const Config& cfg) {
   }
 
   for (int graph_id = 0; graph_id < cfg.graphs; ++graph_id) {
-    for (int col = 0; col < width; ++col) {
-      oox::wait_for_all(prev[graph_id][col]);
+    wait_all_oox_vars(keepalive[graph_id]);
+    if (cfg.height > 1) {
+      wait_all_oox_vars(curr[graph_id]);
     }
+    wait_all_oox_vars(prev[graph_id]);
   }
 
   const auto stop = clock::now();

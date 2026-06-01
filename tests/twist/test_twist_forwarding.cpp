@@ -82,7 +82,7 @@ void ForwardedConsumerRegistrationRace() {
 void ForwardingThroughDeferredInput() {
     oox::var<int> source(oox::deferred);
 
-    auto inner = [](oox::var<int> input) -> oox::var<int> {
+    auto inner = [](int input) -> oox::var<int> {
         return oox::run([](int value) {
             twist::assist::PreemptionPoint();
             return value + 1;
@@ -92,13 +92,14 @@ void ForwardingThroughDeferredInput() {
     auto forwarded = oox::run(inner, source);
     auto consumer = oox::run([](int value) { return value * 2; }, forwarded);
 
-    oox::run([](int& value) {
+    auto writer = oox::run([](int& value) {
         twist::assist::PreemptionPoint();
         value = 20;
     }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(forwarded) == 21, "forwarded deferred result");
     TWIST_ASSERT_M(oox::wait_and_get(consumer) == 42, "forwarded deferred consumer");
+    oox::wait_for_all(writer);
 }
 
 } // namespace
