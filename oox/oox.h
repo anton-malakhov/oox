@@ -519,7 +519,6 @@ namespace details {
 inline constexpr std::uintptr_t k_next_writer_ready_tag = 0x1;
 inline constexpr std::uintptr_t k_next_writer_no_owner_tag = 0x3;
 inline constexpr std::uintptr_t k_forwarded_storage_ptr_tag = 0x1;
-inline constexpr std::uintptr_t k_resolved_storage_ptr_tag = 0x1;
 
 inline task_node* next_writer_ready_marker() {
     return reinterpret_cast<task_node*>(k_next_writer_ready_tag);
@@ -561,16 +560,6 @@ inline bool is_forwarded_storage_ptr(uintptr_t ptr) {
 
 inline void* decode_forwarded_storage_ptr(uintptr_t ptr) {
     return reinterpret_cast<void*>(ptr&~k_forwarded_storage_ptr_tag);
-}
-
-inline arc* encode_resolved_storage_ptr(void* ptr) {
-    __OOX_ASSERT((uintptr_t(ptr)&k_resolved_storage_ptr_tag) == 0, "resolved storage pointer is not aligned");
-    return reinterpret_cast<arc*>(uintptr_t(ptr)|k_resolved_storage_ptr_tag);
-}
-
-inline void* decode_resolved_storage_ptr(arc* ptr) {
-    __OOX_ASSERT((uintptr_t(ptr)&k_resolved_storage_ptr_tag) != 0, "resolved storage pointer is not cached");
-    return reinterpret_cast<void*>(uintptr_t(ptr)&~k_resolved_storage_ptr_tag);
 }
 
 } // namespace details
@@ -1292,7 +1281,10 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     arc forwarding_wait_arc{nullptr, 0, arc::flow_only_embedded};
     bool is_executed : 1 = false;
-    void* resolved_storage_ptr() const override { return details::decode_resolved_storage_ptr(forwarding_wait_arc.next); }
+    void* resolved_storage_ptr() const override {
+        __OOX_ASSERT(forwarding_wait_arc.next, "resolved storage pointer is not cached");
+        return reinterpret_cast<void*>(forwarding_wait_arc.next);
+    }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if 0
@@ -1320,7 +1312,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             }
         }
         __OOX_TRACE("%p do_run: notify forward",this);
-        forwarding_wait_arc.next = details::encode_resolved_storage_ptr(reinterpret_cast<var<VT>*>(&my_result)->resolved_storage_ptr());
+        forwarding_wait_arc.next = reinterpret_cast<arc*>(reinterpret_cast<var<VT>*>(&my_result)->resolved_storage_ptr());
         task_node::notify_successors<slots>();
         return nullptr;
 #endif
