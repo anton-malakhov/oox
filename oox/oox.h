@@ -371,7 +371,7 @@ struct task : task_life {
     }
     void spawn() {
         get_tf_pool().silent_async([this]{
-            this->execute(); // releases execute lifetime ref via the in-execute guard
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         });
     }
     void wait() {
@@ -406,7 +406,7 @@ struct task : task_life {
     void spawn() {
         sync::thread([this] {
             sync::preemption_point();
-            this->execute(); // releases execute lifetime ref via the in-execute guard
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         }).detach();
     }
     void wait() {
@@ -499,14 +499,13 @@ struct task : task_life {
 };
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
 
-inline constexpr int k_execute_lifetime_ref = 1;
-inline constexpr int k_embedded_arc_lifetime_ref = 1;
+#define OOX_TASK_EXECUTE_LIFETIME_REF 1
 
-// Each execute() invocation owns one k_execute_lifetime_ref. Forwarding
-// continuations add the next execute ref before publishing their wait arc.
+// Each execute() invocation owns one OOX_TASK_EXECUTE_LIFETIME_REF.
+// This RAII guard drops it on every return path
 struct execute_lifetime_guard {
     task* self;
-    ~execute_lifetime_guard() { self->release(k_execute_lifetime_ref); }
+    ~execute_lifetime_guard() { self->release(OOX_TASK_EXECUTE_LIFETIME_REF); }
 };
 #define OOX_TASK_EXECUTE_LIFETIME_GUARD ::oox::internal::execute_lifetime_guard oox_execute_lifetime_guard{this}
 
@@ -733,7 +732,6 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         // - test_twist_lifetime / ChainedResultDestroyedWhileChildPending: 24 byte(s), 1 allocation(s) of arc
         // Arc is deleted in this loop unless ownership is transferred via n->add_arc(j).
         bool delete_arc = true;
-        bool release_embedded_arc_ref = false;
 
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
@@ -743,7 +741,6 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         } else {
             if (j->kind == arc::flow_only_embedded) {
                 delete_arc = false;
-                release_embedded_arc_ref = true;
             }
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
@@ -767,9 +764,6 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         }
         if (delete_arc) {
             delete j;
-        }
-        if (release_embedded_arc_ref) {
-            n->release(k_embedded_arc_lifetime_ref);
         }
     } while( r );
 }
@@ -1302,13 +1296,13 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             j->node = this;
             j->port = arc::port_int(0);
             j->kind = arc::flow_only_embedded;
-            this->life_add_count(k_execute_lifetime_ref + k_embedded_arc_lifetime_ref);
+            this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
             if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
                 __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
                 return nullptr;
             }
             else {
-                this->release(k_execute_lifetime_ref + k_embedded_arc_lifetime_ref);
+                this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
             }
         }
         __OOX_TRACE("%p do_run: notify forward",this);
@@ -1327,7 +1321,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), k_execute_lifetime_ref + slots + 1); return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1); return oox;
     }
 };
 template<>
@@ -1335,7 +1329,7 @@ struct gen_oox<void> {
     using type = var<void>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, void> * t) {
-        type oox; oox.bind_to( t, t, k_execute_lifetime_ref + slots ); return oox;
+        type oox; oox.bind_to( t, t, OOX_TASK_EXECUTE_LIFETIME_REF + slots ); return oox;
     }
 };
 template< typename VT >
@@ -1343,7 +1337,7 @@ struct gen_oox<var<VT> > {
     using type = var<VT>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
-        type oox; oox.bind_to( t, &t->my_result, k_execute_lifetime_ref + slots + 1, true ); return oox;
+        type oox; oox.bind_to( t, &t->my_result, OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1, true ); return oox;
     }
 };
 template< typename T>
