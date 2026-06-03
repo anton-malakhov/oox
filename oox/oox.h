@@ -511,7 +511,6 @@ struct execute_lifetime_guard {
 
 struct task_node;
 struct oox_var_base;
-struct arc;
 
 namespace details {
 
@@ -1277,7 +1276,7 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     bool is_executed : 1 = false;
     void* resolved_storage_ptr() const override {
         __OOX_ASSERT(forwarding_wait_arc.next, "resolved storage pointer is not cached");
-        return reinterpret_cast<void*>(forwarding_wait_arc.next);
+        return forwarding_wait_arc.next;
     }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
