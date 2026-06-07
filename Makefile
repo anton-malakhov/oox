@@ -13,7 +13,7 @@ NUMACTL := $(shell command -v numactl >/dev/null 2>&1 && echo "numactl -N 0")
 all: release test bench_fib
 
 release:
-	cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j$(NPROC)
+	cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DOOX_ALLOCATOR=tbb && cmake --build build -j$(NPROC)
 
 debug:
 	cmake -B build_debug -S . -DCMAKE_BUILD_TYPE=Debug && cmake --build build_debug -j$(NPROC)

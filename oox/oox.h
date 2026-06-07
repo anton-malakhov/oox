@@ -1291,8 +1291,8 @@ struct oox_var_base {
 
     struct current_port_and_flags_t {
         std::uint16_t port : k_port_bits;
-        bool is_forwarded : 1;
-        bool is_deferred : 1;
+        std::uint16_t is_forwarded : 1;
+        std::uint16_t is_deferred : 1;
     };
     static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
                   "oox::var packed port/flags must stay 16-bit");
