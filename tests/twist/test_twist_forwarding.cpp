@@ -52,6 +52,29 @@ void ForwardedFanOut() {
     TWIST_ASSERT_M(oox::wait_and_get(joined) == 132, "forwarded fanout join");
 }
 
+void NestedForwardedArgument() {
+    auto leaf = [](int value) -> oox::var<int> {
+        return oox::run([](int x) {
+            twist::assist::PreemptionPoint();
+            return x + 1;
+        }, value);
+    };
+
+    auto middle = [leaf](int value) -> oox::var<int> {
+        return oox::run(leaf, value);
+    };
+
+    auto outer = [middle](int value) -> oox::var<int> {
+        return oox::run(middle, value);
+    };
+
+    auto forwarded = oox::run(outer, 40);
+    auto consumer = oox::run([](int value) { return value * 2; }, forwarded);
+
+    TWIST_ASSERT_M(oox::wait_and_get(forwarded) == 41, "nested forwarded base");
+    TWIST_ASSERT_M(oox::wait_and_get(consumer) == 82, "nested forwarded consumer");
+}
+
 void ForwardedConsumerRegistrationRace() {
     auto make_forwarded = []() -> oox::var<int> {
         return oox::run([] {
@@ -82,7 +105,7 @@ void ForwardedConsumerRegistrationRace() {
 void ForwardingThroughDeferredInput() {
     oox::var<int> source(oox::deferred);
 
-    auto inner = [](oox::var<int> input) -> oox::var<int> {
+    auto inner = [](int input) -> oox::var<int> {
         return oox::run([](int value) {
             twist::assist::PreemptionPoint();
             return value + 1;
@@ -92,13 +115,14 @@ void ForwardingThroughDeferredInput() {
     auto forwarded = oox::run(inner, source);
     auto consumer = oox::run([](int value) { return value * 2; }, forwarded);
 
-    oox::run([](int& value) {
+    auto writer = oox::run([](int& value) {
         twist::assist::PreemptionPoint();
         value = 20;
     }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(forwarded) == 21, "forwarded deferred result");
     TWIST_ASSERT_M(oox::wait_and_get(consumer) == 42, "forwarded deferred consumer");
+    oox::wait_for_all(writer);
 }
 
 } // namespace
@@ -106,6 +130,7 @@ void ForwardingThroughDeferredInput() {
 int main() {
     oox::twist_tests::RunRandomSeeds("NestedForwardingChain", NestedForwardingChain);
     oox::twist_tests::RunRandomSeeds("ForwardedFanOut", ForwardedFanOut);
+    oox::twist_tests::RunRandomSeeds("NestedForwardedArgument", NestedForwardedArgument);
     oox::twist_tests::RunRandomSeeds("ForwardedConsumerRegistrationRace", ForwardedConsumerRegistrationRace);
     oox::twist_tests::RunRandomSeeds("ForwardingThroughDeferredInput", ForwardingThroughDeferredInput);
 

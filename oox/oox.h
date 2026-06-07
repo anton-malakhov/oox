@@ -556,8 +556,8 @@ inline bool is_forwarded_storage_ptr(uintptr_t ptr) {
     return ptr&k_forwarded_storage_ptr_tag;
 }
 
-inline void** decode_forwarded_storage_ptr(uintptr_t ptr) {
-    return reinterpret_cast<void**>(ptr&~k_forwarded_storage_ptr_tag);
+inline void* decode_forwarded_storage_ptr(uintptr_t ptr) {
+    return reinterpret_cast<void*>(ptr&~k_forwarded_storage_ptr_tag);
 }
 
 } // namespace details
@@ -577,6 +577,7 @@ struct arc {
     // types of task relations beside output dependence
     enum kinds : char {
         flow_only,    //< notify consumer when producer is completed
+        flow_only_embedded, //< flow_only arc owned by its task object
         back_only,    //< notify producer when consumer is completed TODO: unnecessary when stored in task directly
         flow_back,    //< flow_only then back_only
         flow_copy,    //< call consumer to copy its value when producer is completed
@@ -660,6 +661,10 @@ struct task_node : public task, arc_list {
 
     // It is called when producer is done and notifies consumers to copy the value
     virtual void on_ready(int) { __OOX_ASSERT(false, "not implemented"); }
+
+    // Forwarding tasks override this to expose the final resolved result storage pointer.
+    // Must be valid once task completion is published to consumers.
+    virtual void* resolved_storage_ptr() const { __OOX_ASSERT(false, "not a forwarding task"); return nullptr; }
 };
 
 bool arc_list::add_arc( arc* i ) {
@@ -733,6 +738,9 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
             if( int k = n->remove_back_arc( j->port ) )
                 n->release( k );
         } else {
+            if (j->kind == arc::flow_only_embedded) {
+                delete_arc = false;
+            }
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
                 // Add back arc so that "n" can notify this when it is done consuming the value.
@@ -945,6 +953,14 @@ struct oox_var_base {
         storage_offset = uintptr_t(storage_ptr) - uintptr_t(current_task);
         t->life_set_count(lifetime);
         __OOX_TRACE("%p bind: store=%p life=%d fwd=%d deferred=%d",t,ptr,lifetime,fwd,deferred);
+    }
+    void* resolved_storage_ptr() const {
+        if (current_port_and_flags.is_forwarded) {
+            __OOX_ASSERT(current_task, "forwarded var has null current_task");
+            return current_task->resolved_storage_ptr();
+        }
+        __OOX_ASSERT(storage_ptr, "var has null storage_ptr");
+        return storage_ptr;
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
@@ -1162,8 +1178,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         } else
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
         if( cov.current_port_and_flags.is_forwarded ) {
-            oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = details::encode_forwarded_storage_ptr(&next.storage_ptr);
+            my_ptr = details::encode_forwarded_storage_ptr(cov.storage_ptr);
         } else
             my_ptr = (uintptr_t)cov.storage_ptr;
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
@@ -1173,8 +1188,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
     C&& consume() {
         internal::result_state<ooxed_type, false>* state = nullptr;
         if( details::is_forwarded_storage_ptr(my_ptr) ) {
-            void* p = *details::decode_forwarded_storage_ptr(my_ptr);
-            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
+            auto* base = reinterpret_cast<oox_var_base*>(details::decode_forwarded_storage_ptr(my_ptr));
+            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(base->resolved_storage_ptr());
         } else {
             state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
         }
@@ -1257,7 +1272,12 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     // TODO: NRVO optimized forwarding
     using storage_task<slots, F>::storage_task;
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
+    arc forwarding_wait_arc{nullptr, 0, arc::flow_only_embedded};
     bool is_executed : 1 = false;
+    void* resolved_storage_ptr() const override {
+        __OOX_ASSERT(forwarding_wait_arc.next, "resolved storage pointer is not cached");
+        return forwarding_wait_arc.next;
+    }
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if 0
@@ -1270,7 +1290,11 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             new(&my_result) var<VT>( this->value()() );
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
-            arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
+            arc* j = &forwarding_wait_arc;
+            j->next = nullptr;
+            j->node = this;
+            j->port = arc::port_int(0);
+            j->kind = arc::flow_only_embedded;
             this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
             if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
                 __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
@@ -1278,10 +1302,10 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             }
             else {
                 this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
-                delete j;
             }
         }
         __OOX_TRACE("%p do_run: notify forward",this);
+        forwarding_wait_arc.next = reinterpret_cast<arc*>(reinterpret_cast<var<VT>*>(&my_result)->resolved_storage_ptr());
         task_node::notify_successors<slots>();
         return nullptr;
 #endif
@@ -1369,15 +1393,8 @@ template<typename T>
     auto &v = const_cast<var<T>&>(ov);
     wait_for_all(v);
 
-    // Follow forwarding chain until we reach a non-forward var
-    internal::oox_var_base* base = &v;
-    while (base->current_port_and_flags.is_forwarded) {
-        __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
-        base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
-    }
-
-    __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
-    return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
+    // Forwarding tasks cache the final result storage before publishing readiness.
+    return static_cast<internal::result_state<T, false>*>(v.resolved_storage_ptr())->value();
 }
 
 template<typename T>
@@ -1387,7 +1404,6 @@ template<typename T>
 
 #undef TASK_EXECUTE_METHOD
 #undef OOX_DEBUG_ONLY
-#undef OOX_TASK_EXECUTE_LIFETIME_REF
 #undef OOX_TASK_EXECUTE_LIFETIME_GUARD
 
 } // namespace oox

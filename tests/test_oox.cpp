@@ -123,6 +123,26 @@ TEST(OOX, ConsistencyInfLoop) {
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
 }
 
+TEST(OOX, NestedForwardedArgument) {
+    auto leaf = [](int value) -> oox::var<int> {
+        return oox::run([](int x) { return x + 1; }, value);
+    };
+
+    auto middle = [leaf](int value) -> oox::var<int> {
+        return oox::run(leaf, value);
+    };
+
+    auto outer = [middle](int value) -> oox::var<int> {
+        return oox::run(middle, value);
+    };
+
+    auto forwarded = oox::run(outer, 40);
+    auto consumer = oox::run([](int value) { return value * 2; }, forwarded);
+
+    ASSERT_EQ(oox::wait_and_get(forwarded), 41);
+    ASSERT_EQ(oox::wait_and_get(consumer), 82);
+}
+
 
 TEST(OOX, DeferredChain) {
     oox::var<int> a(oox::deferred);
