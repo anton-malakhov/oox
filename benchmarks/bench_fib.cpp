@@ -188,21 +188,21 @@ BENCHMARK(Fib_TF)->Unit(benchmark::kMillisecond)->UseRealTime()->DenseRange(cuto
 #endif //HAVE_TF
 
 #include <atomic>
-#include <memory>
 
 namespace InjectToken {
-    using stop_flag = std::shared_ptr<std::atomic<bool>>;
+    using stop_flag = std::atomic<bool>&;
     inline int leaf_or_stop(volatile int n, stop_flag stop) {
-        if (stop->load(std::memory_order_relaxed)) return 0;
+        if (stop.load(std::memory_order_relaxed)) return 0;
         return Serial::Fib(n);
     }
     oox::var<int> Fib(volatile int n, stop_flag stop) {
         if (n < cutoff) {
-            return oox::run([stop](volatile int nn) {
-                return leaf_or_stop(nn, stop);
+            auto* stop_ptr = &stop;
+            return oox::run([stop_ptr](volatile int nn) {
+                return leaf_or_stop(nn, *stop_ptr);
             }, n);
         }
-        if (stop->load(std::memory_order_relaxed)) {
+        if (stop.load(std::memory_order_relaxed)) {
             return oox::run([]() -> int { return 0; });
         }
         auto left  = Fib(n - 1, stop);
@@ -214,9 +214,9 @@ namespace InjectToken {
 static void Fib_TokenCancel(benchmark::State& state) {
     cutoff = state.range(0);
     for (auto _ : state) {
-        auto stop = std::make_shared<std::atomic<bool>>(false);
+        std::atomic<bool> stop{false};
         auto root = InjectToken::Fib(FibN + cutoff, stop);
-        stop->store(true, std::memory_order_relaxed);
+        stop.store(true, std::memory_order_relaxed);
         auto v = oox::wait_and_get(root);
         benchmark::DoNotOptimize(v);
     }
