@@ -195,7 +195,7 @@ namespace InjectToken {
     oox::var<int> Fib(volatile int n, stop_flag stop) {
         if (n < cutoff) return Serial::Fib(n);
         if (stop.load(std::memory_order_relaxed)) {
-            return oox::run([]() -> int { return 0; });
+            return 0;
         }
         auto left  = Fib(n - 1, stop);
         auto right = Fib(n - 2, stop);
