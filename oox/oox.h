@@ -743,6 +743,12 @@ struct arc_list {
     arc_list() = default;
     ~arc_list() {
         arc* h = head.load(std::memory_order_relaxed);
+#if OOX_EXCEPTIONS_ENABLED
+        if (h && details::is_terminal_exception_arc(h)) {
+            delete details::terminal_exception_arc(h);
+            return;
+        }
+#endif
         __OOX_ASSERT(!h || details::is_task_done_marker(h) || details::is_deferred_redirect(h),
                      "destroying task with pending successor arcs");
         if (h && details::is_deferred_redirect(h)) {
@@ -782,18 +788,12 @@ struct task_node : public task, arc_list {
     bool store_exception_control(exception_control control) noexcept;
     exception_control local_exception_control_handle() const noexcept;
     std::exception_ptr local_exception() const noexcept;
-    exception_control incoming_exception_control_handle() const noexcept;
-    void destroy_terminal_exception_arc() noexcept;
 #else
     void cancel() noexcept {}
 #endif
 
     task_node() { } // prepare the task for waiting on it directly
-    virtual ~task_node() {
-#if OOX_EXCEPTIONS_ENABLED
-        destroy_terminal_exception_arc();
-#endif
-    }
+    virtual ~task_node() = default;
 
     // Result output node
     inline output_node& out(int n) const;
@@ -937,7 +937,7 @@ bool task_node::store_exception_control(exception_control control) noexcept {
     return false;
 }
 
-exception_control task_node::incoming_exception_control_handle() const noexcept {
+exception_control task_node::local_exception_control_handle() const noexcept {
     // Exception-path lookup only. exception_signal currently lives in the same
     // lock-free stack as successor arcs, so late consumers can be pushed above
     // it. Normal success/cancellation paths must not call this scan.
@@ -954,23 +954,11 @@ exception_control task_node::incoming_exception_control_handle() const noexcept 
     return {};
 }
 
-exception_control task_node::local_exception_control_handle() const noexcept {
-    return incoming_exception_control_handle();
-}
-
 std::exception_ptr task_node::local_exception() const noexcept {
     if (auto control = local_exception_control_handle()) {
         return control->exception;
     }
     return std::exception_ptr{};
-}
-
-void task_node::destroy_terminal_exception_arc() noexcept {
-    arc* h = head.load(std::memory_order_relaxed);
-    if (details::is_terminal_exception_arc(h)) {
-        delete details::terminal_exception_arc(h);
-        head.store(details::task_done_marker(), std::memory_order_relaxed);
-    }
 }
 
 void task_node::publish_failure_from(task_node* source, int source_port) noexcept {
