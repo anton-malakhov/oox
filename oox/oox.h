@@ -1186,8 +1186,8 @@ void task_node::remove_prerequisite( int n ) {
         const auto updated = previous - static_cast<std::uint32_t>(n);
         if (updated & (start_dependency_cancelled_bit | start_exception_bit)) {
             // Task will not execute(), so balance the bind-acquired execute ref.
-            release(OOX_TASK_EXECUTE_LIFETIME_REF);
             notify_successors_virtual();
+            release(OOX_TASK_EXECUTE_LIFETIME_REF);
             return;
         }
 #endif
@@ -1243,11 +1243,7 @@ void task_node::notify_successors() {
     int counters[slots];
     int n = notify_successors<CanThrow>( slots, counters );
     wakeup();
-    // With user-cancel, execute() can still run and wake a waiter that
-    // immediately drops the last ref. A trailing release(0) would then touch
-    // lifetime atomics on a reclaimed task which is UB, so skip zero-releases.
-    if( n )
-        release(n);
+    release(n);
 }
 
 template<int N>
