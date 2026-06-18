@@ -701,7 +701,11 @@ inline arc* task_done_marker() {
 }
 
 inline bool is_task_done_marker(arc* h) {
+#if OOX_EXCEPTIONS_ENABLED
+    return is_done_arc_head(h);
+#else
     return reinterpret_cast<uintptr_t>(h) == k_task_done_tag;
+#endif
 }
 
 inline bool is_deferred_redirect(arc* h) {
@@ -778,7 +782,6 @@ struct task_node : public task, arc_list {
     bool has_start_failure() const noexcept;
     bool has_non_user_start_failure() const noexcept;
     void set_exception(std::exception_ptr ep) noexcept;
-    void cancel() noexcept;
     void throw_failure_for_port(int port) const;
     bool mark_failure(std::uint32_t failure_bit) noexcept;
     std::uint32_t failure_bits() const noexcept;
@@ -788,10 +791,10 @@ struct task_node : public task, arc_list {
     bool store_exception_control(exception_control control) noexcept;
     exception_control local_exception_control_handle() const noexcept;
     std::exception_ptr local_exception() const noexcept;
+    void cancel() noexcept;
 #else
     void cancel() noexcept {}
 #endif
-
     task_node() { } // prepare the task for waiting on it directly
     virtual ~task_node() = default;
 
@@ -1135,8 +1138,8 @@ int task_node::notify_successors( int output_slots, int *count ) {
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
 
-#if OOX_EXCEPTIONS_ENABLED
     arc* terminal = details::task_done_marker();
+#if OOX_EXCEPTIONS_ENABLED
     if constexpr (CanThrow) {
         if (start_count.load(std::memory_order_acquire) & start_exception_bit) {
             // This is the only completion path that pays for a terminal arc. The
@@ -1149,8 +1152,6 @@ int task_node::notify_successors( int output_slots, int *count ) {
             }
         }
     }
-#else
-    arc* terminal = details::task_done_marker();
 #endif
 
    sync::preemption_point();
@@ -1335,21 +1336,12 @@ struct oox_var_base {
         // - either a constant storage_task, or
         // - a completed functional_task.
         arc* h = current_task->head.load(std::memory_order_acquire);
-#if OOX_EXCEPTIONS_ENABLED
-        if (details::is_done_arc_head(h)
-#else
-        if (details::is_task_done_marker(h)
-#endif
-           ) {
+        if (details::is_task_done_marker(h)) {
             return;
         }
         current_task->wait();
         h = current_task->head.load(std::memory_order_acquire);
-#if OOX_EXCEPTIONS_ENABLED
-        __OOX_ASSERT(details::is_done_arc_head(h), "wait returned before task completed");
-#else
         __OOX_ASSERT(details::is_task_done_marker(h), "wait returned before task completed");
-#endif
     }
     void cancel_current_task() noexcept {
 #if OOX_EXCEPTIONS_ENABLED
@@ -1675,14 +1667,12 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
             }
-        } else {
+        } else
+#endif
+        {
             result_base::emplace(this->functor_base::value()());
             task_node::notify_successors<slots, false>();
         }
-#else
-        result_base::emplace(this->functor_base::value()());
-        task_node::notify_successors<slots, true>();
-#endif
         return nullptr;
     }
     ~functional_task() {
@@ -1713,14 +1703,12 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
             }
-        } else {
+        } else
+#endif
+        {
             this->functor_base::value()();
             task_node::notify_successors<slots, false>();
         }
-#else
-        this->functor_base::value()();
-        task_node::notify_successors<slots, true>();
-#endif
         return nullptr;
     }
     ~functional_task() override {}
@@ -1781,22 +1769,15 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 task_node::notify_successors<slots, true>();
                 return nullptr;
             }
-        } else {
+        } else
+#endif
+        {
             if ( !result_base::has_value() && this->try_forward_result() ) {
                 return nullptr;
             }
         }
-#else
-        if ( !result_base::has_value() && this->try_forward_result() ) {
-            return nullptr;
-        }
-#endif
         __OOX_TRACE("%p do_run: notify forward",this);
-#if OOX_EXCEPTIONS_ENABLED
-        task_node::notify_successors<slots, false>();
-#else
-        task_node::notify_successors<slots, true>();
-#endif
+        task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
         return nullptr;
     }
 
