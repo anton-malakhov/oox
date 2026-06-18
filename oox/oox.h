@@ -16,15 +16,6 @@
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif
 
-#if HAVE_TWIST
-#include <mutex>
-#include <twist/assist/assert.hpp>
-#include <twist/assist/preempt.hpp>
-#include <twist/ed/std/atomic.hpp>
-#include <twist/ed/std/condition_variable.hpp>
-#include <twist/ed/std/mutex.hpp>
-#include <twist/ed/std/thread.hpp>
-#endif
 #if OOX_EXCEPTIONS_ENABLED
 #include <exception>
 #endif
@@ -44,16 +35,12 @@
 #include <folly/fibers/FiberManagerMap.h>
 #include <folly/fibers/FiberManagerInternal.h>
 #include <folly/fibers/SimpleLoopController.h>
+#elif HAVE_EIGEN_WS
+#include "include/eigen/nonblocking_thread_pool.h"
 #else
 #include <future>
 #endif
 
-#if HAVE_TWIST && OOX_TWIST_TEST
-#ifndef __OOX_ASSERT
-#define __OOX_ASSERT(cond, msg) TWIST_ASSERT_M((cond), (msg))
-#define __OOX_ASSERT_EX(cond, msg) TWIST_ASSERT_M((cond), (msg))
-#endif
-#endif
 #ifndef __OOX_TRACE
 #define __OOX_TRACE(...)
 #endif
@@ -61,11 +48,6 @@
 #include <cassert>
 #define __OOX_ASSERT(a, b) assert(a), b
 #define __OOX_ASSERT_EX(a, b) __OOX_ASSERT(a, b)
-#endif
-#if !defined(NDEBUG) || (HAVE_TWIST && OOX_TWIST_TEST)
-#define OOX_DEBUG_ONLY(...) do { __VA_ARGS__; } while (false)
-#else
-#define OOX_DEBUG_ONLY(...) do { } while (false)
 #endif
 
 namespace oox {
@@ -76,47 +58,16 @@ inline constexpr deferred_t deferred{};
 namespace internal {
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
-inline constexpr std::uintptr_t k_task_deferred_redirect_tag = 0x2;
-inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_deferred_redirect_tag;
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag;
 inline constexpr unsigned char k_result_state_empty = 0;
 inline constexpr unsigned char k_result_state_cancelled = 1;
 inline constexpr unsigned char k_result_state_value = 2;
 inline constexpr unsigned char k_result_state_exception = 3;
 
-namespace sync {
-
-#if HAVE_TWIST
-
-template <typename T>
-using atomic = twist::ed::std::atomic<T>;
-
-using mutex = twist::ed::std::mutex;
-using condition_variable = twist::ed::std::condition_variable;
-using thread = twist::ed::std::thread;
-
-inline void preemption_point() {
-    twist::assist::PreemptionPoint();
-}
-
-#else
-
-template <typename T>
-using atomic = std::atomic<T>;
-
-inline void preemption_point() {}
-
-#endif
-
-} // namespace sync
-
 struct task_life {
     // Pointers to this structure and live output nodes
-    sync::atomic<int> life_count{0};
+    std::atomic<int> life_count;
     virtual ~task_life() = default;
-
-    void life_add_count(int lifetime) {
-        life_count.fetch_add(lifetime, std::memory_order_release);
-    }
 
     void life_set_count(int lifetime) {
         life_count.store(lifetime, std::memory_order_release);
@@ -370,8 +321,12 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
+        // Without this guard, concurrent release() on dependency edges can reclaim
+        // the task object before execute() reaches its own release path.
+        life_count.fetch_add(1, std::memory_order_acq_rel);
         get_tf_pool().silent_async([this]{
-            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
+            this->execute();
+            this->release(1);
         });
     }
     void wait() {
@@ -381,44 +336,6 @@ struct task : task_life {
       std::call_once(wakeup_once, [this] {
         waiter.set_value();
       });
-    }
-};
-#elif HAVE_TWIST /////////////////////// Twist ///////////////////////////////////////
-#define OOX_USING_TWIST
-#define TASK_EXECUTE_METHOD void* execute() override
-
-struct task : task_life {
-    sync::mutex waiter_mutex;
-    sync::condition_variable waiter_cv;
-    bool completed = false;
-
-    virtual ~task() = default;
-    virtual void* execute() = 0;
-
-    void release( int n = 1 ) {
-        if(life_release(n))
-            delete this;
-    }
-    template<typename T, typename... Args>
-    static T* allocate(Args && ... args) {
-        return new T(std::forward<Args>(args)...);
-    }
-    void spawn() {
-        sync::thread([this] {
-            sync::preemption_point();
-            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
-        }).detach();
-    }
-    void wait() {
-        std::unique_lock<sync::mutex> lock(waiter_mutex);
-        waiter_cv.wait(lock, [this] { return completed; });
-    }
-    void wakeup() {
-        {
-            std::lock_guard<sync::mutex> lock(waiter_mutex);
-            completed = true;
-        }
-        waiter_cv.notify_all();
     }
 };
 #elif HAVE_FOLLY /////////////////////// Folly ///////////////////////////////////////
@@ -469,6 +386,68 @@ struct task : task_life {
         baton.post();
     }
 };
+
+#elif HAVE_EIGEN_WS /////////////////////// EIGEN ////////////////////////////////////////
+#define OOX_USING_EIGEN
+#define TASK_EXECUTE_METHOD void* execute() override
+
+Eigen::ThreadPool& get_eigen_pool() {
+    static Eigen::ThreadPool* pool = []{
+        int n = (std::thread::hardware_concurrency());
+        std::cerr << "Creating Eigen pool with threads = " << n << std::endl;
+        return new Eigen::ThreadPool(n);
+    }();
+    return *pool;
+}
+struct task : task_life {
+
+    std::atomic<bool> done{false};
+
+    virtual ~task() = default;
+    virtual void* execute() = 0;
+
+    void release(int n = 1) {
+        if (life_release(n))
+            delete this;
+    }
+
+    template<typename T, typename... Args>
+    static T* allocate(Args&&... args) {
+        return new T(std::forward<Args>(args)...);
+    }
+
+    void spawn() {
+        // удерживаем жизнь
+        life_count.fetch_add(1, std::memory_order_acq_rel);
+        assert(this != nullptr);
+
+
+        auto* self = this;
+
+        get_eigen_pool().Schedule(Eigen::MakeTask([self] {
+            self->execute();
+            // self->release(1);  // release после выполнения
+        }));
+    }
+
+    void wait() {
+        auto& pool = get_eigen_pool();
+
+        // helping loop (ВАЖНО)
+        while (!done.load(std::memory_order_acquire)) {
+            // пытаемся выполнить чужую задачу
+            if (!pool.TryExecuteSomething()) {
+                // если нечего делать — немного уступаем CPU
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    void wakeup() {
+        done.store(true, std::memory_order_release);
+    }
+};
+
 #else /////////////////////////////// plain STD impl /////////////////////////////////
 #define OOX_USING_STD
 #define TASK_EXECUTE_METHOD void* execute() override
@@ -499,78 +478,21 @@ struct task : task_life {
 };
 #endif // HAVE_TBB,TF ////////////////////////////////////////////////////////////////
 
-#define OOX_TASK_EXECUTE_LIFETIME_REF 1
-
-// Each execute() invocation owns one OOX_TASK_EXECUTE_LIFETIME_REF.
-// This RAII guard drops it on every return path
-struct execute_lifetime_guard {
-    task* self;
-    ~execute_lifetime_guard() { self->release(OOX_TASK_EXECUTE_LIFETIME_REF); }
-};
-#define OOX_TASK_EXECUTE_LIFETIME_GUARD ::oox::internal::execute_lifetime_guard oox_execute_lifetime_guard{this}
-
 struct task_node;
 struct oox_var_base;
 
-namespace details {
-
-inline constexpr std::uintptr_t k_next_writer_ready_tag = 0x1;
-inline constexpr std::uintptr_t k_next_writer_no_owner_tag = 0x3;
-inline constexpr std::uintptr_t k_forwarded_storage_ptr_tag = 0x1;
-
-inline task_node* next_writer_ready_marker() {
-    return reinterpret_cast<task_node*>(k_next_writer_ready_tag);
-}
-
-inline task_node* next_writer_no_owner_marker() {
-    return reinterpret_cast<task_node*>(k_next_writer_no_owner_tag);
-}
-
-inline bool is_tagged_next_writer(task_node* p) {
-    return uintptr_t(p)&k_next_writer_ready_tag;
-}
-
-inline bool is_next_writer_ready_marker(task_node* p) {
-    return uintptr_t(p) == k_next_writer_ready_tag;
-}
-
-inline bool is_next_writer_no_owner_marker(task_node* p) {
-    return uintptr_t(p) == k_next_writer_no_owner_tag;
-}
-
-inline task_node* encode_next_writer_owner(task_node* owner) {
-    __OOX_ASSERT((uintptr_t(owner)&k_next_writer_ready_tag) == 0, "next-writer owner pointer is not aligned");
-    return reinterpret_cast<task_node*>(uintptr_t(owner)|k_next_writer_ready_tag);
-}
-
-inline task_node* decode_next_writer_owner(task_node* owner) {
-    return reinterpret_cast<task_node*>(uintptr_t(owner)&~k_next_writer_ready_tag);
-}
-
-inline uintptr_t encode_forwarded_storage_ptr(void* ptr) {
-    __OOX_ASSERT((uintptr_t(ptr)&k_forwarded_storage_ptr_tag) == 0, "forwarded storage pointer is not aligned");
-    return uintptr_t(ptr)|k_forwarded_storage_ptr_tag;
-}
-
-inline bool is_forwarded_storage_ptr(uintptr_t ptr) {
-    return ptr&k_forwarded_storage_ptr_tag;
-}
-
-inline void** decode_forwarded_storage_ptr(uintptr_t ptr) {
-    return reinterpret_cast<void**>(ptr&~k_forwarded_storage_ptr_tag);
-}
-
-} // namespace details
-
 struct output_node {
     // 0 if next writer is not known yet.
-    // details::next_writer_ready_marker() if value is available and countdown includes extra one.
-    // details::next_writer_no_owner_marker() if next writer is end without var ownership.
-    // details::encode_next_writer_owner(ptr) if next writer is end with var ownership.
+    // 1 if next writer is not known yet, but value is available and countdown includes extra one
+    // 3 if next writer is end without var ownership
+    // ptr|1 if next writer is end with var ownership, ptr points to var storage.
     // Otherwise points to next node that overwrites the value written by this node.
-    sync::atomic<task_node*> next_writer{nullptr};
-    sync::atomic<int> countdown{1};
-    output_node() = default;
+    std::atomic<task_node*> next_writer;
+    std::atomic<int> countdown;
+    output_node() {
+        next_writer.store(nullptr, std::memory_order_relaxed);
+        countdown.store(1, std::memory_order_relaxed);
+    }
 };
 
 struct arc {
@@ -590,42 +512,20 @@ struct arc {
     arc( task_node* n, int p, kinds k = flow_back ) : node(n), port(port_int(p)), kind(k) {}
 };
 
-inline bool is_arc_list_tagged(arc* p) {
-    return uintptr_t(p)&k_task_tag_mask;
-}
-
-inline arc* encode_deferred_redirect_arc(arc* p) {
-    __OOX_ASSERT((uintptr_t(p)&k_task_tag_mask) == 0, "deferred redirect descriptor is not aligned");
-    return reinterpret_cast<arc*>(uintptr_t(p)|k_task_deferred_redirect_tag);
-}
-
-inline arc* decode_deferred_redirect_arc(arc* p) {
-    __OOX_ASSERT((uintptr_t(p)&k_task_deferred_redirect_tag) != 0, "not a deferred redirect descriptor");
-    return reinterpret_cast<arc*>(uintptr_t(p)&~k_task_tag_mask);
-}
-
 struct arc_list {
     // Root of list of nodes that are waiting for this node's value to be produced.
     // A node can be waiting for *this to produce a value OR waiting for *this to consume its value.
     // Special value 1 means no need to wait (e.g. value has been produced).
-    sync::atomic<arc*> head{nullptr};
+    std::atomic<arc*> head;
     // Add i to arc_list.
     // Return true if success, false otherwise.
     bool add_arc( arc* i );
-    arc_list() = default;
-    ~arc_list() {
-        arc* h = head.load(std::memory_order_relaxed);
-        __OOX_ASSERT(!h || h == (arc*)k_task_done_tag || (uintptr_t(h)&k_task_deferred_redirect_tag),
-                     "destroying task with pending successor arcs");
-        if (h && (uintptr_t(h)&k_task_deferred_redirect_tag)) {
-            delete decode_deferred_redirect_arc(h);
-        }
-    }
+    arc_list() { head.store(nullptr, std::memory_order_relaxed); }
 };
 
 struct task_node : public task, arc_list {
     // Prerequisites to start the task
-    sync::atomic<int> start_count{0};
+    std::atomic<int> start_count;
     // TODO: exception storage here?
 
     task_node() { } // prepare the task for waiting on it directly
@@ -665,15 +565,12 @@ struct task_node : public task, arc_list {
 bool arc_list::add_arc( arc* i ) {
     __OOX_ASSERT( uintptr_t(i->node)>2, "" );
     for(;;) {
-        sync::preemption_point();
         arc* j = head.load(std::memory_order_acquire);
-        if( is_arc_list_tagged(j) )
+        if( j==(arc*)k_task_done_tag )
             return false;
         i->next = j;
-        sync::preemption_point();
         if( head.compare_exchange_weak( j, i ) ) // TODO: weak or strong? what's perf?
             return true;
-        sync::preemption_point();
     }
 }
 
@@ -683,35 +580,16 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     if( n->add_arc(j) ) {
         __OOX_TRACE("%p assign_prerequisite: assigned to %p, %d",this,n,req_port);
         return 1; // Prerequisite n will decrement start_count when it produces a value
+    } else {
+        // Prerequisite n already produced a value. Add this as a consumer of n.
+        int k = ++n->out(req_port).countdown;
+        __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
+        __OOX_ASSERT_EX(k>1,"risk that a prerequisite might be prematurely destroyed");
+        j->node = n;
+        j->kind = arc::back_only;
+        bool success = add_arc(j); //TODO: add_arc_unsafe?
+        __OOX_ASSERT_EX(success, "");
     }
-
-    arc* h = n->head.load(std::memory_order_acquire);
-    if (h && (uintptr_t(h)&k_task_deferred_redirect_tag)) {
-        // A consumer can race with the first real writer of a deferred var.
-        // In that case the deferred placeholder redirects new consumers to
-        // the writer task that inherited its waiting arcs.
-        arc* forwarded = decode_deferred_redirect_arc(h);
-        task_node* d = forwarded->node;
-        int port = forwarded->port;
-        __OOX_ASSERT(d && port >= 0, "deferred forwarding target is not published");
-        n = d;
-        req_port = port;
-        j->port = arc::port_int(req_port);
-        if( n->add_arc(j) ) {
-            __OOX_TRACE("%p assign_prerequisite: assigned to forwarded %p, %d",this,n,req_port);
-            return 1;
-        }
-    }
-
-    // Prerequisite n already produced a value. Add this as a consumer of n.
-    sync::preemption_point();
-    int k = ++n->out(req_port).countdown;
-    __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
-    __OOX_ASSERT_EX(k>1,"risk that a prerequisite might be prematurely destroyed");
-    j->node = n;
-    j->kind = arc::back_only;
-    bool success = add_arc(j); //TODO: add_arc_unsafe?
-    __OOX_ASSERT_EX(success, "");
     return 0;
 }
 
@@ -721,17 +599,12 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
         arc* j = r;
         r = j->next;
         task_node* n = j->node;
-        // Leak trace that motivated explicit ownership here:
-        // - test_twist_forwarding / NestedForwardingChain: 72 byte(s), 3 allocation(s) of arc
-        // - test_twist_lifetime / ChainedResultDestroyedWhileChildPending: 24 byte(s), 1 allocation(s) of arc
-        // Arc is deleted in this loop unless ownership is transferred via n->add_arc(j).
-        bool delete_arc = true;
-
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
             __OOX_TRACE("%p notify: %p->remove_back_arc(%d)",this,n,j->port);
             if( int k = n->remove_back_arc( j->port ) )
                 n->release( k );
+            delete j;
         } else {
             if( j->kind == arc::flow_back ) {
                 // "n" is task that consumes value that this task produced.
@@ -742,19 +615,14 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                     bool b = n->add_arc( j );
                     __OOX_ASSERT_EX(b, "corrupted?");
                     --count[j->port];
-                    delete_arc = false; // ownership transferred to n
-                }
-            } else if( j->kind == arc::flow_copy ) {
+                } else delete j; // very unlikely?
+            } else if( j->kind == arc::flow_copy )
                 n->on_ready( j->port );
-            } else if( j->kind == arc::forward_copy ) {
+            else if( j->kind == arc::forward_copy )
                 __OOX_ASSERT(false, "incorrect forwarding"); // has to be processed by forward_successors only
-            }
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
             n->remove_prerequisite();
-        }
-        if (delete_arc) {
-            delete j;
         }
     } while( r );
 }
@@ -762,11 +630,11 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
 int task_node::do_notify_out( int port, int count ) {
     task_node* null = nullptr;
     if( out(port).next_writer.load(std::memory_order_acquire)==nullptr
-        && out(port).next_writer.compare_exchange_strong( null, details::next_writer_ready_marker()) ) {
-        // The thread that installs the non-nullptr next_writer will see the ready marker and do the decrement.
+        && out(port).next_writer.compare_exchange_strong( null, (task_node*)uintptr_t(1)) ) {
+        // The thread that installs the non-nullptr "next_writer" will see the 1 and do the decrement.
         --count;
-        __OOX_TRACE("%p notify out %d: next_writer went from 0 to ready",this,port);
-    } else if( !details::is_tagged_next_writer(out(port).next_writer.load(std::memory_order_acquire)) ) {
+        __OOX_TRACE("%p notify out %d: next_writer went from 0 to 1",this,port);
+    } else if( !(uintptr_t((void*)out(port).next_writer.load(std::memory_order_acquire))&1) ) {
 #if OOX_AFFINITY
         task_node* d = out(port).next_writer;
         d->affinity = a;
@@ -801,16 +669,16 @@ void task_node::remove_prerequisite( int n ) {
     __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
     if( k==0 ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
-        sync::preemption_point();
         spawn();
     }
 }
 
 int task_node::notify_next_writer( task_node* d ) {
-    if( details::is_tagged_next_writer(d) ) {
-        if( details::is_next_writer_no_owner_marker(d) )
+    uintptr_t i = (uintptr_t)d;
+    if( i&1 ) {
+        if( i == 3 )
             return 1;
-        d = details::decode_next_writer_owner(d);
+        d = (task_node*)(i&~1);
         if( d == this )
             return 2;
         d->release();
@@ -833,17 +701,17 @@ int task_node::remove_back_arc( int output_port, int n ) {
 }
 
 void task_node::set_next_writer( int output_port, task_node* d ) {
-    __OOX_ASSERT( !details::is_next_writer_ready_marker(d), "" );
+    __OOX_ASSERT( uintptr_t(d)!=1, "" );
     task_node* o = out(output_port).next_writer.exchange(d);
     __OOX_TRACE("%p set_next_writer(%d, %p): next_writer was %p",this,output_port,d,o);
     if( o ) {
-        if( details::is_next_writer_ready_marker(o) ) {
+        if( uintptr_t(o)==1 ) {
             // this has value and conceptual back_arc from its owning oox that was removed.
             if( int k = remove_back_arc( output_port ) ) // TODO: optimize it for set_next_writer without contention
                 release( k );
         } else {
-            __OOX_ASSERT( details::is_next_writer_no_owner_marker(o), "" );
-            __OOX_ASSERT( details::is_next_writer_no_owner_marker(d), "TODO forward_successors" ); // TODO
+            __OOX_ASSERT( uintptr_t(o)==3, "" );
+            __OOX_ASSERT( uintptr_t(d)==3, "TODO forward_successors" ); // TODO
         }
     }
 }
@@ -892,8 +760,8 @@ struct oox_var_base {
 
     struct current_port_and_flags_t {
         std::uint16_t port : k_port_bits;
-        std::uint16_t is_forwarded : 1;
-        std::uint16_t is_deferred : 1;
+        bool is_forwarded : 1;
+        bool is_deferred : 1;
     };
     static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
                   "oox::var packed port/flags must stay 16-bit");
@@ -922,10 +790,8 @@ struct oox_var_base {
         // Also, we must retarget arc->port to the writer's output port, so that
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
-            arc* forwarding = new arc(d, output_port, arc::flow_only);
-            arc* r = current_task->head.exchange(encode_deferred_redirect_arc(forwarding), std::memory_order_acq_rel);
-            while(r && !is_arc_list_tagged(r)) {
-                sync::preemption_point();
+            arc* r = current_task->head.exchange(nullptr, std::memory_order_acq_rel);
+            while(r > (arc*)k_task_done_tag) {
                 arc* j = r;
                 r = j->next;
                 j->port = arc::port_int(output_port);
@@ -948,7 +814,7 @@ struct oox_var_base {
     }
     void wait() {
         __OOX_ASSERT_EX(current_task, "wait for empty oox::var");
-        // if head is done marker, the producer is already done:
+        // if head == 1, the producer is already "done":
         // - either a constant storage_task, or
         // - a completed functional_task.
         arc* h = current_task->head.load(std::memory_order_acquire);
@@ -956,17 +822,11 @@ struct oox_var_base {
             return;
         }
         current_task->wait();
-        OOX_DEBUG_ONLY(
-            h = current_task->head.load(std::memory_order_acquire);
-            __OOX_ASSERT(k_task_done_tag == (uintptr_t)h, "wait returned before task completed");
-        );
     }
     void release() {
         if( current_task ) {
-            task_node* owner = storage_offset
-                ? details::encode_next_writer_owner(reinterpret_cast<task_node*>(uintptr_t(storage_ptr)-storage_offset))
-                : details::next_writer_no_owner_marker();
-            current_task->set_next_writer( current_port(), owner );
+            current_task->set_next_writer( current_port(), (task_node*)uintptr_t(
+                    storage_offset? ((uintptr_t(storage_ptr)-storage_offset)|1) : 3/*var<void>*/) );
             current_task = nullptr;
         }
     }
@@ -979,15 +839,15 @@ int task_node::forward_successors( int output_slots, int *count, oox_var_base& n
         // it is safe to assign countdowns here because no successors were notified yet
         out(i).countdown.store(count[i] = std::numeric_limits<int>::max()/2, std::memory_order_release);
     }
-    arc* r = head.exchange( (arc*)k_task_done_tag ); // mark it completed
-    task_node* d = out(0).next_writer.exchange( details::next_writer_no_owner_marker() ); // finish this node
+    arc* r = head.exchange( (arc*)uintptr_t(1) ); // mark it completed
+    task_node* d = out(0).next_writer.exchange( (internal::task_node*)uintptr_t(3) ); // finish this node
     int refs = 1;
     __OOX_TRACE("%p forward_successors(%p, %d): arcs=%p next_writer=%p",this,n.current_task,n.current_port,r,d);
     if( r ) {
         arc* l = n.current_task->head.exchange( r ); // forward dependencies
         if( l ) {
             __OOX_TRACE("%p forward_successors(%p, %d): notify arcs myself %p",this,n.current_task,n.current_port,l);
-            __OOX_ASSERT( k_task_done_tag == uintptr_t(l), "arc lists merge is not implemented" ); // TODO
+            __OOX_ASSERT( uintptr_t(l)==1, "arc lists merge is not implemented" ); // TODO
             __OOX_ASSERT(!n.is_forward, "not implemented"); // TODO
             do_notify_arcs( r, count );
         }
@@ -996,7 +856,7 @@ int task_node::forward_successors( int output_slots, int *count, oox_var_base& n
         task_node* o = n.current_task->out(n.current_port).next_writer.exchange( d );
         if( o ) { // next node is ready already
             __OOX_TRACE("%p forward_successors(%p, %d): removing back arc myself %p",this,n.current_task,n.current_port,o);
-            __OOX_ASSERT( details::is_next_writer_ready_marker(o), "" );
+            __OOX_ASSERT( uintptr_t(o)==1, "" );
             __OOX_ASSERT(!n.is_forward, "not implemented"); // TODO
             __OOX_ASSERT(out(0).countdown == count[0], "not implemented"); // TODO?
             notify_next_writer( d );
@@ -1038,7 +898,7 @@ class var : public internal::oox_var_base {
     void* allocate_new() noexcept {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var",v);
-        v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
+        v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
         // nobody wait on this task
         this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
@@ -1048,9 +908,9 @@ class var : public internal::oox_var_base {
     void* allocate_deferred() noexcept {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var(deferred)", v);
-        // Make writers behave like for a normal initial value (next_writer ready),
+        // Make writers behave like for a normal initial value (next_writer=1),
         // BUT do NOT mark the node completed (head stays nullptr), so readers block.
-        v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
+        v->out(0).next_writer.store((internal::task_node*)uintptr_t(1), std::memory_order_release);
         // v->head is intentionally left as nullptr (not ready)
         this->bind_to(v, static_cast<internal::result_state<T, false>*>(v), 2, false, true);
         return storage_ptr;
@@ -1163,7 +1023,7 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
         if( cov.current_port_and_flags.is_forwarded ) {
             oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = details::encode_forwarded_storage_ptr(&next.storage_ptr);
+            my_ptr = 1|(uintptr_t)&next.storage_ptr;
         } else
             my_ptr = (uintptr_t)cov.storage_ptr;
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
@@ -1172,8 +1032,8 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
     }
     C&& consume() {
         internal::result_state<ooxed_type, false>* state = nullptr;
-        if( details::is_forwarded_storage_ptr(my_ptr) ) {
-            void* p = *details::decode_forwarded_storage_ptr(my_ptr);
+        if( my_ptr & 1 ) {
+            void* p = *reinterpret_cast<void**>(my_ptr ^ 1);
             state = static_cast<internal::result_state<ooxed_type, false>*>(p);
         } else {
             state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
@@ -1229,7 +1089,6 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     using result_base = result_state<R, false>;
     using functor_base::functor_base;
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         result_base::emplace(functor_base::value()());
         task_node::notify_successors<slots>();
@@ -1244,7 +1103,6 @@ template<int slots, typename F>
 struct functional_task<slots, F, void> : storage_task<slots, F> {
     using storage_task<slots, F>::storage_task;
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
         this->value()();
         task_node::notify_successors<slots>();
@@ -1259,7 +1117,6 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
     std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
     bool is_executed : 1 = false;
     TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if 0
         __OOX_TRACE("%p do_run: start forward",this);
         new(my_result.begin()) var<VT>( this->value()() );
@@ -1271,15 +1128,11 @@ struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
             is_executed = true;
             this->start_count.store(1, std::memory_order_release);
             arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
-            this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
             if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
                 __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
                 return nullptr;
             }
-            else {
-                this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
-                delete j;
-            }
+            else delete j;
         }
         __OOX_TRACE("%p do_run: notify forward",this);
         task_node::notify_successors<slots>();
@@ -1296,7 +1149,7 @@ struct gen_oox {
     using type = var<T>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1); return oox;
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), slots + 1); return oox;
     }
 };
 template<>
@@ -1304,7 +1157,7 @@ struct gen_oox<void> {
     using type = var<void>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, void> * t) {
-        type oox; oox.bind_to( t, t, OOX_TASK_EXECUTE_LIFETIME_REF + slots ); return oox;
+        type oox; oox.bind_to( t, t, slots ); return oox;
     }
 };
 template< typename VT >
@@ -1312,7 +1165,7 @@ struct gen_oox<var<VT> > {
     using type = var<VT>;
     template< int slots, typename F >
     static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
-        type oox; oox.bind_to( t, &t->my_result, OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1, true ); return oox;
+        type oox; oox.bind_to( t, &t->my_result, slots+1, true ); return oox;
     }
 };
 template< typename T>
@@ -1386,9 +1239,6 @@ template<typename T>
 [[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
-#undef OOX_DEBUG_ONLY
-#undef OOX_TASK_EXECUTE_LIFETIME_REF
-#undef OOX_TASK_EXECUTE_LIFETIME_GUARD
 
 } // namespace oox
 #endif // __OOX_H__

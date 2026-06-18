@@ -55,6 +55,18 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     gtest_discover_tests(${unittest}_tbb)
   endif ()
 
+  if (EIGEN_FOUND)
+    # build test in EIGEN mode as well
+    add_executable(${unittest}_eigen ${unittest}.cpp)
+    target_compile_definitions(${unittest}_eigen PRIVATE HAVE_EIGEN_WS)
+    target_link_libraries(${unittest}_eigen
+            PRIVATE
+            ${PROJECT_NAME}
+            ${OOX_GTEST_LIB}
+    )
+    gtest_discover_tests(${unittest}_eigen)
+  endif ()
+   
   if (Taskflow_FOUND)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
@@ -76,8 +88,4 @@ if (OOX_EXCEPTIONS_ENABLED)
                    -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
                    -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                    -P ${CMAKE_CURRENT_LIST_DIR}/exception_policy_compile.cmake)
-endif ()
-
-if (OOX_BUILD_TWIST_TESTS)
-  add_subdirectory(twist)
 endif ()

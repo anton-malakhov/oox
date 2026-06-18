@@ -56,6 +56,8 @@ namespace ArchSample {
 #define OOX OOX_TF
 #elif HAVE_FOLLY
 #define OOX OOX_FOLLY
+#elif HAVE_EIGEN_WS
+#define OOX OOX_EIGEN
 #else
 #define OOX OOX_STD
 #endif
