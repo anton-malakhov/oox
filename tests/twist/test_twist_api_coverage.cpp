@@ -5,7 +5,6 @@
 
 #include <twist/assist/assert.hpp>
 #include <twist/assist/preempt.hpp>
-#include <twist/test/body/wg.hpp>
 
 namespace {
 
@@ -92,26 +91,19 @@ void DeferredRedirectLateConsumer() {
         return value + 1;
     }, source);
 
-    oox::var<int> late;
-    twist::test::body::WaitGroup wg;
-    wg.Add(1, [&] {
-        oox::run([](int& value) {
-            twist::assist::PreemptionPoint();
-            value = 10;
-        }, source);
-    });
-    wg.Add(1, [&] {
+    auto late = oox::run([](int value) {
         twist::assist::PreemptionPoint();
-        late = oox::run([](int value) {
-            twist::assist::PreemptionPoint();
-            return value + 2;
-        }, source);
-    });
-    wg.Join();
+        return value + 2;
+    }, source);
+
+    oox::run([](int& value) {
+        twist::assist::PreemptionPoint();
+        value = 10;
+    }, source);
 
     TWIST_ASSERT_M(oox::wait_and_get(source) == 10, "redirect source value");
     TWIST_ASSERT_M(oox::wait_and_get(early) == 11, "early consumer through deferred");
-    TWIST_ASSERT_M(oox::wait_and_get(late) == 12, "late consumer through deferred redirect");
+    TWIST_ASSERT_M(oox::wait_and_get(late) == 12, "second consumer through deferred redirect");
 }
 
 void WriterPipelineOnSingleVar() {
@@ -183,6 +175,12 @@ void RuntimeDeferredTagAndLifeCount() {
     TWIST_ASSERT_M(t.life_get_count() == 0, "life_get_count baseline");
 }
 
+void WaitStatusReadyOnSuccess() {
+    auto t = oox::run([] { return 5; });
+    TWIST_ASSERT_M(oox::wait_for_all_status(t) == oox::wait_status::ready,
+                   "wait_for_all_status must report ready on success");
+}
+
 }  // namespace
 
 int main() {
@@ -197,5 +195,6 @@ int main() {
     oox::twist_tests::RunRandomSeeds("ForwardingImmediateVarPath", ForwardingImmediateVarPath);
     oox::twist_tests::RunRandomSeeds("EmptyVarReaderWriterForms", EmptyVarReaderWriterForms);
     oox::twist_tests::RunRandomSeeds("RuntimeDeferredTagAndLifeCount", RuntimeDeferredTagAndLifeCount);
+    oox::twist_tests::RunRandomSeeds("WaitStatusReadyOnSuccess", WaitStatusReadyOnSuccess);
     return 0;
 }

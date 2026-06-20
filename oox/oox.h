@@ -73,11 +73,46 @@ namespace oox {
 struct deferred_t { explicit constexpr deferred_t(int = 0) {} };
 inline constexpr deferred_t deferred{};
 
+#if OOX_EXCEPTIONS_ENABLED
+struct cancelled_by_exception final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_exception";
+    }
+};
+
+struct cancelled_by_user final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox::cancelled_by_user";
+    }
+};
+#endif
+
+#if defined(OOX_DEFAULT_EXCEPTION_POLICY)
+inline constexpr bool default_exception_policy = OOX_EXCEPTIONS_ENABLED && (OOX_DEFAULT_EXCEPTION_POLICY != 0);
+#elif OOX_EXCEPTIONS_ENABLED
+inline constexpr bool default_exception_policy = true;
+#else
+inline constexpr bool default_exception_policy = false;
+#endif
+
+enum class wait_status {
+    ready,
+    user_cancelled,
+    dependency_cancelled
+};
+
 namespace internal {
 
 inline constexpr std::uintptr_t k_task_done_tag = 0x1;
-inline constexpr std::uintptr_t k_task_deferred_redirect_tag = 0x2;
+#if OOX_EXCEPTIONS_ENABLED
+inline constexpr std::uintptr_t k_task_exception_done_tag = 0x2;
+#endif
+inline constexpr std::uintptr_t k_task_deferred_redirect_tag = 0x4;
+#if OOX_EXCEPTIONS_ENABLED
+inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_exception_done_tag | k_task_deferred_redirect_tag;
+#else
 inline constexpr std::uintptr_t k_task_tag_mask = k_task_done_tag | k_task_deferred_redirect_tag;
+#endif
 inline constexpr unsigned char k_result_state_empty = 0;
 inline constexpr unsigned char k_result_state_cancelled = 1;
 inline constexpr unsigned char k_result_state_value = 2;
@@ -108,6 +143,34 @@ inline void preemption_point() {}
 #endif
 
 } // namespace sync
+
+#if OOX_EXCEPTIONS_ENABLED
+struct exception_control_struct {
+    sync::atomic<std::uint32_t> ref_count{1};
+    std::exception_ptr exception;
+
+    explicit exception_control_struct(std::exception_ptr eptr) noexcept
+        : exception(std::move(eptr)) {}
+};
+
+using exception_control = exception_control_struct*;
+
+inline exception_control retain_exception_control(exception_control control) noexcept {
+    if (control) {
+        control->ref_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return control;
+}
+
+inline void release_exception_control(exception_control control) noexcept {
+    if (!control) {
+        return;
+    }
+    if (control->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete control;
+    }
+}
+#endif
 
 struct task_life {
     // Pointers to this structure and live output nodes
@@ -140,11 +203,8 @@ struct task_life {
     }
 };
 
-template<typename T, bool CanThrow>
-struct result_state;
-
-template <typename T>
-struct result_state<T, false> {
+template <typename T, bool CanThrow = false>
+struct result_state {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
     static constexpr unsigned char state_set = 1;
@@ -173,6 +233,8 @@ struct result_state<T, false> {
         }
         state_bits_field = state_unset;
     }
+    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
+    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
 
   private:
     struct storage_t {
@@ -189,16 +251,10 @@ struct result_state<T, false> {
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
     }
-    T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(storage.data)); }
-    const T* ptr() const noexcept { return std::launder(reinterpret_cast<const T*>(storage.data)); }
 };
 
 template <bool CanThrow>
-struct result_state<void, CanThrow>;
-
-
-template <> struct result_state<void, false> {
-};
+struct result_state<void, CanThrow> {};
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
 
@@ -580,19 +636,93 @@ struct arc {
         back_only,    //< notify producer when consumer is completed TODO: unnecessary when stored in task directly
         flow_back,    //< flow_only then back_only
         flow_copy,    //< call consumer to copy its value when producer is completed
-        forward_copy  //< copy a pointer to the var storage found by producer to consumer
+        forward_copy, //< copy a pointer to the var storage found by producer to consumer
+#if OOX_EXCEPTIONS_ENABLED
+        exception_signal //< carries a refcounted exception_control for an incoming exception
+#endif
     };
     using port_int = short int;
     arc*       next;
-    task_node* node;
+    union {
+        task_node* node;
+#if OOX_EXCEPTIONS_ENABLED
+        exception_control exception_signal_control;
+#endif
+    };
     port_int   port;
     kinds      kind;
     arc( task_node* n, int p, kinds k = flow_back ) : node(n), port(port_int(p)), kind(k) {}
+#if OOX_EXCEPTIONS_ENABLED
+    explicit arc(exception_control c) : exception_signal_control(c), port(0), kind(exception_signal) {
+        __OOX_ASSERT(c, "exception_signal arc requires an exception control");
+    }
+#endif
+    ~arc() {
+#if OOX_EXCEPTIONS_ENABLED
+        if (kind == exception_signal) {
+            release_exception_control(exception_signal_control);
+        }
+#endif
+    }
 };
+
+static_assert(alignof(arc) >= 8, "arc pointers must leave low bits available for completion tags");
+
+namespace details {
+
+inline bool is_live_arc(arc* a) noexcept {
+    const auto bits = reinterpret_cast<std::uintptr_t>(a);
+    return bits != 0 && (bits & k_task_tag_mask) == 0;
+}
+
+#if OOX_EXCEPTIONS_ENABLED
+inline bool is_terminal_exception_arc(arc* a) noexcept {
+    return (reinterpret_cast<std::uintptr_t>(a) & k_task_exception_done_tag) != 0;
+}
+
+inline bool is_done_arc_head(arc* a) noexcept {
+    const auto bits = reinterpret_cast<std::uintptr_t>(a);
+    return bits == k_task_done_tag || (bits & k_task_exception_done_tag) != 0;
+}
+#else
+inline bool is_done_arc_head(arc* a) noexcept {
+    return reinterpret_cast<std::uintptr_t>(a) == k_task_done_tag;
+}
+#endif
 
 inline bool is_arc_list_tagged(arc* p) {
     return uintptr_t(p)&k_task_tag_mask;
 }
+
+// completed-task sentinel stored in task_node::head once a task has produced
+// its value (and has no real-exception terminal arc).
+inline arc* task_done_marker() {
+    return reinterpret_cast<arc*>(k_task_done_tag);
+}
+
+inline bool is_task_done_marker(arc* h) {
+#if OOX_EXCEPTIONS_ENABLED
+    return is_done_arc_head(h);
+#else
+    return reinterpret_cast<uintptr_t>(h) == k_task_done_tag;
+#endif
+}
+
+inline bool is_deferred_redirect(arc* h) {
+    return (reinterpret_cast<uintptr_t>(h) & k_task_deferred_redirect_tag) != 0;
+}
+
+#if OOX_EXCEPTIONS_ENABLED
+inline arc* terminal_exception_arc(arc* a) noexcept {
+    return reinterpret_cast<arc*>(reinterpret_cast<std::uintptr_t>(a) & ~k_task_tag_mask);
+}
+
+inline arc* tagged_terminal_exception_arc(arc* a) noexcept {
+    __OOX_ASSERT((reinterpret_cast<std::uintptr_t>(a) & k_task_tag_mask) == 0,
+                    "terminal exception arc must be aligned");
+    return reinterpret_cast<arc*>(reinterpret_cast<std::uintptr_t>(a) | k_task_exception_done_tag);
+}
+#endif
 
 inline arc* encode_deferred_redirect_arc(arc* p) {
     __OOX_ASSERT((uintptr_t(p)&k_task_tag_mask) == 0, "deferred redirect descriptor is not aligned");
@@ -603,6 +733,8 @@ inline arc* decode_deferred_redirect_arc(arc* p) {
     __OOX_ASSERT((uintptr_t(p)&k_task_deferred_redirect_tag) != 0, "not a deferred redirect descriptor");
     return reinterpret_cast<arc*>(uintptr_t(p)&~k_task_tag_mask);
 }
+
+} // namespace details
 
 struct arc_list {
     // Root of list of nodes that are waiting for this node's value to be produced.
@@ -615,19 +747,54 @@ struct arc_list {
     arc_list() = default;
     ~arc_list() {
         arc* h = head.load(std::memory_order_relaxed);
-        __OOX_ASSERT(!h || h == (arc*)k_task_done_tag || (uintptr_t(h)&k_task_deferred_redirect_tag),
+#if OOX_EXCEPTIONS_ENABLED
+        if (h && details::is_terminal_exception_arc(h)) {
+            delete details::terminal_exception_arc(h);
+            return;
+        }
+#endif
+        __OOX_ASSERT(!h || details::is_task_done_marker(h) || details::is_deferred_redirect(h),
                      "destroying task with pending successor arcs");
-        if (h && (uintptr_t(h)&k_task_deferred_redirect_tag)) {
-            delete decode_deferred_redirect_arc(h);
+        if (h && details::is_deferred_redirect(h)) {
+            delete details::decode_deferred_redirect_arc(h);
         }
     }
 };
 
 struct task_node : public task, arc_list {
-    // Prerequisites to start the task
-    sync::atomic<int> start_count{0};
-    // TODO: exception storage here?
+    static constexpr std::uint32_t start_count_bits = 27;
+    static constexpr std::uint32_t start_count_mask = (std::uint32_t{1} << start_count_bits) - 1;
+#if OOX_EXCEPTIONS_ENABLED
+    static constexpr std::uint32_t start_dependency_cancelled_bit = std::uint32_t{1} << 28;
+    static constexpr std::uint32_t start_user_cancelled_bit       = std::uint32_t{1} << 29;
+    static constexpr std::uint32_t start_exception_bit            = std::uint32_t{1} << 30;
+    static constexpr std::uint32_t start_failure_flag             = std::uint32_t{1} << 31;
+    static constexpr std::uint32_t start_failure_bits_mask =
+        start_exception_bit | start_user_cancelled_bit | start_dependency_cancelled_bit;
+#endif
+    static std::uint32_t start_prerequisite_count(std::uint32_t word) noexcept {
+        return word & start_count_mask;
+    }
 
+    // Prerequisites to start the task
+    sync::atomic<std::uint32_t> start_count{0};
+#if OOX_EXCEPTIONS_ENABLED
+    bool has_start_failure() const noexcept;
+    bool has_non_user_start_failure() const noexcept;
+    void set_exception(std::exception_ptr ep) noexcept;
+    void throw_failure_for_port(int port) const;
+    bool mark_failure(std::uint32_t failure_bit) noexcept;
+    std::uint32_t failure_bits() const noexcept;
+    bool has_failure() const noexcept;
+    void try_set_exception(std::exception_ptr eptr) noexcept;
+    void publish_failure_from(task_node* source, int source_port) noexcept;
+    bool store_exception_control(exception_control control) noexcept;
+    exception_control local_exception_control_handle() const noexcept;
+    std::exception_ptr local_exception() const noexcept;
+    void cancel() noexcept;
+#else
+    void cancel() noexcept {}
+#endif
     task_node() { } // prepare the task for waiting on it directly
     virtual ~task_node() = default;
 
@@ -636,10 +803,12 @@ struct task_node : public task, arc_list {
     // Add a prerequisite
     int  assign_prerequisite( task_node *n, int req_port );
     // Process flow- and anti-dependence arcs
+    template<bool CanThrow>
     void do_notify_arcs( arc* r, int *count );
     // Process output dependence
     int  do_notify_out( int port, int count );
     // Process flow and output arcs. Returns number of finished output nodes
+    template<bool CanThrow>
     int  notify_successors( int output_slots, int *counters );
     // Process flow- and anti-dependence arcs. Returns number of finished output nodes
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
@@ -651,9 +820,14 @@ struct task_node : public task, arc_list {
     int  remove_back_arc( int output_port, int n=1 );
     // Set new output dependence
     void set_next_writer( int output_port, task_node* n );
-    // Call base notify successors
-    template<int slots>
+    // Call base notify successors. CanThrow==true takes the failure-aware path
+    // (may install a terminal exception arc); CanThrow==false is the
+    // completed-without-failure path.
+    template<int slots, bool CanThrow = true>
     void notify_successors();
+#if OOX_EXCEPTIONS_ENABLED
+    virtual void notify_successors_virtual() = 0;
+#endif
     // Call base forward successors
     template<int slots>
     void forward_successors( oox_var_base& );
@@ -663,11 +837,15 @@ struct task_node : public task, arc_list {
 };
 
 bool arc_list::add_arc( arc* i ) {
-    __OOX_ASSERT( uintptr_t(i->node)>2, "" );
+    __OOX_ASSERT(
+#if OOX_EXCEPTIONS_ENABLED
+        i->kind == arc::exception_signal ||
+#endif
+        uintptr_t(i->node)>2, "" );
     for(;;) {
         sync::preemption_point();
         arc* j = head.load(std::memory_order_acquire);
-        if( is_arc_list_tagged(j) )
+        if( details::is_arc_list_tagged(j) )
             return false;
         i->next = j;
         sync::preemption_point();
@@ -676,6 +854,150 @@ bool arc_list::add_arc( arc* i ) {
         sync::preemption_point();
     }
 }
+
+#if OOX_EXCEPTIONS_ENABLED
+bool task_node::has_start_failure() const noexcept {
+    return (start_count.load(std::memory_order_relaxed) & start_failure_bits_mask) != 0;
+}
+
+bool task_node::has_non_user_start_failure() const noexcept {
+    const auto bits = start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
+    return (bits & (start_dependency_cancelled_bit | start_exception_bit)) != 0;
+}
+
+void task_node::set_exception(std::exception_ptr ep) noexcept {
+    try_set_exception(std::move(ep));
+}
+
+void task_node::cancel() noexcept {
+    mark_failure(start_user_cancelled_bit);
+}
+
+void task_node::throw_failure_for_port(int port) const {
+    if (port > 0) {
+        throw cancelled_by_exception{};
+    }
+
+    const auto bits = failure_bits();
+    if (bits & start_exception_bit) {
+        if (auto ep = local_exception()) {
+            std::rethrow_exception(ep);
+        }
+    } else if (bits & start_user_cancelled_bit) {
+        throw cancelled_by_user{};
+    }
+    throw cancelled_by_exception{};
+}
+
+std::uint32_t task_node::failure_bits() const noexcept {
+    return start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
+}
+
+bool task_node::has_failure() const noexcept {
+    return failure_bits() != 0u;
+}
+
+void task_node::try_set_exception(std::exception_ptr eptr) noexcept {
+    if (eptr) {
+        if (store_exception_control(new exception_control_struct(std::move(eptr)))) {
+            mark_failure(start_exception_bit);
+            return;
+        }
+    }
+    mark_failure(start_dependency_cancelled_bit);
+}
+
+bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
+    __OOX_ASSERT_EX(failure_bit != 0 && (failure_bit & ~start_failure_bits_mask) == 0,
+                    "mark_failure expects exactly one failure bit");
+    if (details::is_done_arc_head(head.load(std::memory_order_acquire))) {
+        return false;
+    }
+    auto word = start_count.load(std::memory_order_relaxed);
+    while (true) {
+        if (details::is_done_arc_head(head.load(std::memory_order_acquire))) {
+            return false;
+        }
+        const auto next = word | start_failure_flag | failure_bit;
+        if (start_count.compare_exchange_weak(word, next,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+            return (word & failure_bit) == 0;
+        }
+    }
+}
+
+bool task_node::store_exception_control(exception_control control) noexcept {
+    __OOX_ASSERT_EX(control, "exception control is required");
+    // Real-exception path only: cancellation never creates exception controls
+    // or signal arcs. The signal shares the payload until completion installs
+    // a durable terminal exception arc.
+    arc* signal = new arc(control);
+    if (add_arc(signal)) {
+        return true;
+    }
+    delete signal;
+    return false;
+}
+
+exception_control task_node::local_exception_control_handle() const noexcept {
+    // Exception-path lookup only. exception_signal currently lives in the same
+    // lock-free stack as successor arcs, so late consumers can be pushed above
+    // it. Normal success/cancellation paths must not call this scan.
+    arc* r = head.load(std::memory_order_acquire);
+    if (details::is_terminal_exception_arc(r)) {
+        return details::terminal_exception_arc(r)->exception_signal_control;
+    }
+    while (details::is_live_arc(r)) {
+        if (r->kind == arc::exception_signal) {
+            return r->exception_signal_control;
+        }
+        r = r->next;
+    }
+    return {};
+}
+
+std::exception_ptr task_node::local_exception() const noexcept {
+    if (auto control = local_exception_control_handle()) {
+        return control->exception;
+    }
+    return std::exception_ptr{};
+}
+
+void task_node::publish_failure_from(task_node* source, int source_port) noexcept {
+    if (!source) {
+        mark_failure(start_user_cancelled_bit);
+        return;
+    }
+    if (source_port != 0) {
+        mark_failure(start_dependency_cancelled_bit);
+        return;
+    }
+
+    const auto bits = source->start_count.load(std::memory_order_acquire) & start_failure_bits_mask;
+    if (bits & start_exception_bit) {
+        if (auto control = source->local_exception_control_handle()) {
+            // Real-exception propagation only. Dependency/user cancellation
+            // stays allocation-free and is represented solely by start_count
+            // failure bits.
+            arc* signal = new arc(retain_exception_control(control));
+            if (!add_arc(signal)) {
+                delete signal;
+            }
+            mark_failure(start_exception_bit);
+            return;
+        }
+        mark_failure(start_dependency_cancelled_bit);
+        return;
+    }
+    if (bits & start_user_cancelled_bit) {
+        mark_failure(start_user_cancelled_bit);
+    } else if (bits & start_dependency_cancelled_bit) {
+        mark_failure(start_dependency_cancelled_bit);
+    }
+}
+
+#endif
 
 int task_node::assign_prerequisite( task_node *n, int req_port ) {
     arc* j = new arc( this, req_port ); // TODO: embed into the task
@@ -686,11 +1008,11 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     }
 
     arc* h = n->head.load(std::memory_order_acquire);
-    if (h && (uintptr_t(h)&k_task_deferred_redirect_tag)) {
+    if (h && details::is_deferred_redirect(h)) {
         // A consumer can race with the first real writer of a deferred var.
         // In that case the deferred placeholder redirects new consumers to
         // the writer task that inherited its waiting arcs.
-        arc* forwarded = decode_deferred_redirect_arc(h);
+        arc* forwarded = details::decode_deferred_redirect_arc(h);
         task_node* d = forwarded->node;
         int port = forwarded->port;
         __OOX_ASSERT(d && port >= 0, "deferred forwarding target is not published");
@@ -704,6 +1026,11 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     }
 
     // Prerequisite n already produced a value. Add this as a consumer of n.
+#if OOX_EXCEPTIONS_ENABLED
+    if (n->has_failure()) {
+        this->publish_failure_from(n, req_port);
+    }
+#endif
     sync::preemption_point();
     int k = ++n->out(req_port).countdown;
     __OOX_TRACE("%p assign_prerequisite: preventing %p, port %d, count %d",this,n,req_port,k);
@@ -715,18 +1042,36 @@ int task_node::assign_prerequisite( task_node *n, int req_port ) {
     return 0;
 }
 
+template<bool CanThrow>
 void task_node::do_notify_arcs( arc* r, int *count ) {
     // Notify successors that value is available
+#if OOX_EXCEPTIONS_ENABLED
+    const bool producer_failed = CanThrow &&
+        ((start_count.load(std::memory_order_acquire) & start_failure_flag) != 0);
+#endif
     do {
         arc* j = r;
         r = j->next;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (j->kind == arc::exception_signal) {
+            // Internal payload marker, not a successor edge. It can be present
+            // only on real-exception paths because exception signals share the
+            // active arc stack until notify_successors installs the terminal arc.
+                delete j;
+                continue;
+            }
+        }
+#endif
         task_node* n = j->node;
         // Leak trace that motivated explicit ownership here:
         // - test_twist_forwarding / NestedForwardingChain: 72 byte(s), 3 allocation(s) of arc
         // - test_twist_lifetime / ChainedResultDestroyedWhileChildPending: 24 byte(s), 1 allocation(s) of arc
         // Arc is deleted in this loop unless ownership is transferred via n->add_arc(j).
         bool delete_arc = true;
-
+#if OOX_EXCEPTIONS_ENABLED
+        const auto arc_port = j->port;
+#endif
         if( j->kind == arc::back_only ) {
             // Notify producer that this task has finished consuming its value
             __OOX_TRACE("%p notify: %p->remove_back_arc(%d)",this,n,j->port);
@@ -738,7 +1083,7 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 // Add back arc so that "n" can notify this when it is done consuming the value.
                 j->node = this;
                 j->kind = arc::back_only;
-                if( out(j->port).next_writer.load(std::memory_order_acquire) != (task_node*)uintptr_t(3) ) {
+                if( out(j->port).next_writer.load(std::memory_order_acquire) != details::next_writer_no_owner_marker() ) {
                     bool b = n->add_arc( j );
                     __OOX_ASSERT_EX(b, "corrupted?");
                     --count[j->port];
@@ -751,6 +1096,11 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
             }
             // Let "n" know that prerequisite "this" is ready.
             __OOX_TRACE("%p notify: %p->remove_prequisite()",this,n);
+#if OOX_EXCEPTIONS_ENABLED
+            if (producer_failed) {
+                n->publish_failure_from(this, arc_port);
+            }
+#endif
             n->remove_prerequisite();
         }
         if (delete_arc) {
@@ -778,6 +1128,7 @@ int task_node::do_notify_out( int port, int count ) {
     return remove_back_arc( port, count );
 }
 
+template<bool CanThrow>
 int task_node::notify_successors( int output_slots, int *count ) {
     for( int i = 0; i <  output_slots; i++ ) {
         // it should be safe to assign countdowns here because no successors were notified yet
@@ -787,8 +1138,25 @@ int task_node::notify_successors( int output_slots, int *count ) {
     // Grab list of successors and mark as competed.
     // Note that countdowns can change asynchronously after this point
 
-   if( arc* r = head.exchange( (arc*)k_task_done_tag ) )
-        do_notify_arcs( r, count );
+    arc* terminal = details::task_done_marker();
+#if OOX_EXCEPTIONS_ENABLED
+    if constexpr (CanThrow) {
+        if (start_count.load(std::memory_order_acquire) & start_exception_bit) {
+            // This is the only completion path that pays for a terminal arc. The
+            // lookup may scan the active arc stack, but it is gated by the real-exception
+            // state; successful and cancellation-only tasks keep the raw done tag.
+            if (auto control = local_exception_control_handle()) {
+                auto* terminal_arc = new arc(retain_exception_control(control));
+                terminal_arc->next = details::task_done_marker();
+                terminal = details::tagged_terminal_exception_arc(terminal_arc);
+            }
+        }
+    }
+#endif
+
+   sync::preemption_point();
+   if( arc* r = head.exchange( terminal ) )
+        do_notify_arcs<CanThrow>( r, count );
     int refs = 0;
     for( int i = 0; i <  output_slots; i++ )
         refs += do_notify_out( i, count[i] );
@@ -797,10 +1165,21 @@ int task_node::notify_successors( int output_slots, int *count ) {
 }
 
 void task_node::remove_prerequisite( int n ) {
-    int k = start_count-=n;
-    __OOX_ASSERT(k>=0,"invalid start_count detected while removing prerequisite");
-    if( k==0 ) {
+    const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_acq_rel);
+    const auto previous_count = start_prerequisite_count(previous);
+    __OOX_ASSERT(previous_count >= static_cast<std::uint32_t>(n),
+                 "invalid start_count detected while removing prerequisite");
+    if( previous_count == static_cast<std::uint32_t>(n) ) {
         __OOX_TRACE("%p remove_prerequisite: spawning",this);
+#if OOX_EXCEPTIONS_ENABLED
+        const auto updated = previous - static_cast<std::uint32_t>(n);
+        if (updated & (start_dependency_cancelled_bit | start_exception_bit)) {
+            // Task will not execute(), so balance the bind-acquired execute ref.
+            notify_successors_virtual();
+            release(OOX_TASK_EXECUTE_LIFETIME_REF);
+            return;
+        }
+#endif
         sync::preemption_point();
         spawn();
     }
@@ -848,10 +1227,10 @@ void task_node::set_next_writer( int output_port, task_node* d ) {
     }
 }
 
-template<int slots>
+template<int slots, bool CanThrow>
 void task_node::notify_successors() {
     int counters[slots];
-    int n = notify_successors( slots, counters );
+    int n = notify_successors<CanThrow>( slots, counters );
     wakeup();
     release(n);
 }
@@ -864,6 +1243,11 @@ struct output_slots_storage {
 template<int slots>
 struct task_node_slots : task_node, output_slots_storage<slots> {
     TASK_EXECUTE_METHOD { __OOX_ASSERT(false, "not runnable"); return nullptr; }
+#if OOX_EXCEPTIONS_ENABLED
+    void notify_successors_virtual() override {
+        task_node::notify_successors<slots, true>();
+    }
+#endif
 };
 
 #if defined(__clang__)
@@ -898,7 +1282,7 @@ struct oox_var_base {
     static_assert(sizeof(current_port_and_flags_t) == sizeof(std::uint16_t),
                   "oox::var packed port/flags must stay 16-bit");
 
-    template< typename T > friend struct gen_oox;
+    template< typename T, bool > friend struct gen_oox;
     task_node*  current_task = nullptr;
     void*       storage_ptr;
     int         storage_offset; // task_node* original = ptr - offset
@@ -923,8 +1307,8 @@ struct oox_var_base {
         // back-arcs/countdown protect the correct output slot (the var slot), not slot 0.
         if (current_port_and_flags.is_deferred) {
             arc* forwarding = new arc(d, output_port, arc::flow_only);
-            arc* r = current_task->head.exchange(encode_deferred_redirect_arc(forwarding), std::memory_order_acq_rel);
-            while(r && !is_arc_list_tagged(r)) {
+            arc* r = current_task->head.exchange(details::encode_deferred_redirect_arc(forwarding), std::memory_order_acq_rel);
+            while(details::is_live_arc(r)) {
                 sync::preemption_point();
                 arc* j = r;
                 r = j->next;
@@ -952,14 +1336,19 @@ struct oox_var_base {
         // - either a constant storage_task, or
         // - a completed functional_task.
         arc* h = current_task->head.load(std::memory_order_acquire);
-        if (k_task_done_tag == (uintptr_t)h) {
+        if (details::is_task_done_marker(h)) {
             return;
         }
         current_task->wait();
-        OOX_DEBUG_ONLY(
-            h = current_task->head.load(std::memory_order_acquire);
-            __OOX_ASSERT(k_task_done_tag == (uintptr_t)h, "wait returned before task completed");
-        );
+        h = current_task->head.load(std::memory_order_acquire);
+        __OOX_ASSERT(details::is_task_done_marker(h), "wait returned before task completed");
+    }
+    void cancel_current_task() noexcept {
+#if OOX_EXCEPTIONS_ENABLED
+        if (current_task && !current_port_and_flags.is_deferred) {
+            current_task->cancel();
+        }
+#endif
     }
     void release() {
         if( current_task ) {
@@ -1023,23 +1412,24 @@ tbb::task* task_node::forward_successors( oox_var_base& m ) {
 }
 #endif
 
-template< typename T > struct gen_oox;
+template< typename T, bool CanThrow > struct gen_oox;
 
 } // namespace internal
 
 
-template< typename T >
+template< typename T, bool CanThrow = default_exception_policy >
 class var : public internal::oox_var_base {
     static_assert(std::is_same_v<T, std::decay_t<T>>,
                   "Specialize oox::var only by plain types and pointers."
                   "For references, use reference_wrapper,"
                   "for const types use shared_ptr<T>.");
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<T, true> requires OOX_EXCEPTIONS_ENABLED=1");
 
     void* allocate_new() noexcept {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
-        v->head.store((internal::arc*)internal::k_task_done_tag, std::memory_order_release);
+        v->head.store(internal::details::task_done_marker(), std::memory_order_release);
         // nobody wait on this task
         this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
         return storage_ptr;
@@ -1069,8 +1459,8 @@ public:
         auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
         state->emplace(std::move(t));
     }
-    var(var<T>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
-    var& operator=(var<T>&& t) {
+    var(var<T, CanThrow>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
+    var& operator=(var<T, CanThrow>&& t) {
         release();
         new(this) internal::oox_var_base(std::move(t));
         __OOX_ASSERT_EX(current_task, "");
@@ -1080,19 +1470,42 @@ public:
     ~var() { release(); }
     [[nodiscard]] T get() {
         wait();
-        return static_cast<internal::result_state<T, false>*>(storage_ptr)->value();
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (current_task && current_task->has_failure()) {
+                current_task->throw_failure_for_port(current_port());
+            }
+        }
+#endif
+        return static_cast<internal::result_state<T, CanThrow>*>(storage_ptr)->value();
+    }
+    void cancel() noexcept {
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
     }
 };
 
-template<>
-class var<void> : public internal::oox_var_base {
-    template< typename T > friend struct gen_oox;
+template<bool CanThrow>
+class var<void, CanThrow> : public internal::oox_var_base {
+    template< typename T, bool > friend struct gen_oox;
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<void, true> requires OOX_EXCEPTIONS_ENABLED=1");
 public:
     var() {}
-    template<typename D>
-    var(var<D>&& src) : internal::oox_var_base(src) {
+    template<typename D, bool DCanThrow>
+    var(var<D, DCanThrow>&& src) : internal::oox_var_base(src) {
+        static_assert(CanThrow || !DCanThrow, "non-throwing void var cannot bind to throwing source");
         ((internal::task_node*)(uintptr_t(src.storage_ptr)-src.storage_offset))->release();
         src.current_task = nullptr;
+    }
+    void cancel() noexcept {
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            this->cancel_current_task();
+        }
+#endif
     }
 };
 
@@ -1115,16 +1528,17 @@ template< typename... Args > struct types {};
 
 // Types is types<list> of user functor argument types
 // Args is variadic list of run argument types
-template< typename Types, typename... Args > struct base_args;
+template< typename Types, bool SelfCanThrow, typename... Args > struct base_args;
 // User functor might have default arguments which are not specified thus ignoring them
-template< typename IgnoredTypes > struct base_args<IgnoredTypes> {
+template< typename IgnoredTypes, bool SelfCanThrow > struct base_args<IgnoredTypes, SelfCanThrow> {
     static constexpr int write_nodes_count = 1; // for resulting node
     int setup(int, internal::task_node *) { return 0 /* resulting node is ready initially*/; }
 };
 
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Args...> {
-    using base_type = base_args<types<Types...>, Args...>;
+template< typename T, typename... Types, typename A, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
+    : base_args<types<Types...>, SelfCanThrow, Args...> {
+    using base_type = base_args<types<Types...>, SelfCanThrow, Args...>;
 
     std::decay_t<A> my_value;
 
@@ -1137,12 +1551,13 @@ struct base_args<types<T, Types...>, A, Args...> : base_args<types<Types...>, Ar
     }
 };
 
-template< typename Types, typename... Args > struct oox_var_args;
-template< typename T, typename... Types, typename C, typename... Args >
-struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>, Args...> {
-    using base_type = base_args<types<Types...>, Args...>;
+template< typename Types, bool SelfCanThrow, typename C, bool VarCanThrow, typename... Args > struct oox_var_args;
+template< typename T, typename... Types, typename C, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
+    : base_args<types<Types...>, SelfCanThrow, Args...> {
+    using base_type = base_args<types<Types...>, SelfCanThrow, Args...>;
     using ooxed_type = std::decay_t<C>;
-    using var_type = var<ooxed_type>;
+    using var_type = var<ooxed_type, VarCanThrow>;
 
     uintptr_t my_ptr;
     // TODO: copy-based optimizations
@@ -1156,11 +1571,14 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("oox::var<A>").c_str(), cov.current_task, get_type<T>("T").c_str(), count);
         if( !cov.current_task )
             new( &const_cast<var_type&>(cov) ) var_type(ooxed_type()); // allocate oox container with default value
-        if( count ) {
+        if constexpr (is_writer) {
+            static_assert(VarCanThrow || !SelfCanThrow, "throwing task cannot write to non-throwing var");
             auto &ov = const_cast<var_type&>(cov); // actual type is non-const due to is_writer
             ov.set_next_writer( port, self );// TODO: add 'count =' because no need in sync here
-        } else
+        } else {
+            static_assert(SelfCanThrow || !VarCanThrow, "non-throwing task cannot depend on throwing task");
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
+        }
         if( cov.current_port_and_flags.is_forwarded ) {
             oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
             my_ptr = details::encode_forwarded_storage_ptr(&next.storage_ptr);
@@ -1171,15 +1589,15 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        internal::result_state<ooxed_type, false>* state = nullptr;
+        void* state_ptr = nullptr;
         if( details::is_forwarded_storage_ptr(my_ptr) ) {
-            void* p = *details::decode_forwarded_storage_ptr(my_ptr);
-            state = static_cast<internal::result_state<ooxed_type, false>*>(p);
+            state_ptr = *details::decode_forwarded_storage_ptr(my_ptr);
         } else {
-            state = reinterpret_cast<internal::result_state<ooxed_type, false>*>(my_ptr);
+            state_ptr = reinterpret_cast<void*>(my_ptr);
         }
-        __OOX_ASSERT_EX(state, "null result_state storage");
+        __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
+        auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
         if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
@@ -1189,17 +1607,20 @@ struct oox_var_args<types<T, Types...>, C, Args...> : base_args<types<Types...>,
         return static_cast<C&&>(state->value());
     }
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, var<A>&, Args...> : oox_var_args<types<T, Types...>, A&, Args...> {
-    using oox_var_args<types<T, Types...>, A&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, var<A, VarCanThrow>&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, A&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, A&, VarCanThrow, Args...>::oox_var_args;
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, const var<A>&, Args...> : oox_var_args<types<T, Types...>, const A&, Args...> {
-    using oox_var_args<types<T, Types...>, const A&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, const var<A, VarCanThrow>&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, const A&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, const A&, VarCanThrow, Args...>::oox_var_args;
 };
-template< typename T, typename... Types, typename A, typename... Args >
-struct base_args<types<T, Types...>, var<A>&&, Args...> : oox_var_args<types<T, Types...>, A&&, Args...> {
-    using oox_var_args<types<T, Types...>, A&&, Args...>::oox_var_args;
+template< typename T, typename... Types, typename A, bool VarCanThrow, typename... Args, bool SelfCanThrow >
+struct base_args<types<T, Types...>, SelfCanThrow, var<A, VarCanThrow>&&, Args...>
+    : oox_var_args<types<T, Types...>, SelfCanThrow, A&&, VarCanThrow, Args...> {
+    using oox_var_args<types<T, Types...>, SelfCanThrow, A&&, VarCanThrow, Args...>::oox_var_args;
 };
 
 template< typename F, typename... Preceding, typename Args >
@@ -1210,8 +1631,8 @@ auto apply_args( F&& f, Args&& pack, Preceding&&... params ) {
                       pack.consume());
 }
 
-template< typename F, typename... Preceding, typename Last >
-auto apply_args( F&& f, base_args<Last>&& /*pack*/, Preceding&&... params ) {
+template< typename F, typename... Preceding, typename Last, bool SelfCanThrow >
+auto apply_args( F&& f, base_args<Last, SelfCanThrow>&& /*pack*/, Preceding&&... params ) {
     return std::forward<F>(f)(std::forward<Preceding>(params)...);
 }
 
@@ -1223,16 +1644,35 @@ struct oox_bind {
     auto operator()() { return apply_args(std::move(my_func), std::move(my_args)); }
 };
 
-template<int slots, typename F, typename R>
-struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, false> {
+template<int slots, typename F, typename R, bool CanThrow>
+struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, CanThrow> {
     using functor_base = storage_task<slots, F>;
-    using result_base = result_state<R, false>;
-    using functor_base::functor_base;
+    using result_base = result_state<R, CanThrow>;
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
-        result_base::emplace(functor_base::value()());
-        task_node::notify_successors<slots>();
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return nullptr;
+            }
+            try {
+                result_base::emplace(this->functor_base::value()());
+                task_node::notify_successors<slots, false>();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+            }
+        } else
+#endif
+        {
+            result_base::emplace(this->functor_base::value()());
+            task_node::notify_successors<slots, false>();
+        }
         return nullptr;
     }
     ~functional_task() {
@@ -1240,83 +1680,138 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, fal
     }
 };
 
-template<int slots, typename F>
-struct functional_task<slots, F, void> : storage_task<slots, F> {
-    using storage_task<slots, F>::storage_task;
+template<int slots, typename F, bool CanThrow>
+struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, result_state<void, CanThrow>
+{
+    using functor_base = storage_task<slots, F>;
+    using result_base = result_state<void, CanThrow>;
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
         __OOX_TRACE("%p do_run: start",this);
-        this->value()();
-        task_node::notify_successors<slots>();
-        return nullptr;
-    }
-};
-
-template<int slots, typename F, typename VT> // forwarding task
-struct functional_task<slots, F, var<VT> > : storage_task<slots, F> {
-    // TODO: NRVO optimized forwarding
-    using storage_task<slots, F>::storage_task;
-    std::aligned_storage_t<sizeof(var<VT>), alignof(var<VT>)> my_result;
-    bool is_executed : 1 = false;
-    TASK_EXECUTE_METHOD {
-        OOX_TASK_EXECUTE_LIFETIME_GUARD;
-#if 0
-        __OOX_TRACE("%p do_run: start forward",this);
-        new(my_result.begin()) var<VT>( this->value()() );
-        return task_node::forward_successors<slots>( *my_result.begin() );
-#else
-        if( !is_executed ) {
-            __OOX_TRACE("%p do_run: start forward",this);
-            new(&my_result) var<VT>( this->value()() );
-            is_executed = true;
-            this->start_count.store(1, std::memory_order_release);
-            arc* j = new arc( this, 0, arc::flow_only ); // TODO: embed into the task
-            this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
-            if( reinterpret_cast<var<VT>*>(&my_result)->current_task->add_arc(j) ) {
-                __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
                 return nullptr;
             }
-            else {
-                this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
-                delete j;
+            try {
+                this->functor_base::value()();
+                task_node::notify_successors<slots, false>();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+            }
+        } else
+#endif
+        {
+            this->functor_base::value()();
+            task_node::notify_successors<slots, false>();
+        }
+        return nullptr;
+    }
+    ~functional_task() override {}
+};
+
+template<int slots, typename F, typename VT, bool VarCanThrow, bool CanThrow>
+struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<slots, F>
+                                                                  , result_state<var<VT, VarCanThrow>, CanThrow>
+{
+    // TODO: NRVO optimized forwarding
+    static_assert(VarCanThrow == CanThrow, "returning var<T, P> requires task policy to match P");
+    using functor_base = storage_task<slots, F>;
+    using var_type = var<VT, VarCanThrow>;
+    using result_base = result_state<var_type, CanThrow>;
+    template<typename... Args>
+    functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+
+    // run the functor, install a flow-only arc onto the var it returned, and keep this task
+    // alive as a continuation of that var's producer. Returns true if the arc was accepted
+    // (this task suspended itself and execute() must return without notifying successors).
+    bool try_forward_result() {
+        __OOX_TRACE("%p do_run: start forward",this);
+        result_base::emplace(this->functor_base::value()());
+        this->start_count.store(1, std::memory_order_release);
+        arc* j = new arc(this, 0, arc::flow_only); // TODO: embed into the task
+        auto& result = result_base::value();
+        this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
+        if(result.current_task->add_arc(j)) {
+            __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
+            return true;
+        }
+        this->release(OOX_TASK_EXECUTE_LIFETIME_REF);
+        delete j;
+        return false;
+    }
+
+    TASK_EXECUTE_METHOD {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return nullptr;
+            }
+            try {
+                if ( !result_base::has_value() ) {
+                    if (this->try_forward_result()) {
+                        return nullptr;
+                    }
+                    if (result_base::value().current_task->has_failure()) {
+                        this->publish_failure_from(result_base::value().current_task, 0);
+                        task_node::notify_successors<slots, true>();
+                        return nullptr;
+                    }
+                }
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+                return nullptr;
+            }
+        } else
+#endif
+        {
+            if ( !result_base::has_value() && this->try_forward_result() ) {
+                return nullptr;
             }
         }
         __OOX_TRACE("%p do_run: notify forward",this);
-        task_node::notify_successors<slots>();
+        task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
         return nullptr;
-#endif
     }
+
     ~functional_task() {
-        reinterpret_cast<var<VT>*>(&my_result)->~var<VT>(); // current_task is finished in forward_successors
+        result_base::reset();
     }
 };
 
-template< typename T >
+template< typename T, bool CanThrow >
 struct gen_oox {
-    using type = var<T>;
+    using type = var<T, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, T> * t) {
-        type oox; oox.bind_to(t, static_cast<internal::result_state<T, false>*>(t), OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1); return oox;
+    static type bind_to(internal::functional_task<slots, F, T, CanThrow> * t) {
+        type oox; oox.bind_to(t, static_cast<internal::result_state<T, CanThrow>*>(t), OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1); return oox;
     }
 };
-template<>
-struct gen_oox<void> {
-    using type = var<void>;
+template<bool CanThrow>
+struct gen_oox<void, CanThrow> {
+    using type = var<void, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, void> * t) {
+    static type bind_to(internal::functional_task<slots, F, void, CanThrow> * t) {
         type oox; oox.bind_to( t, t, OOX_TASK_EXECUTE_LIFETIME_REF + slots ); return oox;
     }
 };
-template< typename VT >
-struct gen_oox<var<VT> > {
-    using type = var<VT>;
+template< typename VT, bool CanThrow >
+struct gen_oox<var<VT, CanThrow>, CanThrow> {
+    using type = var<VT, CanThrow>;
     template< int slots, typename F >
-    static type bind_to(internal::functional_task<slots, F, var<VT> > * t) {
-        type oox; oox.bind_to( t, &t->my_result, OOX_TASK_EXECUTE_LIFETIME_REF + slots + 1, true ); return oox;
+    static type bind_to(internal::functional_task<slots, F, var<VT, CanThrow>, CanThrow > * t) {
+        type oox; oox.bind_to( t, static_cast<internal::result_state<type, CanThrow>*>(t)->ptr(), OOX_TASK_EXECUTE_LIFETIME_REF + slots+1, true ); return oox;
     }
 };
-template< typename T>
-using var_type = typename gen_oox<T>::type;
+template< typename T, bool CanThrow>
+using var_type = typename gen_oox<T, CanThrow>::type;
 
 template< typename R, typename... Types >
 struct functor_info {
@@ -1329,6 +1824,12 @@ template< typename R, typename C, typename... Args >
 functor_info<R, Args...> get_functor_info(R (C::*)(Args...)) { return functor_info<R, Args...>(); }
 template< typename R, typename C, typename... Args >
 functor_info<R, Args...> get_functor_info(R (C::*)(Args...) const) { return functor_info<R, Args...>(); }
+template< typename R, typename... Args >
+functor_info<R, Args...> get_functor_info(R (&)(Args...) noexcept) { return functor_info<R, Args...>(); }
+template< typename R, typename C, typename... Args >
+functor_info<R, Args...> get_functor_info(R (C::*)(Args...) noexcept) { return functor_info<R, Args...>(); }
+template< typename R, typename C, typename... Args >
+functor_info<R, Args...> get_functor_info(R (C::*)(Args...) const noexcept) { return functor_info<R, Args...>(); }
 template< typename F >
 auto get_functor_info(F&&) { return get_functor_info( &std::remove_reference_t<F>::operator() ); }
 template< typename F >
@@ -1336,57 +1837,139 @@ using result_type_of = typename decltype( get_functor_info(std::declval<F>()) ):
 template< typename F >
 using args_list_of = typename decltype( get_functor_info(std::declval<F>()) )::args_list_type;
 
+template< typename F, typename ArgsList >
+struct functor_is_nothrow_invocable : std::false_type {};
+template< typename F, typename... Args >
+struct functor_is_nothrow_invocable<F, types<Args...>>
+    : std::bool_constant<std::is_nothrow_invocable_v<F, Args...>> {};
+template< typename F, typename ArgsList >
+inline constexpr bool functor_is_nothrow_invocable_v =
+    functor_is_nothrow_invocable<F, ArgsList>::value;
+
 } //namespace internal
 
-template< typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
-auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F> >
+template< bool CanThrow = default_exception_policy, typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
+auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>, CanThrow>
 {
+    static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::run<true>(...) requires OOX_EXCEPTIONS_ENABLED=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
-    using args_type = internal::base_args<call_args_type, Args&&...>;
+    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
+                      || internal::functor_is_nothrow_invocable_v<F, call_args_type>,
+        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
+        "the callable must satisfy std::is_nothrow_invocable for its argument types. "
+        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
+    using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
     using functor_type = internal::oox_bind<F, args_type>;
-    using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type>;
+    using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
-    int protect_count = std::numeric_limits<int>::max();
+    int protect_count = internal::task_node::start_count_mask;
     t->start_count.store(protect_count, std::memory_order_release);
     // process functor types
     protect_count -= static_cast<internal::storage_task<args_type::write_nodes_count, functor_type>*>(t)
                          ->value()
                          .my_args.setup(1, t, std::forward<Args>(args)...);
-    auto r = internal::gen_oox<r_type>::bind_to( t );
+    auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
 }
 
-void wait_for_all(internal::oox_var_base& on ) {
+#if OOX_EXCEPTIONS_ENABLED
+namespace internal {
+template <bool ThrowOnCancellation>
+wait_status failure_wait_status(task_node* task, int port) {
+    if (!task || !task->has_failure()) {
+        return wait_status::ready;
+    }
+
+    if constexpr (ThrowOnCancellation) {
+        task->throw_failure_for_port(port);
+    } else {
+        if (port > 0) {
+            return wait_status::dependency_cancelled;
+        }
+        const auto bits = task->failure_bits();
+        if (bits & task_node::start_exception_bit) {
+            if (auto ep = task->local_exception()) {
+                std::rethrow_exception(ep);
+            }
+            return wait_status::dependency_cancelled;
+        }
+        if (bits & task_node::start_user_cancelled_bit) {
+            return wait_status::user_cancelled;
+        }
+        return wait_status::dependency_cancelled;
+    }
+
+    return wait_status::ready;
+}
+} // namespace internal
+#endif
+
+template <bool ThrowOnCancellation = true>
+wait_status wait_for_all_status(internal::oox_var_base& on) {
     on.wait();
+#if OOX_EXCEPTIONS_ENABLED
+    return internal::failure_wait_status<ThrowOnCancellation>(on.current_task, on.current_port());
+#else
+    return wait_status::ready;
+#endif
 }
 
-template<typename T>
-[[nodiscard]] T wait_and_get(const var<T> &ov) {
-    auto &v = const_cast<var<T>&>(ov);
+void wait_for_all(internal::oox_var_base& on ) {
+    wait_for_all_status<true>(on);
+}
+
+template <bool ThrowOnCancellation = true, typename T, bool CanThrow>
+wait_status wait_for_all_status(const var<T, CanThrow>& on) {
+    const_cast<var<T, CanThrow>&>(on).wait();
+    if constexpr (CanThrow) {
+#if OOX_EXCEPTIONS_ENABLED
+        return internal::failure_wait_status<ThrowOnCancellation>(on.current_task, on.current_port());
+#endif
+    }
+    return wait_status::ready;
+}
+
+template<typename T, bool CanThrow>
+void wait_for_all(const var<T, CanThrow>& on) {
+    wait_for_all_status<true>(on);
+}
+
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(const var<T, CanThrow> &ov) {
+    auto &v = const_cast<var<T, CanThrow>&>(ov);
     wait_for_all(v);
 
     // Follow forwarding chain until we reach a non-forward var
     internal::oox_var_base* base = &v;
     while (base->current_port_and_flags.is_forwarded) {
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            internal::failure_wait_status<true>(base->current_task, base->current_port());
+        }
+#endif
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage_ptr in wait_and_get");
         base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
     }
 
+#if OOX_EXCEPTIONS_ENABLED
+    if constexpr (CanThrow) {
+        internal::failure_wait_status<true>(base->current_task, base->current_port());
+    }
+#endif
     __OOX_ASSERT_EX(base->storage_ptr, "var has null storage_ptr in wait_and_get");
-    return static_cast<internal::result_state<T, false>*>(base->storage_ptr)->value();
+    return static_cast<internal::result_state<T, CanThrow>*>(base->storage_ptr)->value();
 }
 
-template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
-template<typename T>
-[[nodiscard]] T wait_and_get(var<T> &&ov) { return wait_and_get(static_cast<const var<T>&>(ov)); }
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(var<T, CanThrow> &ov) { return wait_and_get(static_cast<const var<T, CanThrow>&>(ov)); }
+template<typename T, bool CanThrow>
+[[nodiscard]] T wait_and_get(var<T, CanThrow> &&ov) { return wait_and_get(static_cast<const var<T, CanThrow>&>(ov)); }
 
 #undef TASK_EXECUTE_METHOD
-#undef OOX_DEBUG_ONLY
 #undef OOX_TASK_EXECUTE_LIFETIME_REF
 #undef OOX_TASK_EXECUTE_LIFETIME_GUARD
 

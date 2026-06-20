@@ -110,6 +110,25 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
   endforeach()
 endforeach()
 
+foreach(mode IN LISTS OOX_BACKENDS)
+  foreach(policy noexc exc)
+    if(policy STREQUAL "exc")
+      set(policy_value 1)
+    else()
+      set(policy_value 0)
+    endif()
+    set(fib_target bench_fib_${mode}_${policy})
+    add_executable(${fib_target} bench_fib.cpp)
+    target_compile_definitions(${fib_target} PRIVATE PARALLEL=exe HAVE_${mode}
+      OOX_DEFAULT_EXCEPTION_POLICY=${policy_value} OOX_EXCEPTION_POLICY_STR=${policy})
+    target_compile_options(${fib_target} PRIVATE -UOOX_EXCEPTIONS_ENABLED -DOOX_EXCEPTIONS_ENABLED=${policy_value})
+    target_link_libraries(${fib_target} ${PROJECT_NAME} benchmark::benchmark ${${mode}_LIBS})
+    target_include_directories(${fib_target} PRIVATE ${PROJECT_NAME})
+    add_test(NAME ${fib_target}
+             COMMAND ${fib_target} --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME} --benchmark_filter=Fib_Serial/8)
+  endforeach()
+endforeach()
+
 if(TBB_FOUND OR Taskflow_FOUND)
   add_executable(bench_taskbench_alt_failures bench_taskbench_alt_failures.cpp)
   target_compile_definitions(bench_taskbench_alt_failures PRIVATE
