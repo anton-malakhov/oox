@@ -31,6 +31,7 @@ FetchContent_MakeAvailable(benchmark)
 
 list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
 option(OOX_BUILD_TASKBENCH "Build Task-Bench-style benchmarks" ON)
+option(OOX_BUILD_SCHEDULER_EVALS "Build composable-scheduler evaluation kernels" OFF)
 set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tasks: tbb, system, or jemalloc")
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
 set(OOX_BACKENDS)
@@ -88,6 +89,12 @@ if(folly_FOUND)
   list(APPEND OOX_BACKENDS FOLLY)
   list(APPEND FOLLY_LIBS folly)
   list(APPEND FOLLY_LOOP_MODES FOLLY_FOR_EACH)
+endif()
+
+if(EIGEN_FOUND)
+  message(STATUS "Building with bundled Eigen work-stealing backend")
+  list(APPEND OOX_BACKENDS EIGEN)
+  list(APPEND EIGEN_LIBS Threads::Threads)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
@@ -151,8 +158,13 @@ if(TBB_FOUND OR Taskflow_FOUND)
                    --benchmark_repetitions=1
                    --benchmark_min_warmup_time=0
                    --benchmark_filter=/128/16)
+  set_tests_properties(bench_taskbench_alt_failures PROPERTIES TIMEOUT 60)
 endif()
 
 if(OOX_BUILD_TASKBENCH)
   add_subdirectory(taskbench)
+endif()
+
+if(OOX_BUILD_SCHEDULER_EVALS)
+  add_subdirectory(scheduler_eval)
 endif()
