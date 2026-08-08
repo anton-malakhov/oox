@@ -55,6 +55,16 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     gtest_discover_tests(${unittest}_tbb)
   endif ()
 
+  if (EIGEN_FOUND)
+    add_executable(${unittest}_eigen ${unittest}.cpp)
+    target_compile_definitions(${unittest}_eigen PRIVATE HAVE_EIGEN)
+    target_link_libraries(${unittest}_eigen PRIVATE
+            ${PROJECT_NAME}
+            ${OOX_GTEST_LIB}
+            Threads::Threads)
+    gtest_discover_tests(${unittest}_eigen)
+  endif ()
+
   if (Taskflow_FOUND)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)

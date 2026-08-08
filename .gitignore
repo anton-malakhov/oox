@@ -33,6 +33,7 @@
 
 # Dirs
 build*/
+cmake-build*/
 output/
 results/
 .vscode/
