@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Fit an explainable scheduler model to one scheduler_eval result directory."""
+
+import argparse
+import csv
+import html
+import json
+import math
+from pathlib import Path
+import re
+import statistics
+
+
+TIME_TO_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
+SPMV_RE = re.compile(
+    r"^SpmvBenchmark<SparseKind::(Balanced|Hyperbolic|Triangle)>/(\d+)/real_time$")
+SCAN_RE = re.compile(r"^Scan/(\d+)/real_time$")
+LAUNCH_RE = re.compile(r"^Launch/(\d+)/real_time$")
+COLORS = {
+    "RAPID_START": "#3973ac",
+    "EIGEN_STEALING": "#d95f02",
+    "EIGEN_SHARING": "#2a9d50",
+    "EIGEN_SHARING_STEALING": "#8e5bb7",
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("result", type=Path,
+                        help="a complete results/scheduler_eval directory")
+    return parser.parse_args()
+
+
+def write_csv(path, fieldnames, rows):
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def benchmark_medians(result, modes):
+    samples = {}
+    for path in sorted((result / "raw").glob("bench_scheduler_eval_*.json")):
+        mode = path.stem.removeprefix("bench_scheduler_eval_")
+        if mode not in modes:
+            continue
+        for row in json.loads(path.read_text()).get("benchmarks", []):
+            if row.get("run_type", "iteration") != "iteration":
+                continue
+            value = float(row["real_time"]) * TIME_TO_US[row.get("time_unit", "ns")]
+            samples.setdefault((row["name"], mode), []).append(value)
+    return {key: statistics.median(values) for key, values in samples.items()}
+
+
+def nonnegative_line_fit(xs, ys):
+    """Least squares y=a+b*x with a,b >= 0."""
+    candidates = []
+    count = len(xs)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denominator = count * sxx - sx * sx
+    if denominator:
+        b = (count * sxy - sx * sy) / denominator
+        a = (sy - b * sx) / count
+        if a >= 0 and b >= 0:
+            candidates.append((a, b))
+    candidates.append((max(0.0, sy / count), 0.0))
+    candidates.append((0.0, max(0.0, sxy / sxx) if sxx else 0.0))
+    return min(candidates,
+               key=lambda ab: sum((y - ab[0] - ab[1] * x) ** 2
+                                   for x, y in zip(xs, ys)))
+
+
+def fit_launch(points):
+    """Fit H(N)=a+b*(N/scale)^gamma by a bounded grid search."""
+    points = sorted(points)
+    scale = float(max(x for x, _ in points))
+    best = None
+    for step in range(20, 161):
+        gamma = step / 100.0
+        xs = [(x / scale) ** gamma for x, _ in points]
+        ys = [y for _, y in points]
+        a, b = nonnegative_line_fit(xs, ys)
+        error = sum((y - a - b * x) ** 2 for x, y in zip(xs, ys))
+        candidate = (error, a, b, gamma)
+        if best is None or candidate < best:
+            best = candidate
+    _, a, b, gamma = best
+    predictions = [a + b * (x / scale) ** gamma for x, _ in points]
+    return {
+        "intercept_us": a,
+        "scale_us": b,
+        "task_scale": scale,
+        "exponent": gamma,
+        "mape_percent": mean_absolute_percentage(
+            [y for _, y in points], predictions),
+    }
+
+
+def launch_time(fit, tasks):
+    return (fit["intercept_us"] + fit["scale_us"] *
+            (max(1, tasks) / fit["task_scale"]) ** fit["exponent"])
+
+
+def mean_absolute_percentage(observed, predicted):
+    values = [abs(actual - estimate) / actual
+              for actual, estimate in zip(observed, predicted) if actual]
+    return 100.0 * sum(values) / len(values) if values else math.nan
+
+
+def through_origin(xs, ys):
+    denominator = sum(x * x for x in xs)
+    return max(0.0, sum(x * y for x, y in zip(xs, ys)) / denominator)
+
+
+def solve_linear(matrix, vector):
+    size = len(vector)
+    rows = [list(matrix[index]) + [vector[index]] for index in range(size)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(rows[row][column]))
+        if abs(rows[pivot][column]) < 1e-12:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        divisor = rows[column][column]
+        rows[column] = [value / divisor for value in rows[column]]
+        for row in range(size):
+            if row == column:
+                continue
+            factor = rows[row][column]
+            rows[row] = [left - factor * right
+                         for left, right in zip(rows[row], rows[column])]
+    return [rows[index][-1] for index in range(size)]
+
+
+def nonnegative_least_squares(columns, targets):
+    """Small active-set NNLS; this model uses at most three coefficients."""
+    width = len(columns[0])
+    candidates = [tuple(0.0 for _ in range(width))]
+    for mask in range(1, 1 << width):
+        active = [index for index in range(width) if mask & (1 << index)]
+        gram = [[sum(row[left] * row[right] for row in columns)
+                 for right in active] for left in active]
+        rhs = [sum(row[index] * target
+                   for row, target in zip(columns, targets)) for index in active]
+        solution = solve_linear(gram, rhs)
+        if solution is None or any(value < 0 for value in solution):
+            continue
+        candidate = [0.0] * width
+        for index, value in zip(active, solution):
+            candidate[index] = value
+        candidates.append(tuple(candidate))
+    return min(candidates,
+               key=lambda values: sum((target - sum(value * x for value, x
+                                                     in zip(values, row))) ** 2
+                                      for row, target in zip(columns, targets)))
+
+
+def sparse_weights(rows, columns, kind):
+    harmonic = sum(1.0 / index for index in range(1, rows + 1))
+    average = max(1, (columns + 8) // 9)
+    weights = []
+    for row in range(rows):
+        count = average
+        if kind == "Hyperbolic":
+            count = max(1, int(average * rows / harmonic / (row + 1)))
+        elif kind == "Triangle":
+            count = max(1, 2 * average * (rows - row) // (rows + 1))
+        width = (max(1, columns * (row + 1) // rows)
+                 if kind == "Triangle" else columns)
+        weights.append(min(count, width))
+    return weights
+
+
+def static_maximum(weights, parts):
+    step, remainder = divmod(len(weights), parts)
+    cursor = 0
+    loads = []
+    for part in range(parts):
+        length = step + (part < remainder)
+        loads.append(sum(weights[cursor:cursor + length]))
+        cursor += length
+    return max(loads)
+
+
+def spmv_cases(medians, threads):
+    rows = (threads << 9) + (threads << 4) + 7
+    cases = []
+    structures = {}
+    for (name, mode), observed in medians.items():
+        match = SPMV_RE.match(name)
+        if not match:
+            continue
+        kind, raw_columns = match.group(1), int(match.group(2))
+        columns = raw_columns + (threads << 2) + 3
+        key = (kind, columns)
+        if key not in structures:
+            weights = sparse_weights(rows, columns, kind)
+            total = sum(weights)
+            maximum = static_maximum(weights, threads)
+            structures[key] = (total, maximum)
+        total, maximum = structures[key]
+        cases.append({
+            "family": kind.lower(), "parameter": columns, "mode": mode,
+            "observed_us": observed, "tasks": rows, "total_work": total,
+            "ideal_work": total / threads, "static_max_work": maximum,
+            "static_excess": maximum - total / threads,
+        })
+    return cases
+
+
+def fit_spmv(cases, launch_fits, modes):
+    rapid = "RAPID_START"
+    work_unit = {}
+    for family in sorted({case["family"] for case in cases}):
+        selected = [case for case in cases
+                    if case["family"] == family and case["mode"] == rapid]
+        xs = [case["static_max_work"] for case in selected]
+        ys = [max(0.0, case["observed_us"] -
+                  launch_time(launch_fits[rapid], case["tasks"]))
+              for case in selected]
+        work_unit[family] = through_origin(xs, ys)
+
+    coefficients = {rapid: {"body_interaction_us_per_iteration": 0.0,
+                            "work_inflation": 1.0,
+                            "residual_static_imbalance": 1.0}}
+    for mode in sorted(modes - {rapid}):
+        selected = [case for case in cases if case["mode"] == mode]
+        columns, targets = [], []
+        for case in selected:
+            rate = work_unit[case["family"]]
+            columns.append((case["tasks"], rate * case["ideal_work"],
+                            rate * case["static_excess"]))
+            targets.append(max(0.0, case["observed_us"] -
+                               launch_time(launch_fits[mode], case["tasks"])))
+        body_interaction, work_inflation, residual = nonnegative_least_squares(
+            columns, targets)
+        coefficients[mode] = {
+            "body_interaction_us_per_iteration": body_interaction,
+            "work_inflation": work_inflation,
+            "residual_static_imbalance": residual,
+        }
+
+    predictions = []
+    for case in cases:
+        rate = work_unit[case["family"]]
+        coefficient = coefficients[case["mode"]]
+        scheduler = launch_time(launch_fits[case["mode"]], case["tasks"])
+        body_interaction = (coefficient["body_interaction_us_per_iteration"] *
+                            case["tasks"])
+        ideal = rate * coefficient["work_inflation"] * case["ideal_work"]
+        imbalance = (rate * coefficient["residual_static_imbalance"] *
+                     case["static_excess"])
+        predicted = scheduler + body_interaction + ideal + imbalance
+        predictions.append({
+            **case, "case": f'{case["family"]}/{case["parameter"]}',
+            "predicted_us": predicted, "scheduler_us": scheduler,
+            "body_interaction_us": body_interaction,
+            "ideal_work_us": ideal, "imbalance_us": imbalance,
+            "error_percent": 100.0 * (predicted - case["observed_us"]) /
+                             case["observed_us"],
+            "static_imbalance_ratio": (case["static_max_work"] /
+                                       case["ideal_work"]),
+        })
+    for mode, coefficient in coefficients.items():
+        selected = [row for row in predictions if row["mode"] == mode]
+        coefficient["mape_percent"] = mean_absolute_percentage(
+            [row["observed_us"] for row in selected],
+            [row["predicted_us"] for row in selected])
+    return work_unit, coefficients, predictions
+
+
+def fit_scan(medians, launch_fits, modes, threads):
+    cases = []
+    for (name, mode), observed in medians.items():
+        match = SCAN_RE.match(name)
+        if not match:
+            continue
+        size = 1 << int(match.group(1))
+        stages = []
+        tasks = size // 2
+        while tasks:
+            stages.append(tasks)
+            tasks //= 2
+        within_launch_range = max(stages) <= min(
+            fit["task_scale"] for fit in launch_fits.values())
+        launch_sum = 2.0 * sum(launch_time(launch_fits[mode], n) for n in stages)
+        calls = 2 * len(stages)
+        waves = 2 * sum((n + threads - 1) // threads for n in stages)
+        cases.append({"family": "scan", "case": f"scan/{size}",
+                      "parameter": size, "mode": mode,
+                      "observed_us": observed, "launch_sum_us": launch_sum,
+                      "calls": calls, "waves": waves,
+                      "total_work": 2 * size - 2,
+                      "within_launch_range": within_launch_range})
+    if not cases:
+        return {}, []
+    coefficients = {}
+    for mode in sorted(modes):
+        selected = [case for case in cases if case["mode"] == mode]
+        call_us, wave_us = nonnegative_least_squares(
+            [(case["calls"] / case["observed_us"],
+              case["waves"] / case["observed_us"]) for case in selected],
+            [1.0 for _ in selected])
+        coefficients[mode] = {"effective_call_us": call_us,
+                              "effective_wave_us": wave_us}
+    predictions = []
+    for case in cases:
+        coefficient = coefficients[case["mode"]]
+        scheduler = coefficient["effective_call_us"] * case["calls"]
+        ideal = coefficient["effective_wave_us"] * case["waves"]
+        predicted = scheduler + ideal
+        predictions.append({
+            **case, "predicted_us": predicted, "scheduler_us": scheduler,
+            "ideal_work_us": ideal,
+            "body_interaction_us": 0.0, "imbalance_us": 0.0, "error_percent":
+                100.0 * (predicted - case["observed_us"]) / case["observed_us"],
+            "tasks": "", "ideal_work": case["waves"],
+            "static_max_work": "", "static_excess": "",
+            "static_imbalance_ratio": "",
+        })
+    for mode, coefficient in coefficients.items():
+        selected = [row for row in predictions if row["mode"] == mode]
+        coefficient["mape_percent"] = mean_absolute_percentage(
+            [row["observed_us"] for row in selected],
+            [row["predicted_us"] for row in selected])
+        valid = [row for row in selected if row["within_launch_range"]]
+        coefficient["launch_sum_mape_in_measured_range_percent"] = (
+            mean_absolute_percentage(
+                [row["observed_us"] for row in valid],
+                [row["launch_sum_us"] for row in valid]))
+    return coefficients, predictions
+
+
+def startup_parameters(result, modes):
+    values = {}
+    for path in sorted((result / "raw").glob("scheduling_dist_spin_*.json")):
+        data = json.loads(path.read_text())
+        mode = data.get("mode")
+        if mode not in modes:
+            continue
+        distinct = [len(set(row["worker"])) for row in data.get("iterations", [])]
+        maximum = []
+        for row in data.get("iterations", []):
+            counts = {}
+            for worker in row["worker"]:
+                counts[worker] = counts.get(worker, 0) + 1
+            maximum.append(max(counts.values(), default=0))
+        values[mode] = {
+            "initialization_us": float(data["initialization_ns"]) / 1000.0,
+            "p99_publication_spread_us":
+                float(data["spread_summary_ns"]["p99"]) / 1000.0,
+            "median_distinct_workers": statistics.median(distinct) if distinct else 0,
+            "median_max_tasks_per_worker": statistics.median(maximum) if maximum else 0,
+        }
+    return values
+
+
+def write_spmv_chart(path, predictions):
+    families = ["balanced", "hyperbolic", "triangle"]
+    modes = sorted({row["mode"] for row in predictions})
+    width, height = 1280, 500
+    left, right, top, bottom, gap = 95, 25, 50, 95, 38
+    panel_width = (width - left - right - gap * 2) / 3
+    panel_height = height - top - bottom
+    all_x = [float(row["parameter"]) for row in predictions]
+    all_y = [float(row[key]) for row in predictions
+             for key in ("observed_us", "predicted_us")]
+    x0, x1 = math.log10(min(all_x)), math.log10(max(all_x))
+    y0, y1 = math.log10(min(all_y)), math.log10(max(all_y))
+    ypad = max(0.05, (y1 - y0) * 0.08)
+    y0, y1 = y0 - ypad, y1 + ypad
+    elements = [f'<rect width="{width}" height="{height}" fill="white"/>',
+                '<text x="18" y="25" font-size="18" font-weight="600">'
+                'SpMV model: measured (solid) and predicted (dashed)</text>',
+                f'<text x="24" y="{top + panel_height / 2:.1f}" '
+                f'text-anchor="middle" font-size="13" transform="rotate(-90 24 '
+                f'{top + panel_height / 2:.1f})">Time, us (log scale)</text>',
+                f'<text x="{width / 2:.1f}" y="{height - 48}" '
+                'text-anchor="middle" font-size="13">Matrix width (columns), '
+                'log scale</text>']
+    for panel, family in enumerate(families):
+        rows = [row for row in predictions if row["family"] == family]
+        xs = [float(row["parameter"]) for row in rows]
+        px = left + panel * (panel_width + gap)
+        sx = lambda value: px + (math.log10(value) - x0) * panel_width / (x1 - x0)
+        sy = lambda value: top + (y1 - math.log10(value)) * panel_height / (y1 - y0)
+        elements.extend([
+            f'<text x="{px + panel_width / 2:.1f}" y="43" text-anchor="middle" '
+            f'font-size="14">{html.escape(family.title())}</text>',
+            f'<line x1="{px:.1f}" y1="{top}" x2="{px:.1f}" '
+            f'y2="{top + panel_height}" stroke="#444"/>',
+            f'<line x1="{px:.1f}" y1="{top + panel_height}" '
+            f'x2="{px + panel_width:.1f}" y2="{top + panel_height}" stroke="#444"/>',
+        ])
+        for tick in range(5):
+            value = 10 ** (y0 + tick * (y1 - y0) / 4)
+            y = sy(value)
+            elements.append(f'<line x1="{px:.1f}" y1="{y:.1f}" '
+                            f'x2="{px + panel_width:.1f}" y2="{y:.1f}" '
+                            'stroke="#e3e3e3"/>')
+            if panel == 0:
+                elements.append(f'<text x="{px - 8:.1f}" y="{y + 4:.1f}" '
+                                f'text-anchor="end" font-size="11">{value:.3g}</text>')
+        for mode in modes:
+            selected = sorted((row for row in rows if row["mode"] == mode),
+                              key=lambda row: row["parameter"])
+            color = COLORS.get(mode, "#666666")
+            for key, dash in (("observed_us", ""), ("predicted_us", "6 4")):
+                points = " ".join(f'{sx(row["parameter"]):.1f},'
+                                  f'{sy(row[key]):.1f}' for row in selected)
+                dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+                elements.append(f'<polyline points="{points}" fill="none" '
+                                f'stroke="{color}" stroke-width="2"{dash_attr}/>')
+        for value in sorted(set(xs)):
+            if value in (min(xs), max(xs)):
+                elements.append(f'<text x="{sx(value):.1f}" '
+                                f'y="{top + panel_height + 20}" text-anchor="middle" '
+                                f'font-size="11">{value:g}</text>')
+    legend_x = left
+    for index, mode in enumerate(modes):
+        x = legend_x + index * 240
+        color = COLORS.get(mode, "#666666")
+        elements.append(f'<line x1="{x}" y1="{height - 17}" x2="{x + 26}" '
+                        f'y2="{height - 17}" stroke="{color}" stroke-width="3"/>')
+        elements.append(f'<text x="{x + 33}" y="{height - 12}" '
+                        f'font-size="12">{html.escape(mode)}</text>')
+    path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+                    f'height="{height}" viewBox="0 0 {width} {height}">'
+                    f'{"".join(elements)}</svg>\n')
+
+
+def main():
+    result = parse_args().result.resolve()
+    metadata = json.loads((result / "metadata.json").read_text())
+    if not metadata.get("complete") or metadata.get("smoke"):
+        raise RuntimeError("The model requires a complete, non-smoke result")
+    modes = set(metadata["modes"])
+    if "RAPID_START" not in modes:
+        raise RuntimeError("RAPID_START is required as the static calibration anchor")
+    medians = benchmark_medians(result, modes)
+    launch_points = {mode: [] for mode in modes}
+    for (name, mode), value in medians.items():
+        match = LAUNCH_RE.match(name)
+        if match:
+            launch_points[mode].append((int(match.group(1)), value))
+    missing = [mode for mode, points in launch_points.items() if len(points) < 3]
+    if missing:
+        raise RuntimeError(f"Need at least three Launch cases for: {', '.join(missing)}")
+    launch_fits = {mode: fit_launch(points)
+                   for mode, points in launch_points.items()}
+
+    threads = int(metadata["threads"])
+    work_unit, spmv_parameters, spmv_predictions = fit_spmv(
+        spmv_cases(medians, threads), launch_fits, modes)
+    scan_parameters, scan_predictions = fit_scan(
+        medians, launch_fits, modes, threads)
+    startup = startup_parameters(result, modes)
+
+    summaries, plots = result / "summaries", result / "plots"
+    summaries.mkdir(exist_ok=True)
+    plots.mkdir(exist_ok=True)
+    parameters = {
+        "schema": 1, "result": str(result), "threads": threads,
+        "model": ("T_warm = H_m(N) + rho_m*N + "
+                  "kappa_k*(phi_m*W/P + theta_m*Delta_static)"),
+        "amortized_model": "T_amortized(q) = I_m/q + T_warm",
+        "launch": launch_fits,
+        "spmv_work_unit_us": work_unit,
+        "spmv_mode_parameters": spmv_parameters,
+        "scan_mode_parameters": scan_parameters,
+        "startup": startup,
+    }
+    (summaries / "model_parameters.json").write_text(
+        json.dumps(parameters, indent=2, sort_keys=True) + "\n")
+
+    fields = ["family", "case", "parameter", "mode", "observed_us",
+              "predicted_us", "scheduler_us", "body_interaction_us",
+              "ideal_work_us", "imbalance_us", "error_percent", "tasks",
+              "total_work", "ideal_work", "within_launch_range",
+              "static_max_work", "static_excess", "static_imbalance_ratio"]
+    write_csv(summaries / "model_predictions.csv", fields,
+              [{field: row.get(field, "") for field in fields}
+               for row in spmv_predictions + scan_predictions])
+    amortization = []
+    for mode, values in sorted(startup.items()):
+        for calls in (1, 10, 100, 1000, 10000):
+            amortization.append({
+                "mode": mode, "calls": calls,
+                "initialization_us": values["initialization_us"],
+                "initialization_us_per_call": values["initialization_us"] / calls,
+            })
+    write_csv(summaries / "model_initialization_amortization.csv",
+              ["mode", "calls", "initialization_us",
+               "initialization_us_per_call"], amortization)
+    write_spmv_chart(plots / "model_spmv_observed_vs_predicted.svg",
+                     spmv_predictions)
+
+    with (summaries / "model.md").open("w") as stream:
+        stream.write("# Explainable scheduler model\n\n")
+        stream.write(f"Fit to `{result.name}` at P={threads}. Times are microseconds.\n\n")
+        stream.write("## SpMV coefficients\n\n")
+        stream.write("| Mode | Body interaction/row (us) | Work inflation phi | "
+                     "Residual imbalance theta | MAPE |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: |\n")
+        for mode, values in sorted(spmv_parameters.items()):
+            stream.write(f'| {mode} | '
+                         f'{values["body_interaction_us_per_iteration"]:.3f} | '
+                         f'{values["work_inflation"]:.3f} | '
+                         f'{values["residual_static_imbalance"]:.3f} | '
+                         f'{values["mape_percent"]:.1f}% |\n')
+        stream.write("\nThe body-interaction term captures per-row costs that an "
+                     "empty `Launch` cannot see (task/body overlap, migration, and "
+                     "cache effects). `phi` is extra effective work relative to Rapid Start's "
+                     "placement; `theta=0` removes the static tail and `theta=1` "
+                     "retains it. They are fitted diagnostic coefficients, not "
+                     "universal scheduler constants.\n\n")
+        stream.write("## Launch model\n\n")
+        stream.write("`H(N) = a + b (N/Nmax)^gamma`. The exponent describes this "
+                     "measurement range; it is not an asymptotic complexity claim.\n\n")
+        stream.write("| Mode | a (us) | b (us) | gamma | MAPE |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: |\n")
+        for mode, values in sorted(launch_fits.items()):
+            stream.write(f'| {mode} | {values["intercept_us"]:.2f} | '
+                         f'{values["scale_us"]:.2f} | {values["exponent"]:.2f} | '
+                         f'{values["mape_percent"]:.1f}% |\n')
+        stream.write("\n## Cold worker cost\n\n")
+        stream.write("Initialization is kept separate: for q calls, add `I/q` to "
+                     "each predicted warm call.\n\n")
+        stream.write("| Mode | I (us) | P99 publication spread (us) | "
+                     "Median workers observed |\n| --- | ---: | ---: | ---: |\n")
+        for mode, values in sorted(startup.items()):
+            stream.write(f'| {mode} | {values["initialization_us"]:.1f} | '
+                         f'{values["p99_publication_spread_us"]:.1f} | '
+                         f'{values["median_distinct_workers"]:.0f} |\n')
+        if scan_parameters:
+            stream.write("\n## Scan model\n\n")
+            stream.write("Scan uses `T = alpha * (2 log2 N) + beta * waves`, where "
+                         "`waves = 2 sum ceil((N/2^j)/P)`. `alpha` is the effective "
+                         "hot parallel-call/barrier cost and `beta` combines one wave of "
+                         "scan work with body-dependent scheduling.\n\n")
+            stream.write("| Mode | alpha/call (us) | beta/wave (us) | MAPE |\n")
+            stream.write("| --- | ---: | ---: | ---: |\n")
+            for mode, values in sorted(scan_parameters.items()):
+                stream.write(f'| {mode} | {values["effective_call_us"]:.3f} | '
+                             f'{values["effective_wave_us"]:.6f} | '
+                             f'{values["mape_percent"]:.1f}% |\n')
+        stream.write("\nSee `model_predictions.csv` for every fitted case and "
+                     "`../plots/model_spmv_observed_vs_predicted.svg` for residuals.\n")
+
+    print(summaries / "model.md")
+
+
+if __name__ == "__main__":
+    main()

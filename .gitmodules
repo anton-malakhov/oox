@@ -10,3 +10,13 @@
 [submodule "thirdparty/fastfloat"]
 	path = thirdparty/fastfloat
 	url = https://github.com/fastfloat/fast_float.git
+[submodule "thirdparty/pbbsbench"]
+	path = thirdparty/pbbsbench
+	url = https://github.com/EgorkaZ/pbbsbench.git
+	branch = eigen-mailbox
+	ignore = untracked
+[submodule "thirdparty/composable-parallel-scheduler-thesis"]
+	path = thirdparty/composable-parallel-scheduler-thesis
+	url = https://github.com/lejabque/composable-parallel-scheduler-thesis.git
+	branch = master
+	ignore = untracked
