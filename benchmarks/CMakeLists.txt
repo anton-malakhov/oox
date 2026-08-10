@@ -29,7 +29,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(benchmark)
 
-list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
+list(APPEND OOX_BENCHMARKS bench_fib bench_loops bench_accounts)
 option(OOX_BUILD_TASKBENCH "Build Task-Bench-style benchmarks" ON)
 set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tasks: tbb, system, or jemalloc")
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)

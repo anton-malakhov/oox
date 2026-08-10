@@ -122,6 +122,15 @@ TEST(SharedVar, MixedVarAndSharedVar) {
     EXPECT_EQ(oox::wait_and_get(sum), 11);
 }
 
+TEST(SharedVar, MixedVarAndSharedVarWriters) {
+    oox::var<int> plain(0);
+    oox::shared_var<int> shared(0);
+    auto done = oox::run([](int& p, int& s) { p = 1; s = 2; }, plain, shared);
+    oox::wait_for_all(done);
+    EXPECT_EQ(oox::wait_and_get(plain), 1);
+    EXPECT_EQ(oox::wait_and_get(shared), 2);
+}
+
 TEST(SharedVar, VoidResultTask) {
     oox::shared_var<int> value(0);
     auto done = oox::run([](int& v) { v += 5; }, value);

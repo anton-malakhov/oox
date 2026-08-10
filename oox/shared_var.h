@@ -8,6 +8,7 @@
 #include <oox/oox.h>
 
 #include <memory>
+#include <mutex>
 
 // oox::shared_var<T> — thread-safe, copyable counterpart of oox::var<T>.
 //
@@ -35,6 +36,15 @@ template <typename T, bool CanThrow = default_exception_policy>
 class shared_var;
 
 namespace internal {
+
+// Mutex abstraction for the shared state. oox.h's sync namespace provides a
+// mutex only under HAVE_TWIST; shared_var needs one in every build, so the
+// alias lives here (keeps oox.h untouched).
+#if HAVE_TWIST
+using shared_var_mutex = sync::mutex;
+#else
+using shared_var_mutex = std::mutex;
+#endif
 
 // ---------------------------------------------------------------------------
 // shared_var_args — mirrors oox_var_args for shared_var arguments of oox::run
@@ -73,7 +83,7 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
             // Copy the shared_ptr: the caller's handle may be released while
             // we hold the lock, but the state must stay alive.
             auto state = cov.state_;
-            std::unique_lock<sync::mutex> lock(state->mtx);
+            std::unique_lock<shared_var_mutex> lock(state->mtx);
             if (!state->inner.current_task) {
                 state->inner = var_type(ooxed_type()); // lazy default value, like var
             }
@@ -161,7 +171,7 @@ class shared_var {
     friend struct internal::shared_var_args;
 
     struct shared_state {
-        internal::sync::mutex mtx;        // serializes every mutation of the handle state
+        internal::shared_var_mutex mtx;   // serializes every mutation of the handle state
         var<T, CanThrow> inner;           // the "eternal owner": keeps value slots alive
 
         shared_state() = default;
@@ -185,7 +195,7 @@ class shared_var {
     auto with_ready_slot(F&& fn) const
         -> decltype(std::forward<F>(fn)(static_cast<internal::task_node*>(nullptr),
                                         static_cast<void*>(nullptr), 0)) {
-        std::unique_lock<internal::sync::mutex> lock(state_->mtx);
+        std::unique_lock<internal::shared_var_mutex> lock(state_->mtx);
         if (!state_->inner.current_task) {
             state_->inner = var<T, CanThrow>(T{}); // lazy var: materialize default value
         }
@@ -216,12 +226,12 @@ public:
     // Write a new value into the shared state. Concurrent assignments
     // serialize on the state mutex; the last one wins.
     shared_var& operator=(const T& t) {
-        std::unique_lock<internal::sync::mutex> lock(state_->mtx);
+        std::unique_lock<internal::shared_var_mutex> lock(state_->mtx);
         state_->inner = var<T, CanThrow>(t);
         return *this;
     }
     shared_var& operator=(T&& t) {
-        std::unique_lock<internal::sync::mutex> lock(state_->mtx);
+        std::unique_lock<internal::shared_var_mutex> lock(state_->mtx);
         state_->inner = var<T, CanThrow>(std::move(t));
         return *this;
     }
@@ -263,7 +273,7 @@ public:
     void cancel() noexcept {
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
-            std::unique_lock<internal::sync::mutex> lock(state_->mtx);
+            std::unique_lock<internal::shared_var_mutex> lock(state_->mtx);
             state_->inner.cancel();
         }
 #endif

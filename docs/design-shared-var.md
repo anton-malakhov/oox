@@ -92,6 +92,12 @@ from the storage pointer captured at registration time; the graph orders the
 write before the read (flow dependency), and the slot stays alive while the
 result var of its producer lives (existing lifetime rules).
 
+`oox::run` arguments are handled **per argument**: a single task may mix plain
+`oox::var` and `oox::shared_var` arguments (each kind matched by its own
+`base_args` specialization, each `shared_var` locked independently, one
+argument at a time). The plain-var parts keep their single-threaded semantics;
+only the `shared_var` parts add the mutex.
+
 ### 4.2 `get()` / `wait()` — any thread, concurrently
 
 1. `lock(state->mtx)`.

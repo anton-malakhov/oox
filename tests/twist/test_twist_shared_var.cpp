@@ -166,6 +166,39 @@ void HandleCopyLifecycle() {
     TWIST_ASSERT_M(oox::wait_and_get(value) == 9, "last write wins");
 }
 
+// A single task may mix plain oox::var and oox::shared_var arguments: the
+// per-argument machinery handles each kind independently, and a concurrent
+// writer on the shared_var must still serialize with the mixed task's writer.
+void MixedVarAndSharedVarArgs() {
+    oox::var<int> plain(0);
+    oox::shared_var<int> shared(10);
+    twist::test::body::WaitGroup wg;
+
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        auto r = oox::run([](int& p, int& s) {
+            twist::assist::PreemptionPoint();
+            p = 1;
+            s = 2;
+        }, plain, shared);
+        oox::wait_for_all(r);
+    });
+
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        oox::run([](int& s) {
+            twist::assist::PreemptionPoint();
+            s = 100;
+        }, shared);
+    });
+
+    wg.Join();
+
+    TWIST_ASSERT_M(oox::wait_and_get(plain) == 1, "plain var written by the mixed task");
+    const int sv = oox::wait_and_get(shared);
+    TWIST_ASSERT_M(sv == 2 || sv == 100, "shared var written by one serialized writer");
+}
+
 } // namespace
 
 int main() {
@@ -175,5 +208,6 @@ int main() {
     oox::twist_tests::RunRandomSeeds("ConcurrentGet", ConcurrentGet);
     oox::twist_tests::RunRandomSeeds("WriterSwitchWhileGetPending", WriterSwitchWhileGetPending);
     oox::twist_tests::RunRandomSeeds("HandleCopyLifecycle", HandleCopyLifecycle);
+    oox::twist_tests::RunRandomSeeds("MixedVarAndSharedVarArgs", MixedVarAndSharedVarArgs);
     return 0;
 }
