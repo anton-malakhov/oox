@@ -9,7 +9,18 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <barrier>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <exception>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -17,6 +28,93 @@ namespace {
 struct account {
     int points = 1000;
 };
+
+using namespace std::chrono_literals;
+
+constexpr auto k_async_test_timeout = 2s;
+constexpr auto k_registration_rendezvous_timeout = 500ms;
+
+// Forces two lazy shared_var values to be materialized concurrently. Each
+// constructor runs while setup() holds the mutex for its first shared_var, so
+// opposite argument orders deterministically expose non-atomic registration.
+// The bounded wait also lets the test pass after a fix that locks all states in
+// a canonical order before materializing either value.
+class registration_rendezvous {
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool enabled_ = false;
+    int participants_ = 0;
+
+public:
+    void enable() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enabled_ = true;
+        participants_ = 0;
+    }
+
+    void disable() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            enabled_ = false;
+        }
+        cv_.notify_all();
+    }
+
+    void arrive() {
+        thread_local bool already_arrived = false;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!enabled_ || already_arrived) {
+            return;
+        }
+
+        already_arrived = true;
+        ++participants_;
+        cv_.notify_all();
+        cv_.wait_for(lock, k_registration_rendezvous_timeout,
+                     [this] { return participants_ >= 2 || !enabled_; });
+    }
+};
+
+registration_rendezvous writer_registration_rendezvous;
+
+struct gated_value {
+    int value = 0;
+
+    gated_value() {
+        writer_registration_rendezvous.arrive();
+    }
+};
+
+template <typename F>
+testing::AssertionResult completes_within(F&& scenario, const char* timeout_message) {
+    auto completion = std::make_shared<std::promise<void>>();
+    auto completion_future = completion->get_future();
+    std::thread worker([scenario = std::forward<F>(scenario), completion]() mutable {
+        try {
+            scenario();
+            completion->set_value();
+        } catch (...) {
+            completion->set_exception(std::current_exception());
+        }
+    });
+
+    if (completion_future.wait_for(k_async_test_timeout) != std::future_status::ready) {
+        // The scenario owns all of its state. Detaching it lets this test report
+        // a bounded failure even when the implementation has deadlocked.
+        worker.detach();
+        return testing::AssertionFailure() << timeout_message;
+    }
+
+    worker.join();
+    try {
+        completion_future.get();
+    } catch (const std::exception& e) {
+        return testing::AssertionFailure() << "scenario threw: " << e.what();
+    } catch (...) {
+        return testing::AssertionFailure() << "scenario threw a non-standard exception";
+    }
+    return testing::AssertionSuccess();
+}
 
 } // namespace
 
@@ -49,6 +147,16 @@ TEST(SharedVar, AdoptVar) {
     auto v = oox::run([] { return 7; });
     oox::shared_var<int> sv(std::move(v));
     EXPECT_EQ(sv.get(), 7);
+}
+
+TEST(SharedVar, AdoptForwardedVar) {
+    constexpr std::uint64_t expected = 0x1122334455667788ULL;
+    auto forwarded = oox::run([] {
+        return oox::run([] { return expected; });
+    });
+
+    oox::shared_var<std::uint64_t> sv(std::move(forwarded));
+    EXPECT_EQ(sv.get(), expected);
 }
 
 TEST(SharedVar, CopyHandlesShareState) {
@@ -172,6 +280,71 @@ TEST(SharedVar, ConcurrentWriterRegistration) {
     }
     // Writers serialize on the state mutex: all N increments must be applied.
     EXPECT_EQ(oox::wait_and_get(value), N * (N - 1) / 2);
+}
+
+TEST(SharedVar, WaitOnDeferredDoesNotBlockPublication) {
+#if defined(OOX_USING_SERIAL)
+    GTEST_SKIP() << "the serial backend does not implement blocking waits";
+#else
+    const auto completion = completes_within([] {
+        oox::shared_var<int> value(oox::deferred);
+        std::atomic<bool> published{false};
+        std::promise<void> publisher_started;
+        auto publisher_started_future = publisher_started.get_future();
+
+        std::thread publisher([&] {
+            publisher_started.set_value();
+            std::this_thread::sleep_for(250ms);
+            oox::run([](int& v) { v = 41; }, value);
+            published.store(true, std::memory_order_release);
+        });
+
+        publisher_started_future.wait();
+        value.wait();
+        if (!published.load(std::memory_order_acquire)) {
+            throw std::runtime_error("wait() returned before deferred publication");
+        }
+        publisher.join();
+        if (value.get() != 41) {
+            throw std::runtime_error("deferred publication produced the wrong value");
+        }
+    }, "wait() retained the shared_var mutex and blocked publication");
+    EXPECT_TRUE(completion);
+#endif
+}
+
+TEST(SharedVar, ConcurrentOppositeOrderMultiVarWritersComplete) {
+    const auto completion = completes_within([] {
+        writer_registration_rendezvous.enable();
+        oox::shared_var<gated_value> first;
+        oox::shared_var<gated_value> second;
+        std::barrier start(2);
+
+        std::thread first_registration([&] {
+            start.arrive_and_wait();
+            oox::run([](gated_value& a, gated_value& b) {
+                ++a.value;
+                ++b.value;
+            }, first, second);
+        });
+
+        std::thread second_registration([&] {
+            start.arrive_and_wait();
+            oox::run([](gated_value& b, gated_value& a) {
+                ++b.value;
+                ++a.value;
+            }, second, first);
+        });
+
+        first_registration.join();
+        second_registration.join();
+        writer_registration_rendezvous.disable();
+
+        if (first.get().value != 2 || second.get().value != 2) {
+            throw std::runtime_error("one of the two writer tasks did not run");
+        }
+    }, "opposite per-variable registration orders created a task cycle");
+    EXPECT_TRUE(completion);
 }
 
 TEST(SharedVar, ConcurrentCopyAndUse) {
