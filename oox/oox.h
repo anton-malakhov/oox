@@ -9,6 +9,9 @@
 #include <type_traits>
 #include <limits>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -137,6 +140,10 @@ inline void preemption_point() {
 
 template <typename T>
 using atomic = std::atomic<T>;
+
+using mutex = std::mutex;
+using condition_variable = std::condition_variable;
+using thread = std::thread;
 
 inline void preemption_point() {}
 

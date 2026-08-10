@@ -16,6 +16,7 @@ endif ()
 
 list(APPEND OOX_UNITTESTS
         test_oox
+        test_shared_var
 )
 
 foreach (unittest IN LISTS OOX_UNITTESTS)
