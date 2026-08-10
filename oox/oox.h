@@ -12,6 +12,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#if HAVE_TWIST && OOX_TWIST_TEST
+#include <vector>
+#endif
 #ifndef OOX_EXCEPTIONS_ENABLED
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif
@@ -143,6 +146,58 @@ inline void preemption_point() {}
 #endif
 
 } // namespace sync
+
+#if HAVE_TWIST && OOX_TWIST_TEST
+// The Twist backend launches detached worker threads. A value becomes ready
+// just before its worker exits, so a test scenario can otherwise return while
+// that worker is still completing its epilogue. Track test workers explicitly
+// and let the harness drain them before the simulator validates thread leaks.
+struct twist_task_tracker {
+    sync::mutex mutex;
+    std::vector<sync::thread> workers;
+
+    void track(sync::thread worker) {
+        std::lock_guard<sync::mutex> lock(mutex);
+        workers.push_back(std::move(worker));
+    }
+
+    void drain() {
+        std::size_t next = 0;
+        while (true) {
+            sync::thread worker;
+            {
+                std::lock_guard<sync::mutex> lock(mutex);
+                if (next == workers.size()) {
+                    return;
+                }
+                worker = std::move(workers[next++]);
+            }
+            worker.join();
+        }
+    }
+};
+
+inline twist_task_tracker* active_twist_task_tracker = nullptr;
+
+class twist_task_tracking_scope {
+    twist_task_tracker tracker_;
+
+public:
+    twist_task_tracking_scope() {
+        __OOX_ASSERT(active_twist_task_tracker == nullptr,
+                     "nested Twist task tracking scopes are not supported");
+        active_twist_task_tracker = &tracker_;
+    }
+
+    ~twist_task_tracking_scope() {
+        active_twist_task_tracker = nullptr;
+    }
+
+    void drain() {
+        tracker_.drain();
+    }
+};
+#endif
 
 #if OOX_EXCEPTIONS_ENABLED
 struct exception_control_struct {
@@ -460,10 +515,22 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
-        sync::thread([this] {
+#if OOX_TWIST_TEST
+        auto* tracker = active_twist_task_tracker;
+#endif
+        sync::thread worker([this] {
             sync::preemption_point();
             this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
-        }).detach();
+        });
+#if OOX_TWIST_TEST
+        if (tracker) {
+            tracker->track(std::move(worker));
+        } else {
+            worker.detach();
+        }
+#else
+        worker.detach();
+#endif
     }
     void wait() {
         std::unique_lock<sync::mutex> lock(waiter_mutex);

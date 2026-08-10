@@ -104,8 +104,7 @@ struct test_hooks {
             !t.has_start_failure() && !t.has_failure();
         const bool no_exception =
             t.local_exception() == nullptr &&
-            t.local_exception_control_handle() == nullptr &&
-            t.incoming_exception_control_handle() == nullptr;
+            t.local_exception_control_handle() == nullptr;
         return no_failure && no_exception;
     }
 

@@ -83,4 +83,21 @@ if (TWIST_SIM)
           LABELS "twist;concurrency;negative"
           TIMEOUT 30
   )
+
+  # Keep the shared_var counterexamples separate so one discovered defect does
+  # not prevent CTest from running and reporting the other scenarios.
+  oox_add_twist_executable(test_twist_shared_var_countertests
+          test_twist_shared_var_countertests.cpp)
+  add_test(NAME test_twist_shared_var_adopt_forwarded
+          COMMAND test_twist_shared_var_countertests AdoptForwardedVar)
+  add_test(NAME test_twist_shared_var_wait_during_publication
+          COMMAND test_twist_shared_var_countertests WaitOnDeferredDoesNotBlockPublication)
+  add_test(NAME test_twist_shared_var_opposite_writer_order
+          COMMAND test_twist_shared_var_countertests ConcurrentOppositeOrderMultiVarWritersComplete)
+  set_tests_properties(test_twist_shared_var_adopt_forwarded
+          PROPERTIES LABELS "twist;countertest" TIMEOUT 30)
+  set_tests_properties(
+          test_twist_shared_var_wait_during_publication
+          test_twist_shared_var_opposite_writer_order
+          PROPERTIES LABELS "twist;concurrency;countertest" TIMEOUT 30)
 endif ()
