@@ -295,8 +295,13 @@ TEST(SharedVar, WaitOnDeferredDoesNotBlockPublication) {
         std::thread publisher([&] {
             publisher_started.set_value();
             std::this_thread::sleep_for(250ms);
-            oox::run([](int& v) { v = 41; }, value);
-            published.store(true, std::memory_order_release);
+            oox::run([&published](int& v) {
+                v = 41;
+                // Set inside the writer: on backends where run() blocks until
+                // the task completes, a flag set after run() returns would be
+                // observed later than wait()'s unblock, failing the oracle.
+                published.store(true, std::memory_order_release);
+            }, value);
         });
 
         publisher_started_future.wait();
