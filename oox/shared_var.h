@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -408,10 +409,15 @@ class shared_var {
             port = base->current_port();
         };
         snapshot();
-        // Early-out for slots that are already produced (e.g. a constant value
-        // storage task that never executed): var::wait() mirrors this check.
-        // Otherwise wait() would block forever on their never-set promise.
-        if (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
+        // Wait until the current slot is produced. We never touch the task's
+        // own members (its waiter/cv) after it can be freed, so instead of
+        // task->wait() we poll the current slot's done marker under the state
+        // mutex, yielding between checks. The current task stays alive while
+        // we hold the mutex: the transition is blocked, and while it is still
+        // current its own completion keeps the slot-1 hold. If the slot is
+        // switched while we yield, we re-snapshot without touching the old
+        // (possibly freed) task.
+        while (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
             if (state_->inner.current_port_and_flags.is_deferred) {
                 // Deferred placeholder: block on the state CV (registration
                 // notifies it) instead of the placeholder's promise, keeping
@@ -420,11 +426,14 @@ class shared_var {
                     return !state_->inner.current_port_and_flags.is_deferred;
                 });
                 snapshot(); // the first writer replaced the current slot
-                if (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
-                    task->wait(); // the publisher's task completes on its own
-                }
-            } else {
-                task->wait(); // under the state mutex; task execution never takes it
+                continue;
+            }
+            lock.unlock();
+            internal::sync::preemption_point();
+            std::this_thread::yield();
+            lock.lock();
+            if (state_->inner.current_task != task) {
+                snapshot(); // the slot was switched while we yielded — retry
             }
         }
         return std::forward<F>(fn)(task, storage, port);
