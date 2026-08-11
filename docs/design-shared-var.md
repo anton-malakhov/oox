@@ -25,10 +25,12 @@ We want `oox::shared_var<T>`: a copyable, reference-counted handle that
    caller as usual.
 2. `get()` returns a **copy** (`T` must be copyable). It never returns a
    reference to the stored value.
-3. **Forwarding is banned for `shared_var`** in v1: a `shared_var` cannot be
-   produced by a task returning a `var` (`is_forwarded` path is not
-   supported). Ban is enforced by construction: `shared_var` is only ever
-   created from values/`deferred`, and its inner handle is never forwarded.
+3. **Forwarding is supported for adopted vars**: a `shared_var` constructed
+   from a forwarded `var` (a producer that returned a var) resolves the chain
+   on `get()`/`wait()` — the producer is waited for first (its result storage
+   is materialized during execution), then the chain is walked to the final
+   slot. Registering a forwarded shared_var as a *run argument* stays one
+   level deep (same limitation as `oox::var`'s own consume path).
 4. The **Folly backend limitation** is documented, not fixed: `folly::fibers::Baton`
    is a single-waiter primitive, so `get()`/`wait()` on the same node from
    multiple fibers is not supported on the Folly backend.
@@ -74,40 +76,58 @@ existing Twist-verified lifetime machinery does the rest.
 ### 4.1 Registration: `oox::run(f, shared_var<A> ...)` — any thread
 
 `internal::shared_var_args::setup()` (specializations of `base_args` for
-`shared_var<A,VC>&`, `const shared_var<A,VC>&`, `shared_var<A,VC>&&`):
+`shared_var<A,VC>&`, `const shared_var<A,VC>&`, `shared_var<A,VC>&&`) defers
+the actual registration to a thread-local setup context:
 
-1. `lock(state->mtx)`.
-2. Lazy materialization: if `inner.current_task == nullptr`, assign a default
-   `var<A>(A{})` to `inner` (same requirement as `var`: `A` default-constructible).
-3. Writer category (`A&` or `A&&` functor arg): `inner.set_next_writer(port, self)`.
-   Multiple threads registering writers serialize on `mtx`, so the writer
-   chain order is linearized by lock acquisition order — this is the
-   multi-thread writer serialization guarantee.
-4. Reader/copy category: `self->assign_prerequisite(inner.current_task,
-   inner.current_port())` and capture `inner.storage_ptr` into `my_ptr`.
-5. `unlock`. Task execution stays fully parallel.
+1. Each shared_var argument records a pending registration (its state, the
+   task, the port, and whether it is a writer) instead of locking immediately.
+2. The **outermost** shared_var argument commits the whole batch: all involved
+   states are locked **in canonical (address-sorted) order**, then every
+   registration is applied as one atomic unit:
+   - lazy materialization: if `inner.current_task == nullptr`, assign a
+     default `var<A>(A{})` (same requirement as `var`: `A` default-constructible);
+   - writer category (`A&` or `A&&` functor arg): `inner.set_next_writer(port, self)`;
+   - reader/copy category: `self->assign_prerequisite(inner.current_task,
+     inner.current_port())` and capture `inner.storage_ptr` into `my_ptr`.
+3. `unlock`. Task execution stays fully parallel.
+
+**Why atomic multi-state registration**: two threads registering writers on the
+same two vars in opposite orders (`run(f, sv1, sv2)` vs `run(g, sv2, sv1)`)
+can interleave their per-var chains and create a **task cycle** (each writer
+waits for the other) that deadlocks. Registering each `run()`'s chains as one
+atomic unit — with the second run chaining onto the complete result of the
+first — makes the chains consistent and acyclic. The canonical lock order also
+prevents AB-BA lock-order deadlocks between two such runs.
 
 `consume()` (inside the worker task) needs **no lock**: it reads the value
 from the storage pointer captured at registration time; the graph orders the
 write before the read (flow dependency), and the slot stays alive while the
 result var of its producer lives (existing lifetime rules).
 
-`oox::run` arguments are handled **per argument**: a single task may mix plain
-`oox::var` and `oox::shared_var` arguments (each kind matched by its own
-`base_args` specialization, each `shared_var` locked independently, one
-argument at a time). The plain-var parts keep their single-threaded semantics;
-only the `shared_var` parts add the mutex.
+`oox::run` arguments are handled **per argument kind**: a single task may mix
+plain `oox::var` and `oox::shared_var` arguments (each kind matched by its own
+`base_args` specialization). The plain-var parts keep their single-threaded
+semantics; the `shared_var` parts are registered atomically as one batch
+(§4.1).
 
 ### 4.2 `get()` / `wait()` — any thread, concurrently
 
 1. `lock(state->mtx)`.
-2. Snapshot `task = inner.current_task`, `storage = inner.storage_ptr`,
-   `port = inner.current_port()` (materializing a default value first if
-   `inner` is empty).
-3. If the slot is not done yet (`head` is not the done marker), `task->wait()`
-   **while still holding the lock**.
-4. Read the value copy from `storage` (failure check first when `CanThrow`).
-5. `unlock`.
+2. Materialize a default value first if `inner` is empty.
+3. If the inner var is **forwarded** (adopted from a producer that returned a
+   var), wait for the producer task first: the chain target is materialized
+   inside the producer's result storage during its execution, so the chain is
+   not walkable until the producer completes.
+4. Resolve the forwarding chain (walk `storage_ptr` while `is_forwarded`) and
+   snapshot `task`, `storage`, `port` from the final var.
+5. If the slot is not done yet (`head` is not the done marker):
+   - **deferred placeholder** (never completes on its own): wait on the state
+     condition variable until a writer registers (registration notifies it),
+     keeping the mutex available for the publisher; then re-snapshot and wait
+     for the publisher's task;
+   - otherwise `task->wait()` **while still holding the lock**.
+6. Read the value copy from `storage` (failure check first when `CanThrow`).
+7. `unlock`.
 
 ### Why the wait happens under the lock (and not a retain)
 
@@ -206,9 +226,13 @@ Access categories through `oox::run` are the same as for `var`:
 
 ## 7. Out of scope / future work
 
-- **Forwarding** (`var`-returning producers feeding a `shared_var`): banned in
-  v1. A `shared_var` value can still be an *input* to any task, including ones
-  that return `var`.
+- **Forwarding of `shared_var` *as a producer*'s result**: a `shared_var`
+  cannot be *created* by a task returning one (there is no `shared_run`); a
+  `shared_var` value can still be an *input* to any task, including ones that
+  return `var` (and the adopted result may itself be a forwarded `var`, which
+  is resolved on `get()`/`wait()`, see Decision #3).
+- **Registration of a forwarded shared_var as a run argument** stays one
+  level deep (same limitation as `oox::var`'s own consume path).
 - **Lock-free handle** (variant 3): pack `{task*, port, flags}` into atomics,
   CAS-based writer chain, seqlock reads. Only if benchmarks show the mutex to
   be a bottleneck at the required concurrency level.

@@ -7,8 +7,22 @@
 
 #include <oox/oox.h>
 
+#include <algorithm>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <utility>
+#include <vector>
+
+// Twist's simulation runtime models each simulated thread as a coroutine on
+// one OS thread, so the standard thread_local storage would be shared across
+// simulated threads. The header below must be included at global scope (its
+// code resolves unqualified names against the global namespace); the
+// TWISTED_STATIC_THREAD_LOCAL_PTR declaration itself is placed next to the
+// context type it refers to.
+#if HAVE_TWIST && defined(__TWIST_SIM__)
+#include <twist/ed/static/thread_local/ptr.hpp>
+#endif
 
 // oox::shared_var<T> — thread-safe, copyable counterpart of oox::var<T>.
 //
@@ -20,11 +34,17 @@
 // Writer serialization across threads is guaranteed: writers chained onto the
 // same shared_var are linearized by the internal state mutex, so their order
 // is a total order (same model as a single-threaded var, now multi-threaded).
+// All shared_var arguments of one oox::run() are registered atomically: their
+// states are locked in a canonical (address-sorted) order, which prevents
+// writer-chain cycles when two threads register writers on the same vars in
+// opposite orders.
 //
 // Design (variant 1, "thick handle"): see docs/design-shared-var.md.
 // v1 limitations:
 //   - get() returns a copy (T must be copyable);
-//   - forwarding (producers returning var) is not supported;
+//   - forwarding is resolved when adopting a var and when reading the value
+//     (get()/wait()); forwarding through the graph for *registration* is
+//     supported only one level deep, same as oox::var;
 //   - Folly backend: get()/wait() from multiple fibers is not supported
 //     (single-waiter Baton);
 //   - moving a shared_var from two threads at once is a data race on the
@@ -37,14 +57,152 @@ class shared_var;
 
 namespace internal {
 
-// Mutex abstraction for the shared state. oox.h's sync namespace provides a
-// mutex only under HAVE_TWIST; shared_var needs one in every build, so the
-// alias lives here (keeps oox.h untouched).
+// Mutex/CV abstractions for the shared state. oox.h's sync namespace provides
+// them only under HAVE_TWIST; shared_var needs them in every build, so the
+// aliases live here (keeps oox.h untouched).
 #if HAVE_TWIST
 using shared_var_mutex = sync::mutex;
+using shared_var_cv = sync::condition_variable;
 #else
 using shared_var_mutex = std::mutex;
+using shared_var_cv = std::condition_variable;
 #endif
+
+// ---------------------------------------------------------------------------
+// shared_state_base: type-erased state for atomic multi-state registration
+// ---------------------------------------------------------------------------
+
+struct shared_state_base {
+    shared_var_mutex mtx;   // serializes every mutation of the handle state
+    shared_var_cv cv;       // deferred waiters are notified on registration
+
+    virtual ~shared_state_base() = default;
+
+    // Lazy materialization of the default value (if the var is still empty).
+    virtual void materialize() = 0;
+    // Chain `self` as the next writer of this state at `port`.
+    virtual void chain_writer(int port, task_node* self) = 0;
+    // Register `self` as a reader of the current slot; returns the
+    // prerequisite count for run()'s start_count accounting.
+    virtual int preregister_reader(task_node* self, int port) = 0;
+    // Capture the storage pointer for consume(), resolving one level of
+    // forwarding when the inner var is forwarded.
+    virtual uintptr_t capture_storage() = 0;
+};
+
+// One pending registration contributed by a single shared_var argument of one
+// oox::run() call. Applied at commit() while all involved states are locked.
+struct shared_var_registration {
+    std::shared_ptr<shared_state_base> state;
+    task_node* self;
+    int port;
+    bool is_writer;
+    uintptr_t* my_ptr;
+    int count = 0;
+
+    void apply() {
+        state->materialize();
+        if (is_writer) {
+            state->chain_writer(port, self);
+            count = 1;
+        } else {
+            count = state->preregister_reader(self, port);
+        }
+        *my_ptr = state->capture_storage();
+    }
+};
+
+// Thread-local context for the registration of one oox::run() call. The
+// outermost shared_var argument creates it; the setup recursion records every
+// shared_var argument; at the end the outermost locks ALL involved states in
+// a canonical (address-sorted) order and applies every registration as one
+// atomic unit. This is what prevents writer-chain cycles: with atomic
+// registration, the second run() always chains onto the complete result of
+// the first, no matter the argument order.
+struct shared_var_setup_context {
+    std::vector<shared_var_registration> ops;
+
+    void add(shared_var_registration op) {
+        ops.push_back(std::move(op));
+    }
+
+    void commit() {
+        if (ops.empty()) {
+            return;
+        }
+        // Canonical lock order: unique states sorted by address.
+        std::vector<shared_state_base*> states;
+        states.reserve(ops.size());
+        for (const auto& op : ops) {
+            states.push_back(op.state.get());
+        }
+        std::sort(states.begin(), states.end());
+        states.erase(std::unique(states.begin(), states.end()), states.end());
+
+        std::vector<std::unique_lock<shared_var_mutex>> locks;
+        locks.reserve(states.size());
+        for (auto* s : states) {
+            locks.emplace_back(s->mtx);
+        }
+        for (auto& op : ops) {
+            op.apply();
+        }
+        locks.clear();
+        for (auto* s : states) {
+            s->cv.notify_all(); // deferred waiters re-check their predicates
+        }
+    }
+
+    int total_count() const {
+        int total = 0;
+        for (const auto& op : ops) {
+            total += op.count;
+        }
+        return total;
+    }
+};
+
+// Setup context for one oox::run() call, reachable from every shared_var
+// argument of that call through the current thread's TLS. Twist's simulation
+// runtime models each simulated thread as a coroutine on one OS thread, so the
+// standard thread_local storage would be shared across simulated threads;
+// under the simulator, use twist's per-simulated-thread TLS instead.
+#if HAVE_TWIST && defined(__TWIST_SIM__)
+static TWISTED_STATIC_THREAD_LOCAL_PTR(shared_var_setup_context, g_shared_var_setup_context);
+#else
+inline thread_local shared_var_setup_context* g_shared_var_setup_context = nullptr;
+#endif
+
+// RAII: creates the setup context at the outermost shared_var argument of a
+// run() and destroys it when that setup returns. Inner shared_var arguments
+// reuse the outer's context.
+struct shared_var_setup_guard {
+    shared_var_setup_context* ctx;
+    bool outermost;
+
+    shared_var_setup_guard() : ctx(g_shared_var_setup_context), outermost(false) {
+        if (!ctx) {
+            ctx = new shared_var_setup_context;
+            g_shared_var_setup_context = ctx;
+            outermost = true;
+        }
+    }
+
+    ~shared_var_setup_guard() {
+        if (outermost) {
+            g_shared_var_setup_context = nullptr;
+            delete ctx;
+        }
+    }
+
+    shared_var_setup_context* context() const {
+        return ctx;
+    }
+
+    bool is_outermost() const {
+        return outermost;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // shared_var_args — mirrors oox_var_args for shared_var arguments of oox::run
@@ -61,7 +219,7 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
     using var_type = var<ooxed_type, VarCanThrow>;
     using shared_type = shared_var<ooxed_type, VarCanThrow>;
 
-    uintptr_t my_ptr;
+    uintptr_t my_ptr = 0;
 
     shared_var_args(const shared_type& cov, Args&&... args)
         : base_type(std::forward<Args>(args)...) {}
@@ -70,43 +228,32 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
         || (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>)) ? 1 : 0;
     static constexpr int write_nodes_count = base_type::write_nodes_count + is_writer;
 
-    // Registration runs under the shared state mutex. The lock is scoped to
-    // THIS argument only: the recursive base_type::setup() for the following
-    // arguments runs unlocked, so passing the same shared_var twice (e.g. a
-    // reader functor with two parameters fed from one handle) cannot
-    // self-deadlock on a non-recursive mutex.
+    // Registration is deferred to the outermost argument of this run(): the
+    // setup context collects every shared_var argument, and the outermost
+    // commits them all under one sorted multi-state lock (see
+    // shared_var_setup_context). The count contributed by this argument is
+    // computed at commit time (readers return the assign_prerequisite result),
+    // so inner levels only pass through their recursion result and the
+    // outermost returns rest + total_count().
     int setup(int port, task_node* self, const shared_type& cov, Args&&... args) {
-        int count = is_writer;
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("shared_var<A>").c_str(),
-                    cov.state_.get(), get_type<T>("T").c_str(), count);
-        {
-            // Copy the shared_ptr: the caller's handle may be released while
-            // we hold the lock, but the state must stay alive.
-            auto state = cov.state_;
-            std::unique_lock<shared_var_mutex> lock(state->mtx);
-            if (!state->inner.current_task) {
-                state->inner = var_type(ooxed_type()); // lazy default value, like var
-            }
-            if constexpr (is_writer) {
-                static_assert(VarCanThrow || !SelfCanThrow,
-                              "throwing task cannot write to non-throwing shared_var");
-                state->inner.set_next_writer(port, self);
-            } else {
-                static_assert(SelfCanThrow || !VarCanThrow,
-                              "non-throwing task cannot depend on throwing shared_var");
-                count = self->assign_prerequisite(state->inner.current_task,
-                                                  state->inner.current_port());
-            }
-            if (state->inner.current_port_and_flags.is_forwarded) {
-                // Kept for symmetry with oox_var_args; never reachable in v1
-                // (shared_var never binds a forwarded producer).
-                oox_var_base& next = *(oox_var_base*)state->inner.storage_ptr;
-                my_ptr = details::encode_forwarded_storage_ptr(&next.storage_ptr);
-            } else {
-                my_ptr = (uintptr_t)state->inner.storage_ptr;
-            }
+                    cov.state_.get(), get_type<T>("T").c_str(), is_writer);
+        if constexpr (is_writer) {
+            static_assert(VarCanThrow || !SelfCanThrow,
+                          "throwing task cannot write to non-throwing shared_var");
+        } else {
+            static_assert(SelfCanThrow || !VarCanThrow,
+                          "non-throwing task cannot depend on throwing shared_var");
         }
-        return count + base_type::setup(port + is_writer, self, std::forward<Args>(args)...);
+        shared_var_setup_guard guard;
+        guard.context()->add(shared_var_registration{
+            cov.state_, self, port, is_writer != 0, &my_ptr});
+        const int rest = base_type::setup(port + is_writer, self, std::forward<Args>(args)...);
+        if (guard.is_outermost()) {
+            guard.context()->commit();
+            return rest + guard.context()->total_count();
+        }
+        return rest;
     }
 
     // Runs inside the worker task. No lock required: the graph orders the
@@ -170,18 +317,51 @@ class shared_var {
     template <typename, bool, typename, bool, typename...>
     friend struct internal::shared_var_args;
 
-    struct shared_state {
-        internal::shared_var_mutex mtx;   // serializes every mutation of the handle state
-        var<T, CanThrow> inner;           // the "eternal owner": keeps value slots alive
+    struct shared_state : internal::shared_state_base {
+        var<T, CanThrow> inner; // the "eternal owner": keeps value slots alive
 
         shared_state() = default;
         explicit shared_state(deferred_t d) : inner(d) {}
         shared_state(const T& t) : inner(t) {}
         shared_state(T&& t) : inner(std::move(t)) {}
         explicit shared_state(var<T, CanThrow>&& v) : inner(std::move(v)) {}
+
+        void materialize() override {
+            if (!inner.current_task) {
+                inner = var<T, CanThrow>(T{}); // lazy var: materialize default value
+            }
+        }
+
+        void chain_writer(int port, internal::task_node* self) override {
+            inner.set_next_writer(port, self);
+        }
+
+        int preregister_reader(internal::task_node* self, int port) override {
+            return self->assign_prerequisite(inner.current_task, inner.current_port());
+        }
+
+        uintptr_t capture_storage() override {
+            if (inner.current_port_and_flags.is_forwarded) {
+                internal::oox_var_base& next = *(internal::oox_var_base*)inner.storage_ptr;
+                return internal::details::encode_forwarded_storage_ptr(&next.storage_ptr);
+            }
+            return (uintptr_t)inner.storage_ptr;
+        }
     };
 
     std::shared_ptr<shared_state> state_;
+
+    // Follow the forwarding chain of an adopted forwarded var (a producer that
+    // returned a var): storage_ptr of a forwarded var points at the next var
+    // object. The chain is fixed after adoption and alive while inner lives,
+    // so it is safe to walk under the state mutex.
+    internal::oox_var_base* resolve_current_locked() const {
+        internal::oox_var_base* base = &state_->inner;
+        while (base->current_port_and_flags.is_forwarded) {
+            base = reinterpret_cast<internal::oox_var_base*>(base->storage_ptr);
+        }
+        return base;
+    }
 
     // Snapshot the current slot under the lock, wait for its completion, then
     // invoke fn(task, storage, port). The state mutex is held for the whole
@@ -191,6 +371,14 @@ class shared_var {
     // or read. (Retaining via task_life::life_count does NOT work: the graph's
     // release(n) paths decrement raw refs and would consume the retained one,
     // corrupting the lifetime accounting.)
+    //
+    // Two special cases:
+    //   - adopted forwarded vars: the chain is resolved to the final var, and
+    //     we wait on / read the final slot;
+    //   - deferred placeholders never complete on their own: waiting on their
+    //     never-set promise would deadlock publication (the publisher needs
+    //     the state mutex), so we wait on the state condition variable until
+    //     a writer registers, then wait for that writer's task.
     template <typename F>
     auto with_ready_slot(F&& fn) const
         -> decltype(std::forward<F>(fn)(static_cast<internal::task_node*>(nullptr),
@@ -199,14 +387,45 @@ class shared_var {
         if (!state_->inner.current_task) {
             state_->inner = var<T, CanThrow>(T{}); // lazy var: materialize default value
         }
-        internal::task_node* task = state_->inner.current_task;
-        void* storage = state_->inner.storage_ptr;
-        const int port = state_->inner.current_port();
+        // A forwarded var's chain target is materialized inside the producer
+        // task's result storage during its execution: on async backends (TBB)
+        // the chain is not walkable until the producer completes, so wait for
+        // it first. (The deferred placeholder never completes on its own and
+        // is handled by the deferred branch below instead.)
+        if (state_->inner.current_port_and_flags.is_forwarded) {
+            internal::task_node* producer = state_->inner.current_task;
+            if (!internal::details::is_task_done_marker(producer->head.load(std::memory_order_acquire))) {
+                producer->wait(); // under the state mutex; producer execution never takes it
+            }
+        }
+        internal::task_node* task = nullptr;
+        void* storage = nullptr;
+        int port = 0;
+        auto snapshot = [&]() {
+            internal::oox_var_base* base = resolve_current_locked();
+            task = base->current_task;
+            storage = base->storage_ptr;
+            port = base->current_port();
+        };
+        snapshot();
         // Early-out for slots that are already produced (e.g. a constant value
         // storage task that never executed): var::wait() mirrors this check.
         // Otherwise wait() would block forever on their never-set promise.
         if (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
-            task->wait(); // under the state mutex; task execution never takes it
+            if (state_->inner.current_port_and_flags.is_deferred) {
+                // Deferred placeholder: block on the state CV (registration
+                // notifies it) instead of the placeholder's promise, keeping
+                // the mutex available for the publisher.
+                state_->cv.wait(lock, [this] {
+                    return !state_->inner.current_port_and_flags.is_deferred;
+                });
+                snapshot(); // the first writer replaced the current slot
+                if (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
+                    task->wait(); // the publisher's task completes on its own
+                }
+            } else {
+                task->wait(); // under the state mutex; task execution never takes it
+            }
         }
         return std::forward<F>(fn)(task, storage, port);
     }
