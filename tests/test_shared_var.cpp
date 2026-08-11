@@ -385,6 +385,43 @@ TEST(SharedVar, WriterSwitchWhileGetPending) {
     EXPECT_TRUE(v == 0 || v == 7) << "reader must observe a consistent slot value, got " << v;
 }
 
+TEST(SharedVar, GetWhileFastWriters) {
+    // Regression: a reader's get() racing a fast writer chain used to wait on
+    // a task freed at its own completion (the chain consumes the slot hold),
+    // crashing with task::wait(): Assertion life_get_count(). The wait now
+    // happens without the state mutex and re-validates the current slot, so
+    // this must not crash on any backend. (The window is only reachable on
+    // async backends — TBB/twist — where the next writer is chained before
+    // the current task completes; on std/serial the registration blocks and
+    // the test passes trivially.)
+    oox::shared_var<int> value(0);
+    constexpr int kRegistrations = 4000;
+    constexpr int kGets = 1000;
+    std::atomic<int> registrations{0};
+    std::thread writer([&] {
+        int i = 0;
+        while (registrations.load(std::memory_order_relaxed) < kRegistrations) {
+            oox::run([i](int& v) {
+                int acc = i;
+                for (int j = 0; j < 20000; ++j) {
+                    acc = acc * 31 + j;
+                }
+                v = acc;
+            }, value);
+            registrations.fetch_add(1, std::memory_order_relaxed);
+            ++i;
+        }
+    });
+    volatile int sink = 0;
+    for (int i = 0; i < kGets; ++i) {
+        sink = value.get(); // must not crash
+    }
+    registrations.store(kRegistrations, std::memory_order_relaxed);
+    writer.join();
+    (void)value.get(); // the chain drains; read the final value
+    EXPECT_NE(sink, -1) << "unreachable";
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     int err{0};

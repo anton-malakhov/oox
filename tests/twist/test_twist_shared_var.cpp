@@ -199,6 +199,46 @@ void MixedVarAndSharedVarArgs() {
     TWIST_ASSERT_M(sv == 2 || sv == 100, "shared var written by one serialized writer");
 }
 
+// Regression: a reader's get() racing a fast writer chain. On async backends
+// the next writer is chained before the current task completes, and the chain
+// consumes the current task's slot hold at its completion — the get() used to
+// wait on the freed task (task::wait: life_get_count assertion). The wait now
+// runs without the state mutex and re-validates the current slot.
+void GetWhileFastWriters() {
+    oox::shared_var<int> value(0);
+    constexpr int kRegistrations = 64;
+    constexpr int kGets = 32;
+    twist::test::body::WaitGroup wg;
+
+    wg.Add(1, [&] {
+        for (int i = 0; i < kRegistrations; ++i) {
+            twist::assist::PreemptionPoint();
+            oox::run([i](int& v) {
+                int acc = i;
+                for (int j = 0; j < 100; ++j) {
+                    acc = acc * 31 + j;
+                }
+                v = acc;
+            }, value);
+        }
+    });
+
+    wg.Add(1, [&] {
+        for (int i = 0; i < kGets; ++i) {
+            twist::assist::PreemptionPoint();
+            (void)value.get(); // must not crash
+        }
+    });
+
+    wg.Join();
+
+    int expected = kRegistrations - 1;
+    for (int j = 0; j < 100; ++j) {
+        expected = expected * 31 + j;
+    }
+    TWIST_ASSERT_M(oox::wait_and_get(value) == expected, "last writer applied");
+}
+
 } // namespace
 
 int main() {
@@ -209,5 +249,6 @@ int main() {
     oox::twist_tests::RunRandomSeeds("WriterSwitchWhileGetPending", WriterSwitchWhileGetPending);
     oox::twist_tests::RunRandomSeeds("HandleCopyLifecycle", HandleCopyLifecycle);
     oox::twist_tests::RunRandomSeeds("MixedVarAndSharedVarArgs", MixedVarAndSharedVarArgs);
+    oox::twist_tests::RunRandomSeeds("GetWhileFastWriters", GetWhileFastWriters);
     return 0;
 }
