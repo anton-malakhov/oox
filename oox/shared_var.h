@@ -8,10 +8,8 @@
 #include <oox/oox.h>
 
 #include <algorithm>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -58,15 +56,13 @@ class shared_var;
 
 namespace internal {
 
-// Mutex/CV abstractions for the shared state. oox.h's sync namespace provides
-// them only under HAVE_TWIST; shared_var needs them in every build, so the
-// aliases live here (keeps oox.h untouched).
+// Mutex abstraction for the shared state. oox.h's sync namespace provides
+// it only under HAVE_TWIST; shared_var needs it in every build, so the alias
+// lives here (keeps oox.h untouched).
 #if HAVE_TWIST
 using shared_var_mutex = sync::mutex;
-using shared_var_cv = sync::condition_variable;
 #else
 using shared_var_mutex = std::mutex;
-using shared_var_cv = std::condition_variable;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -75,7 +71,6 @@ using shared_var_cv = std::condition_variable;
 
 struct shared_state_base {
     shared_var_mutex mtx;   // serializes every mutation of the handle state
-    shared_var_cv cv;       // deferred waiters are notified on registration
 
     virtual ~shared_state_base() = default;
 
@@ -149,9 +144,6 @@ struct shared_var_setup_context {
             op.apply();
         }
         locks.clear();
-        for (auto* s : states) {
-            s->cv.notify_all(); // deferred waiters re-check their predicates
-        }
     }
 
     int total_count() const {
@@ -204,6 +196,38 @@ struct shared_var_setup_guard {
         return outermost;
     }
 };
+
+// oox.h #undef's TASK_EXECUTE_METHOD and the lifetime macros at its end;
+// define a local backend-conditional execute signature for the waiter node.
+// (The execute_lifetime_guard struct itself stays visible; only its macro
+// aliases are gone.)
+#if defined(OOX_USING_TBB)
+#define OOX_SHARED_VAR_EXECUTE_METHOD tbb_task* execute(execution_data&) override
+#else
+#define OOX_SHARED_VAR_EXECUTE_METHOD void* execute() override
+#endif
+
+// A graph node used by get()/wait() to block until the current slot is
+// produced. The getter registers the waiter as a successor of the current
+// task (a flow arc — the graph's own lock-free wait-queue) and blocks on the
+// waiter's completion via the backend's own task wait (TBB wait_context,
+// std promise, ...) — the pool's native mechanism. The graph notifies the
+// waiter at the current task's completion (do_notify_arcs ->
+// remove_prerequisite -> spawn -> execute -> wakeup). The getter never
+// touches the current task after the registration, so the task can be freed
+// at its completion safely. The waiter is kept alive by the getter's life
+// hold until the wait returns. This also covers the deferred placeholder:
+// the first writer's deferred redirect forwards the waiter's arc to the
+// writer task.
+struct shared_var_waiter : task_node {
+    OOX_SHARED_VAR_EXECUTE_METHOD {
+        execute_lifetime_guard oox_waiter_lifetime_guard{this};
+        wakeup(); // the backend's own waiter-release (pool-native)
+        return nullptr;
+    }
+};
+
+#undef OOX_SHARED_VAR_EXECUTE_METHOD
 
 // ---------------------------------------------------------------------------
 // shared_var_args — mirrors oox_var_args for shared_var arguments of oox::run
@@ -409,32 +433,38 @@ class shared_var {
             port = base->current_port();
         };
         snapshot();
-        // Wait until the current slot is produced. We never touch the task's
-        // own members (its waiter/cv) after it can be freed, so instead of
-        // task->wait() we poll the current slot's done marker under the state
-        // mutex, yielding between checks. The current task stays alive while
-        // we hold the mutex: the transition is blocked, and while it is still
-        // current its own completion keeps the slot-1 hold. If the slot is
-        // switched while we yield, we re-snapshot without touching the old
-        // (possibly freed) task.
+        // Wait until the current slot is produced. The getter registers a
+        // waiter node as a successor of the current task (a flow arc — the
+        // graph's own lock-free wait-queue) and blocks on the waiter's OWN
+        // cv; the graph notifies the waiter at the task's completion
+        // (do_notify_arcs -> remove_prerequisite -> spawn -> execute ->
+        // cv notify). The getter never touches the current task after the
+        // registration, so the task can be freed at its completion safely.
+        // This also covers the deferred placeholder: the first writer's
+        // deferred redirect forwards the waiter's arc to the writer task, so
+        // there is no separate deferred branch and no condition variable on
+        // the state. The waiter is allocated per wait and kept alive by the
+        // getter's life hold until the wait returns.
         while (!internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
-            if (state_->inner.current_port_and_flags.is_deferred) {
-                // Deferred placeholder: block on the state CV (registration
-                // notifies it) instead of the placeholder's promise, keeping
-                // the mutex available for the publisher.
-                state_->cv.wait(lock, [this] {
-                    return !state_->inner.current_port_and_flags.is_deferred;
-                });
-                snapshot(); // the first writer replaced the current slot
-                continue;
+            auto* waiter = internal::task::allocate<internal::shared_var_waiter>();
+            waiter->life_set_count(2); // the execute guard (1) + the getter's hold (1)
+            waiter->start_count.store(1, std::memory_order_release);
+            auto* j = new internal::arc(waiter, 0, internal::arc::flow_only);
+            if (task->add_arc(j)) {
+                lock.unlock();
+                waiter->wait(); // the backend's own task wait (pool-native)
+                waiter->release(1); // the getter's hold; the graph's guard releases the other
+                lock.lock();
+            } else {
+                // The slot became ready (or switched) before the arc was
+                // registered: the waiter never spawns, so drop both refs.
+                waiter->release(2);
             }
-            lock.unlock();
-            internal::sync::preemption_point();
-            std::this_thread::yield();
-            lock.lock();
-            if (state_->inner.current_task != task) {
-                snapshot(); // the slot was switched while we yielded — retry
+            if (state_->inner.current_task == task
+                && internal::details::is_task_done_marker(task->head.load(std::memory_order_acquire))) {
+                break; // still the current slot and complete — safe to read
             }
+            snapshot(); // the slot was switched while we waited — retry
         }
         return std::forward<F>(fn)(task, storage, port);
     }
