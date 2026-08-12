@@ -43,8 +43,8 @@ We want `oox::shared_var<T>`: a copyable, reference-counted handle that
 shared_var<T, CanThrow>
 ├── std::shared_ptr<shared_state<T, CanThrow>>   // copyable, refcounted handle
 └── shared_state
-    ├── sync::mutex mtx            // serializes every mutation of the handle state
-    └── var<T, CanThrow> inner     // the "eternal owner" handle: keeps slots alive
+    ├── shared_var_mutex mtx   // serializes every mutation of the handle state
+    └── var<T, CanThrow> inner // the "eternal owner" handle: keeps slots alive
 ```
 
 - All handle-state mutations (writer registration, reader registration, lazy
@@ -110,7 +110,7 @@ plain `oox::var` and `oox::shared_var` arguments (each kind matched by its own
 semantics; the `shared_var` parts are registered atomically as one batch
 (§4.1).
 
-### 4.2 `get()` / `wait()` — any thread, concurrently
+### 4.2 `get()` / `wait()` — any thread, concurrently (A1: waiting is a graph edge)
 
 1. `lock(state->mtx)`.
 2. Materialize a default value first if `inner` is empty.
@@ -120,37 +120,45 @@ semantics; the `shared_var` parts are registered atomically as one batch
    not walkable until the producer completes.
 4. Resolve the forwarding chain (walk `storage_ptr` while `is_forwarded`) and
    snapshot `task`, `storage`, `port` from the final var.
-5. If the slot is not done yet (`head` is not the done marker):
-   - **deferred placeholder** (never completes on its own): wait on the state
-     condition variable until a writer registers (registration notifies it),
-     keeping the mutex available for the publisher; then re-snapshot and wait
-     for the publisher's task;
-   - otherwise `task->wait()` **while still holding the lock**.
-6. Read the value copy from `storage` (failure check first when `CanThrow`).
-7. `unlock`.
+5. If the slot is already produced (`head` is the done marker) — read under
+   the lock.
+6. Otherwise, **wait through the graph**: allocate a waiter node
+   (`shared_var_waiter`, a `task_node` subclass), register it as a successor
+   of the current task via the same lock-free `add_arc` the graph's readers
+   use (a flow arc — the graph's own wait queue), `unlock`, and block on the
+   waiter's completion through the **backend's native task wait**
+   (`task::wait()` — TBB `wait_context`, std promise, TF future, ...). The
+   graph notifies the waiter at the task's completion (`do_notify_arcs` →
+   `remove_prerequisite` → spawn → `execute` → `wakeup`). If the slot was
+   switched while we waited, re-snapshot and retry.
+7. Re-lock and read the value copy from `storage` (failure check first when
+   `CanThrow`); release the getter's hold on the waiter.
 
-### Why the wait happens under the lock (and not a retain)
+### Why waiting is a graph edge (and not a CV, a spin, or a retain)
 
-The value slot a `get()` refers to can be freed while `get()` is in flight:
+The current slot's task can be freed **at its own completion** when the next
+writer is chained before it completes (the chain consumes the slot-1 hold at
+the completion, so the task's life hits zero there — not at the transition).
+That free is not gated by the state mutex, so any wait that touches the task's
+own members (its waiter/cv) after the completion is a use-after-free — this
+is the bug class the wait-under-lock, the CV-based deferred wait, and the
+polling attempts all ran into.
 
-- while the slot is the *current* one, `inner`'s countdown hold keeps it alive;
-- the moment another thread registers a new writer or assigns a new value,
-  `task_node::set_next_writer` / `var::release` runs `remove_back_arc` →
-  `notify_next_writer`, which **releases the slot** (`release(1)` or
-  `release(2)` for owner markers) and may delete it.
+- A **retain** (`task_life::life_add_count`) is incompatible with the graph's
+  raw `release(n)` accounting (an owner-marker release is `release(2)` and
+  would consume the retained ref) — verified empirically under Twist/TSAN.
+- A **CV on the state** serializes registration during the wait and needs a
+  notification path that does not exist.
+- A **spin/poll** burns CPU on pool threads, against the project philosophy.
 
-A naive "retain" (bumping `task_life::life_count`) does **not** work: the
-graph's `release(n)` paths are raw decrements that do not distinguish the
-retained reference from the slot-hold refs, so an owner-marker `release(2)`
-would consume the retained `+1` and corrupt the lifetime accounting (observed
-in practice as `life_count` going negative under Twist).
-
-The correct mechanism is mutual exclusion: all slot transitions (writer
-registration, value assignment, deferred redirect) happen under the same state
-mutex, so holding the mutex for the duration of the wait + read guarantees the
-slot cannot be freed underneath us. Task execution never takes the state mutex,
-so the wait is deadlock-free. Trade-off: a blocking `get()`/`wait()` holds the
-state mutex and briefly serializes registration on that `shared_var`.
+The A1 waiter solves it structurally: the getter registers the waiter into the
+graph's own lock-free arc queue and **never touches the current task after the
+registration**, so the task can be freed safely. The getter blocks on the
+waiter's completion through the pool's native wait — pool threads never wait
+on foreign primitives. The **deferred placeholder** is covered by the same
+path: the first writer's deferred redirect forwards the waiter's arc to the
+writer task, so no deferred-specific wait exists. No condition variables
+remain in the shared_var layer.
 
 ### 4.3 Assignment `sv = value` — any thread
 
@@ -187,8 +195,8 @@ public:
     shared_var& operator=(const T&);
     shared_var& operator=(T&&);
 
-    [[nodiscard]] T get();                     // copy; requires copyable T
-    void wait();
+    [[nodiscard]] T get() const;             // copy; requires copyable T
+    void wait() const;
     void cancel() noexcept;
 };
 
@@ -222,7 +230,9 @@ Access categories through `oox::run` are the same as for `var`:
   point of the call.
 - Moving a `shared_var` from two threads simultaneously is a data race on the
   user side (same contract as `std::shared_ptr`).
-- Folly backend: multi-waiter `get`/`wait` unsupported (single-waiter Baton).
+- Folly backend: the ordinary `get`/`wait` uses a per-call waiter node and is
+  multi-waiter safe; the direct wait on a task (e.g. the forwarded-producer
+  wait) retains the single-waiter Baton limitation.
 
 ## 7. Out of scope / future work
 
@@ -238,13 +248,15 @@ Access categories through `oox::run` are the same as for `var`:
   be a bottleneck at the required concurrency level.
 - **`read(callback)` for `const T&` under the lock**: not needed yet; `get()`
   returns a copy.
-- **Folly multi-waiter**: would require a CV + notification hook in
-  `notify_successors` for the shared layer.
+- **Folly multi-waiter on direct task waits**: the ordinary `get`/`wait` is
+  multi-waiter safe (per-call waiter node); only direct waits on a task (the
+  forwarded-producer wait) hit the single-waiter Baton.
 
-## 8. Verification plan
+## 8. Verification
 
 - Unit tests (`tests/test_shared_var.cpp`): API coverage, copy semantics,
-  deferred, multi-writer, exceptions, cross-thread smoke.
+  deferred, multi-writer, exceptions, cross-thread smoke, the fast-writer +
+  reader race regression (`GetWhileFastWriters`).
 - Twist scenarios (`tests/twist/test_twist_shared_var.cpp`):
   - `ConcurrentReaderAndWriterRegistration` — concurrent `run` registration
     on one `shared_var` (reader + writer), deterministic result;
@@ -253,7 +265,16 @@ Access categories through `oox::run` are the same as for `var`:
     switch cannot dangle the slot a `get()` is waiting on;
   - `DeferredSharedPublication` — `shared_var(deferred)` with concurrent
     reader/writer publication;
-  - `HandleCopyLifecycle` — copies used/destroyed in other threads.
+  - `HandleCopyLifecycle` — copies used/destroyed in other threads;
+  - `ConcurrentOppositeOrderMultiVarWritersComplete` — opposite-order
+    multi-var writer registration (the anti-cycle guarantee);
+  - `GetWhileFastWriters` — the waiter-based wait racing a fast writer chain
+    (the UAF regression).
+- Twist runtimes: `twist-fault` (real threads + fault injection) and
+  `twist-sim` (RandomSeeds; DFS requires `TWIST_SIM_ISOLATION=ON`, blocked in
+  some environments by an upstream sure/twist gap).
 - TSAN build (`twist-fault-tsan` preset) as a release gate.
+- Benchmarks: `bench_accounts` (transfers), `bench_shared_var_get_heavy`
+  (concurrent get + registration).
 - Example: `examples/accounts.cpp` — `std::vector<shared_var<account>>`,
   100 000 random point transfers between accounts.
