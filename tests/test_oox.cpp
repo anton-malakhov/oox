@@ -62,6 +62,17 @@ namespace ArchSample {
 
 auto plus = std::plus<int>();
 
+struct copy_only_value {
+    int value = 0;
+
+    copy_only_value() = default;
+    explicit copy_only_value(int v) : value(v) {}
+    copy_only_value(const copy_only_value&) = default;
+    copy_only_value(copy_only_value&&) = delete;
+    copy_only_value& operator=(const copy_only_value&) = default;
+    copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
 TEST(OOX, Simple) {
     const oox::var<int> a = oox::run(plus, 2, 3);
     oox::var<int> b = oox::run(plus, 1, a);
@@ -121,6 +132,31 @@ TEST(OOX, Consistency) {
 TEST(OOX, ConsistencyInfLoop) {
     const oox::var<int> tmp = 1;
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
+}
+
+TEST(OOX, ValueAssignmentPublishesDeferredVar) {
+    oox::var<int> value(oox::deferred);
+    auto reader = oox::run(plus, 1, value);
+    const int published = 41;
+    value = published;
+    ASSERT_EQ(oox::wait_and_get(value), 41);
+    ASSERT_EQ(oox::wait_and_get(reader), 42);
+}
+
+TEST(OOX, ValueAssignmentSerializesAfterReader) {
+    oox::var<int> value(1);
+    auto reader = oox::run([](int input) { return input; }, value);
+    value = 7;
+    ASSERT_EQ(oox::wait_and_get(reader), 1);
+    ASSERT_EQ(oox::wait_and_get(value), 7);
+}
+
+TEST(OOX, CopyOnlyAssignmentUsesTheCopyOverload) {
+    copy_only_value initial(1);
+    copy_only_value replacement(42);
+    oox::var<copy_only_value> value(initial);
+    value = replacement;
+    ASSERT_EQ(oox::wait_and_get(value).value, 42);
 }
 
 

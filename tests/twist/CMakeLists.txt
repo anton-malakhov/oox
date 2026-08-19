@@ -90,6 +90,10 @@ if (TWIST_SIM)
           test_twist_shared_var_countertests.cpp)
   add_test(NAME test_twist_shared_var_adopt_forwarded
           COMMAND test_twist_shared_var_countertests AdoptForwardedVar)
+  add_test(NAME test_twist_shared_var_register_forwarded_before_producer
+          COMMAND test_twist_shared_var_countertests RegisterAdoptedForwardedVarBeforeProducerRuns)
+  add_test(NAME test_twist_shared_var_forwarded_wait_unlocks
+          COMMAND test_twist_shared_var_countertests ForwardedWaitDoesNotBlockWriterRegistration)
   add_test(NAME test_twist_shared_var_wait_during_publication
           COMMAND test_twist_shared_var_countertests WaitOnDeferredDoesNotBlockPublication)
   add_test(NAME test_twist_shared_var_opposite_writer_order
@@ -97,6 +101,8 @@ if (TWIST_SIM)
   set_tests_properties(test_twist_shared_var_adopt_forwarded
           PROPERTIES LABELS "twist;countertest" TIMEOUT 30)
   set_tests_properties(
+          test_twist_shared_var_register_forwarded_before_producer
+          test_twist_shared_var_forwarded_wait_unlocks
           test_twist_shared_var_wait_during_publication
           test_twist_shared_var_opposite_writer_order
           PROPERTIES LABELS "twist;concurrency;countertest" TIMEOUT 30)

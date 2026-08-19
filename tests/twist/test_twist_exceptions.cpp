@@ -1,9 +1,11 @@
-#include <oox/oox.h>
+#include <oox/shared_var.h>
 
 #include "oox_twist_harness.h"
 
 #include <twist/assist/assert.hpp>
+#include <twist/assist/preempt.hpp>
 #include <twist/ed/std/atomic.hpp>
+#include <twist/test/body/wg.hpp>
 
 #include <exception>
 #include <type_traits>
@@ -170,6 +172,64 @@ void ForwardedInnerExceptionPropagates() {
     }, "forwarded inner task exception must propagate");
 }
 
+void SharedVarExceptionWakesWaiter() {
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int) -> int {
+        throw DummyException{};
+    }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    twist::test::body::WaitGroup wg;
+
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        ExpectThrows<DummyException>([&] { (void)value.get(); },
+                                     "shared_var waiter must wake and rethrow producer exception");
+    });
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        gate = 1;
+    });
+    wg.Join();
+}
+
+void SharedVarForwardedProducerExceptionPropagates() {
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int) -> oox::var<int, true> {
+        throw DummyException{};
+    }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    twist::ed::std::atomic<bool> dependent_ran{false};
+    auto dependent = oox::run<true>([&](int input) {
+        dependent_ran.store(true, std::memory_order_relaxed);
+        return input;
+    }, value);
+    gate = 1;
+    ExpectThrows<DummyException>([&] { (void)value.get(); },
+                                 "forwarded shared_var producer must rethrow before resolving storage");
+    ExpectThrows<DummyException>([&] { (void)oox::wait_and_get(dependent); },
+                                 "forwarded producer failure propagates to a registered dependent");
+    TWIST_ASSERT_M(!dependent_ran.load(std::memory_order_relaxed),
+                   "dependent body must not run after forwarded producer failure");
+}
+
+void SharedVarCancellationPropagates() {
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int input) { return input + 1; }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    value.cancel();
+    twist::test::body::WaitGroup wg;
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        ExpectThrows<oox::cancelled_by_user>([&] { (void)value.get(); },
+                                            "shared_var must preserve explicit cancellation");
+    });
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        gate = 1;
+    });
+    wg.Join();
+}
+
 void WaitStatusNoThrowRethrowsOriginalForProducer() {
     auto bad = oox::run([]() -> int {
         throw DummyException{};
@@ -230,6 +290,10 @@ int main() {
     oox::twist_tests::RunRandomSeeds("ExplicitCancelIsBestEffort", ExplicitCancelIsBestEffort);
     oox::twist_tests::RunRandomSeeds("ForwardingThrowsBeforeReturningVar", ForwardingThrowsBeforeReturningVar);
     oox::twist_tests::RunRandomSeeds("ForwardedInnerExceptionPropagates", ForwardedInnerExceptionPropagates);
+    oox::twist_tests::RunRandomSeeds("SharedVarExceptionWakesWaiter", SharedVarExceptionWakesWaiter);
+    oox::twist_tests::RunRandomSeeds("SharedVarForwardedProducerExceptionPropagates",
+                                     SharedVarForwardedProducerExceptionPropagates);
+    oox::twist_tests::RunRandomSeeds("SharedVarCancellationPropagates", SharedVarCancellationPropagates);
     oox::twist_tests::RunRandomSeeds("WaitStatusNoThrowRethrowsOriginalForProducer",
                                      WaitStatusNoThrowRethrowsOriginalForProducer);
     oox::twist_tests::RunRandomSeeds("WaitStatusNoThrowDependentReportsFailure",

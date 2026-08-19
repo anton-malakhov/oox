@@ -8,6 +8,7 @@
 #include <utility>
 #include <type_traits>
 #include <limits>
+#include <memory>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -1481,6 +1482,12 @@ tbb::task* task_node::forward_successors( oox_var_base& m ) {
 
 template< typename T, bool CanThrow > struct gen_oox;
 
+template <typename T>
+concept copy_value_assignable = std::is_copy_constructible_v<T> && std::is_copy_assignable_v<T>;
+
+template <typename T>
+concept move_value_assignable = std::is_move_constructible_v<T> && std::is_move_assignable_v<T>;
+
 } // namespace internal
 
 
@@ -1492,17 +1499,17 @@ class var : public internal::oox_var_base {
                   "for const types use shared_ptr<T>.");
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<T, true> requires OOX_EXCEPTIONS_ENABLED=1");
 
-    void* allocate_new() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
+    template <typename U>
+    void allocate_new(U&& value) {
+        auto *v = internal::task::allocate<internal::storage_task<1, T>>(std::forward<U>(value));
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         v->head.store(internal::details::task_done_marker(), std::memory_order_release);
         // nobody wait on this task
         this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
-        return storage_ptr;
     }
 
-    void* allocate_deferred() noexcept {
+    void* allocate_deferred() {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var(deferred)", v);
         // Make writers behave like for a normal initial value (next_writer ready),
@@ -1518,15 +1525,15 @@ public:
     var(deferred_t) {
         allocate_deferred(); // storage exists, but value is not ready
     }
-    var(const T& t) noexcept {
-        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(t); // TODO: add exception-safe
-    }
-    var(T&& t)      noexcept {
-        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(std::move(t));
-    }
+    var(const T& t) requires std::is_copy_constructible_v<T> { allocate_new(t); }
+    var(const T&) requires (!std::is_copy_constructible_v<T>) = delete;
+    var(T&& t) requires std::is_move_constructible_v<T> { allocate_new(std::move(t)); }
+    var(T&&) requires (!std::is_move_constructible_v<T>) = delete;
     var(var<T, CanThrow>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
+    var& operator=(const T& t) requires internal::copy_value_assignable<T>;
+    var& operator=(const T&) requires (!internal::copy_value_assignable<T>) = delete;
+    var& operator=(T&& t) requires internal::move_value_assignable<T>;
+    var& operator=(T&&) requires (!internal::move_value_assignable<T>) = delete;
     var& operator=(var<T, CanThrow>&& t) {
         release();
         new(this) internal::oox_var_base(std::move(t));
@@ -1636,8 +1643,14 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
     int setup( int port, internal::task_node *self, const var_type& cov, Args&&... args ) {
         int count = is_writer;
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("oox::var<A>").c_str(), cov.current_task, get_type<T>("T").c_str(), count);
-        if( !cov.current_task )
-            new( &const_cast<var_type&>(cov) ) var_type(ooxed_type()); // allocate oox container with default value
+        if( !cov.current_task ) {
+            if constexpr (std::is_move_constructible_v<ooxed_type>) {
+                new( &const_cast<var_type&>(cov) ) var_type(ooxed_type());
+            } else {
+                ooxed_type value;
+                new( &const_cast<var_type&>(cov) ) var_type(value);
+            }
+        }
         if constexpr (is_writer) {
             static_assert(VarCanThrow || !SelfCanThrow, "throwing task cannot write to non-throwing var");
             auto &ov = const_cast<var_type&>(cov); // actual type is non-const due to is_writer
@@ -1941,6 +1954,31 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
+}
+
+template<typename T, bool CanThrow>
+var<T, CanThrow>& var<T, CanThrow>::operator=(const T& t)
+    requires internal::copy_value_assignable<T> {
+    if (!current_task) {
+        return *this = var<T, CanThrow>(t);
+    }
+    auto value = std::make_shared<T>(t);
+    run<CanThrow>([value = std::move(value)](T& target) noexcept(!CanThrow) {
+        target = *value;
+    }, *this);
+    return *this;
+}
+
+template<typename T, bool CanThrow>
+var<T, CanThrow>& var<T, CanThrow>::operator=(T&& t)
+    requires internal::move_value_assignable<T> {
+    if (!current_task) {
+        return *this = var<T, CanThrow>(std::move(t));
+    }
+    run<CanThrow>([value = std::move(t)](T& target) mutable noexcept(!CanThrow) {
+        target = std::move(value);
+    }, *this);
+    return *this;
 }
 
 #if OOX_EXCEPTIONS_ENABLED

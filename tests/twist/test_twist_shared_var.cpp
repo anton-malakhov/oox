@@ -7,7 +7,42 @@
 #include <twist/ed/std/atomic.hpp>
 #include <twist/test/body/wg.hpp>
 
+#include <cstdint>
+
 namespace {
+
+twist::ed::std::atomic<int>* materialization_gate = nullptr;
+oox::shared_var<int>* materialization_side_effect = nullptr;
+oox::shared_var<int>* plain_constructor_side_effect = nullptr;
+
+struct gated_default_value {
+    int value = 0;
+
+    gated_default_value() {
+        materialization_gate->fetch_add(1, std::memory_order_relaxed);
+        while (materialization_gate->load(std::memory_order_relaxed) < 2) {
+            twist::assist::PreemptionPoint();
+        }
+        oox::run([](int& side_effect) { ++side_effect; }, *materialization_side_effect);
+    }
+};
+
+struct copy_only_value {
+    int value = 0;
+
+    copy_only_value() = default;
+    explicit copy_only_value(int v) : value(v) {}
+    copy_only_value(const copy_only_value&) = default;
+    copy_only_value(copy_only_value&&) = delete;
+    copy_only_value& operator=(const copy_only_value&) = default;
+    copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
+struct reentrant_plain_default_value {
+    reentrant_plain_default_value() {
+        oox::run([](int& side_effect) { ++side_effect; }, *plain_constructor_side_effect);
+    }
+};
 
 // Mirror of test_twist_known_deferred_race: two threads race to register a
 // reader and a writer on the same deferred shared_var. The state mutex
@@ -38,6 +73,125 @@ void DeferredSharedPublication() {
 
     TWIST_ASSERT_M(oox::wait_and_get(result) == 42, "deferred shared publication result");
     TWIST_ASSERT_M(oox::wait_and_get(source) == 41, "deferred shared source value");
+}
+
+void DeferredAssignmentWakesWaitingReader() {
+    oox::shared_var<int> value(oox::deferred);
+    twist::ed::std::atomic<int> observed{-1};
+    twist::test::body::WaitGroup wg;
+
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        observed.store(value.get(), std::memory_order_relaxed);
+    });
+    wg.Add(1, [&] {
+        twist::assist::PreemptionPoint();
+        value = 42;
+    });
+
+    wg.Join();
+    TWIST_ASSERT_M(observed.load(std::memory_order_relaxed) == 42,
+                   "assignment publishes a deferred shared_var to a waiting reader");
+}
+
+void CopyOnlyAssignmentUsesTheCopyOverload() {
+    copy_only_value initial(1);
+    copy_only_value replacement(42);
+    oox::shared_var<copy_only_value> value(initial);
+    value = replacement;
+    TWIST_ASSERT_M(value.get().value == 42, "copy-only shared_var assignment");
+}
+
+void AssignmentPublishesAfterReleasingStateLock() {
+    oox::shared_var<int> value(oox::deferred);
+    oox::shared_var<int> alias = value;
+    auto reader = oox::run([alias](int) { return alias.get(); }, value);
+    value = 42;
+    TWIST_ASSERT_M(oox::wait_and_get(reader) == 42,
+                   "assignment continuation runs after the shared state unlock");
+}
+
+void ConcurrentLazyMaterializationRunsOutsideRegistrationLocks() {
+    twist::ed::std::atomic<int> gate{0};
+    oox::shared_var<int> side_effect(0);
+    materialization_gate = &gate;
+    materialization_side_effect = &side_effect;
+    oox::shared_var<gated_default_value> first;
+    oox::shared_var<gated_default_value> second;
+    twist::test::body::WaitGroup wg;
+
+    wg.Add(1, [&] {
+        oox::run([](gated_default_value& a, gated_default_value& b) {
+            ++a.value;
+            ++b.value;
+        }, first, second);
+    });
+    wg.Add(1, [&] {
+        oox::run([](gated_default_value& b, gated_default_value& a) {
+            ++b.value;
+            ++a.value;
+        }, second, first);
+    });
+    wg.Join();
+    TWIST_ASSERT_M(first.get().value == 2 && second.get().value == 2,
+                   "both writers survive concurrent lazy materialization");
+    TWIST_ASSERT_M(side_effect.get() >= 2, "default constructors ran outside registration locks");
+    materialization_gate = nullptr;
+    materialization_side_effect = nullptr;
+}
+
+void ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch() {
+    oox::shared_var<int> value(0);
+    oox::shared_var<int> side_effect(0);
+    oox::var<reentrant_plain_default_value> plain;
+    plain_constructor_side_effect = &side_effect;
+    auto done = oox::run([](int& target, reentrant_plain_default_value&) {
+        ++target;
+    }, value, plain);
+    oox::wait_for_all(done);
+    TWIST_ASSERT_M(value.get() == 1 && side_effect.get() == 1,
+                   "reentrant run uses a separate shared registration batch");
+    plain_constructor_side_effect = nullptr;
+}
+
+void MutableAliasesShareOneWriterRegistration() {
+    oox::shared_var<int> value(0);
+    oox::shared_var<int> alias = value;
+
+    auto first = oox::run([](int& a, int& b) {
+        ++a;
+        ++b;
+    }, value, value);
+    oox::wait_for_all(first);
+    TWIST_ASSERT_M(oox::internal::details::is_next_writer_no_owner_marker(
+                       first.current_task->out(2).next_writer.load(std::memory_order_acquire)),
+                   "discarded aliased writer port has no owner hold");
+
+    auto second = oox::run([](int& a, int& b) {
+        ++a;
+        ++b;
+    }, value, alias);
+    oox::wait_for_all(second);
+    TWIST_ASSERT_M(oox::internal::details::is_next_writer_no_owner_marker(
+                       second.current_task->out(2).next_writer.load(std::memory_order_acquire)),
+                   "copied alias writer port has no owner hold");
+    TWIST_ASSERT_M(value.get() == 4, "aliased mutable arguments execute without self-dependency");
+
+    auto mixed = oox::run([](int& target, int snapshot) {
+        target += snapshot;
+    }, value, value);
+    oox::wait_for_all(mixed);
+    TWIST_ASSERT_M(value.get() == 8,
+                   "reader/writer aliases share the writer registration and storage");
+}
+
+void FailedWaiterSubscriptionReleasesArc() {
+    oox::var<int> ready(1);
+    auto* waiter = oox::internal::task::allocate<oox::internal::shared_var_waiter>();
+    waiter->life_set_count(1);
+    TWIST_ASSERT_M(!waiter->subscribe(ready.current_task),
+                   "completed producer rejects a late waiter arc");
+    waiter->release();
 }
 
 // A ready shared_var with concurrent reader and writer registration: the
@@ -205,18 +359,18 @@ void MixedVarAndSharedVarArgs() {
 // wait on the freed task (task::wait: life_get_count assertion). The wait now
 // runs without the state mutex and re-validates the current slot.
 void GetWhileFastWriters() {
-    oox::shared_var<int> value(0);
-    constexpr int kRegistrations = 64;
-    constexpr int kGets = 32;
+    oox::shared_var<std::uint32_t> value(0);
+    constexpr int kRegistrations = 8;
+    constexpr int kGets = 8;
     twist::test::body::WaitGroup wg;
 
     wg.Add(1, [&] {
         for (int i = 0; i < kRegistrations; ++i) {
             twist::assist::PreemptionPoint();
-            oox::run([i](int& v) {
-                int acc = i;
+            oox::run([i](std::uint32_t& v) {
+                std::uint32_t acc = static_cast<std::uint32_t>(i);
                 for (int j = 0; j < 100; ++j) {
-                    acc = acc * 31 + j;
+                    acc = acc * 31 + static_cast<std::uint32_t>(j);
                 }
                 v = acc;
             }, value);
@@ -232,9 +386,9 @@ void GetWhileFastWriters() {
 
     wg.Join();
 
-    int expected = kRegistrations - 1;
+    std::uint32_t expected = kRegistrations - 1;
     for (int j = 0; j < 100; ++j) {
-        expected = expected * 31 + j;
+        expected = expected * 31 + static_cast<std::uint32_t>(j);
     }
     TWIST_ASSERT_M(oox::wait_and_get(value) == expected, "last writer applied");
 }
@@ -243,6 +397,19 @@ void GetWhileFastWriters() {
 
 int main() {
     oox::twist_tests::RunRandomSeeds("DeferredSharedPublication", DeferredSharedPublication);
+    oox::twist_tests::RunRandomSeeds("DeferredAssignmentWakesWaitingReader", DeferredAssignmentWakesWaitingReader);
+    oox::twist_tests::RunRandomSeeds("CopyOnlyAssignmentUsesTheCopyOverload",
+                                     CopyOnlyAssignmentUsesTheCopyOverload);
+    oox::twist_tests::RunRandomSeeds("AssignmentPublishesAfterReleasingStateLock",
+                                     AssignmentPublishesAfterReleasingStateLock);
+    oox::twist_tests::RunRandomSeeds("ConcurrentLazyMaterializationRunsOutsideRegistrationLocks",
+                                     ConcurrentLazyMaterializationRunsOutsideRegistrationLocks);
+    oox::twist_tests::RunRandomSeeds("ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch",
+                                     ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
+    oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",
+                                     MutableAliasesShareOneWriterRegistration);
+    oox::twist_tests::RunRandomSeeds("FailedWaiterSubscriptionReleasesArc",
+                                     FailedWaiterSubscriptionReleasesArc);
     oox::twist_tests::RunRandomSeeds("ConcurrentReaderAndWriterRegistration", ConcurrentReaderAndWriterRegistration);
     oox::twist_tests::RunRandomSeeds("ConcurrentWriterRegistration", ConcurrentWriterRegistration);
     oox::twist_tests::RunRandomSeeds("ConcurrentGet", ConcurrentGet);

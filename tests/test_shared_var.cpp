@@ -11,12 +11,10 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,61 +27,59 @@ struct account {
     int points = 1000;
 };
 
+struct non_assignable_value {
+    non_assignable_value() = default;
+    non_assignable_value(const non_assignable_value&) = default;
+    non_assignable_value(non_assignable_value&&) = default;
+    non_assignable_value& operator=(const non_assignable_value&) = delete;
+    non_assignable_value& operator=(non_assignable_value&&) = delete;
+};
+
+struct copy_only_value {
+    int value = 0;
+
+    copy_only_value() = default;
+    explicit copy_only_value(int v) : value(v) {}
+    copy_only_value(const copy_only_value&) = default;
+    copy_only_value(copy_only_value&&) = delete;
+    copy_only_value& operator=(const copy_only_value&) = default;
+    copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
+template <typename Var, typename Value>
+concept supports_value_assignment = requires(Var& var, Value&& value) {
+    var = std::forward<Value>(value);
+};
+
+static_assert(!supports_value_assignment<oox::var<non_assignable_value>, non_assignable_value>);
+static_assert(!supports_value_assignment<oox::shared_var<non_assignable_value>, non_assignable_value>);
+static_assert(!oox::internal::shareable_value<oox::shared_var<int>>);
+
+std::barrier<>* default_constructor_gate = nullptr;
+oox::shared_var<int>* default_constructor_side_effect = nullptr;
+oox::shared_var<int>* plain_constructor_side_effect = nullptr;
+
+struct gated_default_value {
+    int value = 0;
+
+    gated_default_value() {
+        default_constructor_gate->arrive_and_wait();
+        oox::run([](int& side_effect) { ++side_effect; }, *default_constructor_side_effect);
+    }
+};
+
+struct reentrant_plain_default_value {
+    reentrant_plain_default_value() {
+        oox::run([](int& side_effect) { ++side_effect; }, *plain_constructor_side_effect);
+    }
+};
+
 using namespace std::chrono_literals;
 
 constexpr auto k_async_test_timeout = 2s;
-constexpr auto k_registration_rendezvous_timeout = 500ms;
-
-// Forces two lazy shared_var values to be materialized concurrently. Each
-// constructor runs while setup() holds the mutex for its first shared_var, so
-// opposite argument orders deterministically expose non-atomic registration.
-// The bounded wait also lets the test pass after a fix that locks all states in
-// a canonical order before materializing either value.
-class registration_rendezvous {
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool enabled_ = false;
-    int participants_ = 0;
-
-public:
-    void enable() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        enabled_ = true;
-        participants_ = 0;
-    }
-
-    void disable() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            enabled_ = false;
-        }
-        cv_.notify_all();
-    }
-
-    void arrive() {
-        thread_local bool already_arrived = false;
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!enabled_ || already_arrived) {
-            return;
-        }
-
-        already_arrived = true;
-        ++participants_;
-        cv_.notify_all();
-        cv_.wait_for(lock, k_registration_rendezvous_timeout,
-                     [this] { return participants_ >= 2 || !enabled_; });
-    }
-};
-
-registration_rendezvous writer_registration_rendezvous;
-
-struct gated_value {
-    int value = 0;
-
-    gated_value() {
-        writer_registration_rendezvous.arrive();
-    }
-};
+#if OOX_EXCEPTIONS_ENABLED
+struct shared_var_test_error final : std::exception {};
+#endif
 
 template <typename F>
 testing::AssertionResult completes_within(F&& scenario, const char* timeout_message) {
@@ -131,6 +127,52 @@ TEST(SharedVar, LazyDefault) {
     EXPECT_EQ(sv.get(), 0); // lazy var materializes a default value
 }
 
+TEST(SharedVar, LazyMaterializationRunsUserCodeOutsideRegistrationLocks) {
+    const auto completion = completes_within([] {
+        std::barrier gate(2);
+        oox::shared_var<int> side_effect(0);
+        default_constructor_gate = &gate;
+        default_constructor_side_effect = &side_effect;
+        oox::shared_var<gated_default_value> first;
+        oox::shared_var<gated_default_value> second;
+
+        std::thread left([&] {
+            oox::run([](gated_default_value& a, gated_default_value& b) {
+                ++a.value;
+                ++b.value;
+            }, first, second);
+        });
+        std::thread right([&] {
+            oox::run([](gated_default_value& b, gated_default_value& a) {
+                ++b.value;
+                ++a.value;
+            }, second, first);
+        });
+        left.join();
+        right.join();
+        if (first.get().value != 2 || second.get().value != 2 || side_effect.get() < 2) {
+            throw std::runtime_error("lazy materialization lost a writer or constructor side effect");
+        }
+        default_constructor_gate = nullptr;
+        default_constructor_side_effect = nullptr;
+    }, "T{} ran while the shared registration lock set was held");
+    EXPECT_TRUE(completion);
+}
+
+TEST(SharedVar, ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch) {
+    oox::shared_var<int> value(0);
+    oox::shared_var<int> side_effect(0);
+    oox::var<reentrant_plain_default_value> plain;
+    plain_constructor_side_effect = &side_effect;
+    auto done = oox::run([](int& target, reentrant_plain_default_value&) {
+        ++target;
+    }, value, plain);
+    oox::wait_for_all(done);
+    EXPECT_EQ(value.get(), 1);
+    EXPECT_EQ(side_effect.get(), 1);
+    plain_constructor_side_effect = nullptr;
+}
+
 TEST(SharedVar, MoveValue) {
     oox::shared_var<std::string> sv(std::string("hello"));
     EXPECT_EQ(sv.get(), "hello");
@@ -159,6 +201,17 @@ TEST(SharedVar, AdoptForwardedVar) {
     EXPECT_EQ(sv.get(), expected);
 }
 
+TEST(SharedVar, RegisterAdoptedForwardedVarBeforeProducerRuns) {
+    oox::shared_var<int> gate(oox::deferred);
+    auto forwarded = oox::run([](int input) {
+        return oox::run([input] { return input + 1; });
+    }, gate);
+    oox::shared_var<int> value(std::move(forwarded));
+    auto result = oox::run([](int input) { return input + 1; }, value);
+    gate = 40;
+    EXPECT_EQ(oox::wait_and_get(result), 42);
+}
+
 TEST(SharedVar, CopyHandlesShareState) {
     oox::shared_var<int> sv(10);
     oox::shared_var<int> copy = sv;
@@ -179,6 +232,54 @@ TEST(SharedVar, AssignmentSerializes) {
     EXPECT_EQ(sv.get(), 5);
     sv = 7;
     EXPECT_EQ(sv.get(), 7);
+}
+
+TEST(SharedVar, CopyOnlyAssignmentUsesTheCopyOverload) {
+    copy_only_value initial(1);
+    copy_only_value replacement(42);
+    oox::shared_var<copy_only_value> value(initial);
+    value = replacement;
+    EXPECT_EQ(value.get().value, 42);
+}
+
+TEST(SharedVar, AssignmentPublishesAfterReleasingStateLock) {
+    const auto completion = completes_within([] {
+        oox::shared_var<int> value(oox::deferred);
+        oox::shared_var<int> alias = value;
+        auto reader = oox::run([alias](int) { return alias.get(); }, value);
+        value = 42;
+        if (oox::wait_and_get(reader) != 42) {
+            throw std::runtime_error("reader observed the wrong assigned value");
+        }
+    }, "assignment published a task while retaining the shared state lock");
+    EXPECT_TRUE(completion);
+}
+
+TEST(SharedVar, DeferredAssignmentWakesWaitingReader) {
+#if defined(OOX_USING_SERIAL)
+    GTEST_SKIP() << "the serial backend does not implement blocking waits";
+#else
+    oox::shared_var<int> value(oox::deferred);
+    std::promise<void> reader_started;
+    std::atomic<int> observed{-1};
+    std::thread reader([&] {
+        reader_started.set_value();
+        observed.store(value.get(), std::memory_order_relaxed);
+    });
+    reader_started.get_future().wait();
+    std::this_thread::sleep_for(20ms);
+    value = 42;
+    reader.join();
+    EXPECT_EQ(observed.load(std::memory_order_relaxed), 42);
+#endif
+}
+
+TEST(SharedVar, FailedWaiterSubscriptionReleasesArc) {
+    oox::var<int> ready(1);
+    auto* waiter = oox::internal::task::allocate<oox::internal::shared_var_waiter>();
+    waiter->life_set_count(1);
+    EXPECT_FALSE(waiter->subscribe(ready.current_task));
+    waiter->release();
 }
 
 /////////////////////////////////////// GRAPH INTEGRATION ////////////////////////////////////////
@@ -222,6 +323,88 @@ TEST(SharedVar, SameVarTwiceAsReader) {
     auto sum = oox::run([](int a, int b) { return a + b; }, value, value);
     EXPECT_EQ(oox::wait_and_get(sum), 20);
 }
+
+TEST(SharedVar, SameStateTwiceAsWriter) {
+    oox::shared_var<int> value(0);
+    auto done = oox::run([](int& a, int& b) {
+        ++a;
+        ++b;
+    }, value, value);
+    oox::wait_for_all(done);
+    EXPECT_EQ(done.current_task->life_get_count(), 2);
+    EXPECT_EQ(value.get(), 2);
+}
+
+TEST(SharedVar, CopiedStateTwiceAsWriter) {
+    oox::shared_var<int> value(0);
+    oox::shared_var<int> alias = value;
+    auto done = oox::run([](int& a, int& b) {
+        ++a;
+        ++b;
+    }, value, alias);
+    oox::wait_for_all(done);
+    EXPECT_EQ(done.current_task->life_get_count(), 2);
+    EXPECT_EQ(value.get(), 2);
+    EXPECT_EQ(alias.get(), 2);
+}
+
+TEST(SharedVar, SameStateAsReaderAndWriterUsesOneRegistration) {
+    oox::shared_var<int> value(3);
+    auto done = oox::run([](int& target, int snapshot) {
+        target += snapshot;
+    }, value, value);
+    oox::wait_for_all(done);
+    EXPECT_EQ(value.get(), 6);
+}
+
+#if OOX_EXCEPTIONS_ENABLED
+TEST(SharedVar, ExceptionWakesWaiterAndRethrows) {
+#if defined(OOX_USING_SERIAL)
+    GTEST_SKIP() << "the serial backend does not implement blocking waits";
+#else
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int) -> int { throw shared_var_test_error{}; }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    auto result = std::async(std::launch::async, [&] { return value.get(); });
+    std::this_thread::sleep_for(20ms);
+    gate = 1;
+    EXPECT_THROW((void)result.get(), shared_var_test_error);
+#endif
+}
+
+TEST(SharedVar, ForwardedProducerExceptionRethrows) {
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int) -> oox::var<int, true> {
+        throw shared_var_test_error{};
+    }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    std::atomic<bool> dependent_ran{false};
+    auto dependent = oox::run<true>([&](int input) {
+        dependent_ran.store(true, std::memory_order_relaxed);
+        return input;
+    }, value);
+    gate = 1;
+    EXPECT_THROW((void)value.get(), shared_var_test_error);
+    EXPECT_THROW((void)oox::wait_and_get(dependent), shared_var_test_error);
+    EXPECT_FALSE(dependent_ran.load(std::memory_order_relaxed));
+}
+
+TEST(SharedVar, CancellationPropagatesThroughWaiter) {
+    oox::shared_var<int, true> gate(oox::deferred);
+    auto producer = oox::run<true>([](int input) { return input + 1; }, gate);
+    oox::shared_var<int, true> value(std::move(producer));
+    value.cancel();
+#if defined(OOX_USING_SERIAL)
+    gate = 1;
+    EXPECT_THROW((void)value.get(), oox::cancelled_by_user);
+#else
+    auto result = std::async(std::launch::async, [&] { return value.get(); });
+    std::this_thread::sleep_for(20ms);
+    gate = 1;
+    EXPECT_THROW((void)result.get(), oox::cancelled_by_user);
+#endif
+}
+#endif
 
 TEST(SharedVar, MixedVarAndSharedVar) {
     oox::var<int> plain(5);
@@ -318,34 +501,64 @@ TEST(SharedVar, WaitOnDeferredDoesNotBlockPublication) {
 #endif
 }
 
+TEST(SharedVar, ForwardedWaitDoesNotBlockWriterRegistration) {
+#if defined(OOX_USING_SERIAL)
+    GTEST_SKIP() << "the serial backend does not implement blocking waits";
+#else
+    const auto completion = completes_within([] {
+        oox::shared_var<int> gate(oox::deferred);
+        auto forwarded = oox::run([](int input) {
+            return oox::run([input] { return input; });
+        }, gate);
+        oox::shared_var<int> value(std::move(forwarded));
+        std::promise<void> getter_started;
+        auto getter = std::async(std::launch::async, [&] {
+            getter_started.set_value();
+            return value.get();
+        });
+        getter_started.get_future().wait();
+        std::this_thread::sleep_for(20ms);
+        auto registration = std::async(std::launch::async, [&] {
+            oox::run([](int& input) { ++input; }, value);
+        });
+        const bool registered_before_publication =
+            registration.wait_for(100ms) == std::future_status::ready;
+        gate = 41;
+        registration.get();
+        const int observed = getter.get();
+        if (!registered_before_publication || observed != 42) {
+            throw std::runtime_error("forwarded wait retained the state mutex");
+        }
+    }, "forwarded get() blocked a writer registration on the state mutex");
+    EXPECT_TRUE(completion);
+#endif
+}
+
 TEST(SharedVar, ConcurrentOppositeOrderMultiVarWritersComplete) {
     const auto completion = completes_within([] {
-        writer_registration_rendezvous.enable();
-        oox::shared_var<gated_value> first;
-        oox::shared_var<gated_value> second;
+        oox::shared_var<int> first(0);
+        oox::shared_var<int> second(0);
         std::barrier start(2);
 
         std::thread first_registration([&] {
             start.arrive_and_wait();
-            oox::run([](gated_value& a, gated_value& b) {
-                ++a.value;
-                ++b.value;
+            oox::run([](int& a, int& b) {
+                ++a;
+                ++b;
             }, first, second);
         });
 
         std::thread second_registration([&] {
             start.arrive_and_wait();
-            oox::run([](gated_value& b, gated_value& a) {
-                ++b.value;
-                ++a.value;
+            oox::run([](int& b, int& a) {
+                ++b;
+                ++a;
             }, second, first);
         });
 
         first_registration.join();
         second_registration.join();
-        writer_registration_rendezvous.disable();
-
-        if (first.get().value != 2 || second.get().value != 2) {
+        if (first.get() != 2 || second.get() != 2) {
             throw std::runtime_error("one of the two writer tasks did not run");
         }
     }, "opposite per-variable registration orders created a task cycle");
@@ -394,17 +607,17 @@ TEST(SharedVar, GetWhileFastWriters) {
     // async backends — TBB/twist — where the next writer is chained before
     // the current task completes; on std/serial the registration blocks and
     // the test passes trivially.)
-    oox::shared_var<int> value(0);
+    oox::shared_var<std::uint32_t> value(0);
     constexpr int kRegistrations = 4000;
     constexpr int kGets = 1000;
     std::atomic<int> registrations{0};
     std::thread writer([&] {
         int i = 0;
         while (registrations.load(std::memory_order_relaxed) < kRegistrations) {
-            oox::run([i](int& v) {
-                int acc = i;
+            oox::run([i](std::uint32_t& v) {
+                std::uint32_t acc = static_cast<std::uint32_t>(i);
                 for (int j = 0; j < 20000; ++j) {
-                    acc = acc * 31 + j;
+                    acc = acc * 31 + static_cast<std::uint32_t>(j);
                 }
                 v = acc;
             }, value);
@@ -412,14 +625,14 @@ TEST(SharedVar, GetWhileFastWriters) {
             ++i;
         }
     });
-    volatile int sink = 0;
+    volatile std::uint32_t sink = 0;
     for (int i = 0; i < kGets; ++i) {
         sink = value.get(); // must not crash
     }
     registrations.store(kRegistrations, std::memory_order_relaxed);
     writer.join();
     (void)value.get(); // the chain drains; read the final value
-    EXPECT_NE(sink, -1) << "unreachable";
+    (void)sink;
 }
 
 int main(int argc, char** argv) {

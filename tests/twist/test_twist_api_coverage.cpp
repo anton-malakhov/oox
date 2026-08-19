@@ -8,6 +8,17 @@
 
 namespace {
 
+struct copy_only_value {
+    int value = 0;
+
+    copy_only_value() = default;
+    explicit copy_only_value(int v) : value(v) {}
+    copy_only_value(const copy_only_value&) = default;
+    copy_only_value(copy_only_value&&) = delete;
+    copy_only_value& operator=(const copy_only_value&) = default;
+    copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
 void DeferredTwoInputs() {
     oox::var<int> a(oox::deferred);
     oox::var<int> b(oox::deferred);
@@ -81,6 +92,28 @@ void DeferredArrayLayered() {
 void ImmediateValueConsistency() {
     const oox::var<int> tmp = 1;
     TWIST_ASSERT_M(oox::wait_and_get(tmp) == 1, "immediate var consistency");
+}
+
+void ValueAssignmentPublishesAndSerializes() {
+    oox::var<int> deferred(oox::deferred);
+    auto deferred_reader = oox::run([](int value) { return value + 1; }, deferred);
+    deferred = 41;
+    TWIST_ASSERT_M(oox::wait_and_get(deferred) == 41, "value assignment publishes deferred var");
+    TWIST_ASSERT_M(oox::wait_and_get(deferred_reader) == 42, "deferred reader observes assignment");
+
+    oox::var<int> ready(1);
+    auto ready_reader = oox::run([](int value) { return value; }, ready);
+    ready = 7;
+    TWIST_ASSERT_M(oox::wait_and_get(ready_reader) == 1, "existing reader precedes assignment writer");
+    TWIST_ASSERT_M(oox::wait_and_get(ready) == 7, "assignment becomes current writer");
+}
+
+void CopyOnlyAssignmentUsesTheCopyOverload() {
+    copy_only_value initial(1);
+    copy_only_value replacement(42);
+    oox::var<copy_only_value> value(initial);
+    value = replacement;
+    TWIST_ASSERT_M(oox::wait_and_get(value).value == 42, "copy-only var assignment");
 }
 
 void DeferredRedirectLateConsumer() {
@@ -189,6 +222,10 @@ int main() {
     oox::twist_tests::RunRandomSeeds("DeferredForwardingLayer", DeferredForwardingLayer);
     oox::twist_tests::RunRandomSeeds("DeferredArrayLayered", DeferredArrayLayered);
     oox::twist_tests::RunRandomSeeds("ImmediateValueConsistency", ImmediateValueConsistency);
+    oox::twist_tests::RunRandomSeeds("ValueAssignmentPublishesAndSerializes",
+                                     ValueAssignmentPublishesAndSerializes);
+    oox::twist_tests::RunRandomSeeds("CopyOnlyAssignmentUsesTheCopyOverload",
+                                     CopyOnlyAssignmentUsesTheCopyOverload);
     oox::twist_tests::RunRandomSeeds("DeferredRedirectLateConsumer", DeferredRedirectLateConsumer);
     oox::twist_tests::RunRandomSeeds("WriterPipelineOnSingleVar", WriterPipelineOnSingleVar);
     oox::twist_tests::RunRandomSeeds("InternalHooksRareBranches", InternalHooksRareBranches);
