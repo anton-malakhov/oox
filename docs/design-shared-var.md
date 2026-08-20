@@ -111,6 +111,12 @@ the actual registration to a thread-local setup context:
    any synchronously triggered continuation therefore cannot re-enter a held
    shared-state mutex.
 
+Argument setup is a synchronous graph-construction phase, outside the
+`CanThrow` execution policy. If setup itself throws, registration rollback and
+reclamation of the unpublished task are intentionally not guaranteed; callers
+must treat that boundary as fatal. This avoids adding a temporary atomic
+lifetime owner and rollback machinery to every successful `run()`.
+
 **Why atomic multi-state registration**: two threads registering writers on the
 same two vars in opposite orders (`run(f, sv1, sv2)` vs `run(g, sv2, sv1)`)
 can interleave their per-var chains and create a **task cycle** (each writer

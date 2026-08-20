@@ -218,6 +218,11 @@ void wait_for_all(const shared_var<T, CanThrow>&);
 
 `CanThrow` (with `OOX_EXCEPTIONS_ENABLED=ON`) adds exception-aware state
 machinery: failed tasks propagate through the graph and `get()` rethrows.
+This policy starts after a task has been published. Dependency registration in
+`run()` is synchronous and intentionally provides no exception-safety
+guarantee: if argument `setup()` throws, OOX does not roll back registrations
+or reclaim the unpublished task. Applications must treat graph-construction
+failures as fatal or prevent them at that boundary.
 For `CanThrow == false`, operations performed by argument consumption are also
 part of the non-throwing contract: deferred/forwarded materialization and a
 copy/move or cross-type conversion from the actual stored-value reference must

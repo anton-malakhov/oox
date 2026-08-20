@@ -151,16 +151,14 @@ static_assert(supports_value_assignment<oox::shared_var<throwing_assignment_valu
                                         throwing_assignment_value>);
 #endif
 
-std::barrier<>* default_constructor_gate = nullptr;
-oox::shared_var<int>* default_constructor_side_effect = nullptr;
+std::atomic<std::uint64_t> default_constructor_count{0};
 oox::shared_var<int>* plain_constructor_side_effect = nullptr;
 
-struct gated_default_value {
+struct counted_default_value {
     int value = 0;
 
-    gated_default_value() noexcept {
-        default_constructor_gate->arrive_and_wait();
-        oox::run([](int& side_effect) { ++side_effect; }, *default_constructor_side_effect);
+    counted_default_value() noexcept {
+        default_constructor_count.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
@@ -241,32 +239,33 @@ TEST(SharedVar, LazyMaterializationUsesValueInitializationAndSafeCopy) {
 
 TEST(SharedVar, LazyMaterializationRunsUserCodeInGraphTasks) {
     const auto completion = completes_within([] {
-        std::barrier gate(1);
-        oox::shared_var<int> side_effect(0);
-        default_constructor_gate = &gate;
-        default_constructor_side_effect = &side_effect;
-        oox::shared_var<gated_default_value> first;
-        oox::shared_var<gated_default_value> second;
+        const auto constructors_before =
+            default_constructor_count.load(std::memory_order_relaxed);
+        oox::shared_var<counted_default_value> first;
+        oox::shared_var<counted_default_value> second;
 
         std::thread left([&] {
-            oox::run([](gated_default_value& a, gated_default_value& b) {
+            oox::run([](counted_default_value& a, counted_default_value& b) {
                 ++a.value;
                 ++b.value;
             }, first, second);
         });
         std::thread right([&] {
-            oox::run([](gated_default_value& b, gated_default_value& a) {
+            oox::run([](counted_default_value& b, counted_default_value& a) {
                 ++b.value;
                 ++a.value;
             }, second, first);
         });
         left.join();
         right.join();
-        if (first.get().value != 2 || second.get().value != 2 || side_effect.get() < 2) {
+        const int first_value = first.get().value;
+        const int second_value = second.get().value;
+        const auto constructors_after =
+            default_constructor_count.load(std::memory_order_relaxed);
+        if (first_value != 2 || second_value != 2
+            || constructors_after < constructors_before + 2) {
             throw std::runtime_error("lazy materialization lost a writer or constructor side effect");
         }
-        default_constructor_gate = nullptr;
-        default_constructor_side_effect = nullptr;
     }, "lazy materializer graph tasks did not complete");
     EXPECT_TRUE(completion);
 }

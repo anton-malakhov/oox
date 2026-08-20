@@ -2077,6 +2077,9 @@ inline constexpr bool functor_is_nothrow_invocable_v =
 
 } //namespace internal
 
+// CanThrow governs execution of a published task. Dependency setup happens
+// synchronously and is intentionally not exception-safe: if setup throws,
+// graph registrations and the unpublished task are not rolled back.
 template< bool CanThrow = default_exception_policy, typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
 auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>, CanThrow>
 {
@@ -2102,9 +2105,6 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
-    t->life_set_count(1);
-    auto release_unpublished = [](task_type* task) { task->release(1); };
-    std::unique_ptr<task_type, decltype(release_unpublished)> setup_guard(t, release_unpublished);
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
     int protect_count = internal::task_node::start_count_mask;
     t->start_count.store(protect_count, std::memory_order_release);
@@ -2113,7 +2113,6 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
                          ->value()
                          .my_args.setup(1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
-    setup_guard.release();
     t->remove_prerequisite( protect_count ); // publish it
     return r;
 }
