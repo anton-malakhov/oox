@@ -37,7 +37,10 @@ inline eigen_thread_pool& get_eigen_pool() {
 }
 
 struct task : task_life {
+    enum : unsigned { worker_waiter = 1, external_waiter = 2 };
+
     std::atomic<bool> done{false};
+    std::atomic<unsigned> waiters{0};
     virtual ~task() = default;
     virtual void* execute() = 0;
 
@@ -58,14 +61,24 @@ struct task : task_life {
     }
 
     void wait() {
-        get_eigen_pool().Wait(
-            [this] { return done.load(std::memory_order_acquire); }
-        );
+        auto& pool = get_eigen_pool();
+        if (pool.CurrentThreadId() != -1) {
+            waiters.fetch_or(worker_waiter, std::memory_order_release);
+            pool.Wait([this] { return done.load(std::memory_order_acquire); });
+        } else {
+            waiters.fetch_or(external_waiter, std::memory_order_release);
+            while (!done.load(std::memory_order_acquire))
+                done.wait(false, std::memory_order_acquire);
+        }
     }
 
     void wakeup() {
         done.store(true, std::memory_order_release);
-        get_eigen_pool().NotifyTaskCompletion();
+        const unsigned waiting = waiters.load(std::memory_order_acquire);
+        if (waiting & external_waiter)
+            done.notify_all();
+        if (waiting & worker_waiter)
+            get_eigen_pool().NotifyTaskCompletion();
     }
 };
 

@@ -90,6 +90,12 @@ if(folly_FOUND)
   list(APPEND FOLLY_LOOP_MODES FOLLY_FOR_EACH)
 endif()
 
+if(OOX_ENABLE_EIGEN)
+  message(STATUS "Building with the bundled Eigen scheduler")
+  list(APPEND OOX_BACKENDS EIGEN)
+  list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
+endif()
+
 foreach(bench IN LISTS OOX_BENCHMARKS)
   foreach(mode IN LISTS OOX_BACKENDS)
     if("${bench}" MATCHES "loops")

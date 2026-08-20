@@ -8,11 +8,12 @@ adds a guarded overflow queue when the copied bounded publication paths fill.
 
 All implementation symbols live in `oox::detail::eigen_pool`; none are part of
 Eigen's namespace or OOX's public API. Workers briefly spin only when requested,
-then park on a condition variable. Queue publication and completion increment a
-generation while holding the wait mutex, preventing the check-to-sleep lost
-wakeup. Published-task accounting keeps workers alive during destructor draining
-and nested waits. Full local deques and mailboxes spill to an unbounded guarded
-queue, so nested spawning never falls back to recursive inline execution.
+then park with C++20 atomic wait/notify. Queue publication advances a worker
+generation without taking a global mutex, and task completion only notifies
+registered waiters. Published-task accounting keeps workers alive during
+destructor draining and nested waits. Full local deques and mailboxes spill to an
+unbounded guarded queue, so nested spawning never falls back to recursive inline
+execution.
 
 ## File provenance and license
 
@@ -30,4 +31,5 @@ The full MIT notice for Rigtorp's queue remains in `mpmc_queue.h`; MPL notices
 remain in every Eigen-derived file.
 
 `OOX_EIGEN_CACHE_LINE_SIZE` can override the stable 64-byte cache-line layout
-constant used by the vendored MPMC queue. Its value must be a power of two.
+constant used by the vendored MPMC queue. Its value must be a power of two no
+greater than 128, matching the vendored aligned allocator's supported range.

@@ -22,7 +22,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -38,6 +37,7 @@
 namespace oox::detail::eigen_pool {
 
 struct Task {
+  std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
   virtual ~Task() = default;
 };
@@ -172,7 +172,7 @@ public:
       }
     } catch (...) {
       done_.store(true, std::memory_order_release);
-      NotifyAll();
+      WakeAll();
       JoinThreads();
       FlushQueues();
       RestoreCreatorRegistration();
@@ -182,7 +182,7 @@ public:
 
   ~ThreadPoolTempl() {
     done_.store(true, std::memory_order_release);
-    NotifyAll();
+    WakeAll();
     JoinThreads();
     FlushQueues();
     RestoreCreatorRegistration();
@@ -260,7 +260,7 @@ public:
       }
     }
 #endif
-    NotifyAll();
+    WakeAll();
   }
 
   size_t NumThreads() const final { return num_threads_; }
@@ -293,29 +293,42 @@ public:
 
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
+    if (ready()) {
+      return;
+    }
+    auto &event = registered ? worker_event_ : waiter_event_;
+    if (registered) {
+      worker_task_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    struct WorkerWaitGuard {
+      std::atomic<size_t> *waiters;
+      ~WorkerWaitGuard() {
+        if (waiters) {
+          waiters->fetch_sub(1, std::memory_order_acq_rel);
+        }
+      }
+    } guard{registered ? &worker_task_waiters_ : nullptr};
+
     while (!ready()) {
-      const uint64_t observed =
-          wake_generation_.load(std::memory_order_acquire);
+      const uint64_t token = event.PrepareWait();
       if (registered && TryExecuteOne()) {
+        event.CancelWait();
         continue;
       }
       if (ready() || cancelled_.load(std::memory_order_acquire)) {
+        event.CancelWait();
         return;
       }
-      std::unique_lock<std::mutex> lock(wake_mutex_);
-      auto wake_predicate = [&]() {
-        return ready() || cancelled_.load(std::memory_order_acquire) ||
-               wake_generation_.load(std::memory_order_acquire) != observed;
-      };
-      if (registered) {
-        worker_cv_.wait(lock, wake_predicate);
-      } else {
-        waiter_cv_.wait(lock, wake_predicate);
-      }
+      event.Wait(token);
     }
   }
 
-  void NotifyTaskCompletion() { NotifyAll(); }
+  void NotifyTaskCompletion() {
+    if (worker_task_waiters_.load(std::memory_order_acquire) != 0) {
+      worker_event_.NotifyAll();
+    }
+    waiter_event_.NotifyAll();
+  }
 
 private:
   // Create a single atomic<int> that encodes start and limit information for
@@ -328,6 +341,43 @@ private:
   static const int kMaxPartitionBits = 16;
   static const int kMaxThreads = 1 << kMaxPartitionBits;
   static const int kSpinCount = 64;
+
+  class EventCount {
+  public:
+    uint64_t PrepareWait() {
+      // The caller checks for work again after registering. Sequential
+      // consistency makes either that check or a concurrent notification win.
+      const uint64_t epoch = epoch_.load(std::memory_order_seq_cst);
+      waiters_.fetch_add(1, std::memory_order_seq_cst);
+      return epoch;
+    }
+
+    void CancelWait() { waiters_.fetch_sub(1, std::memory_order_seq_cst); }
+
+    void Wait(uint64_t token) {
+      epoch_.wait(token, std::memory_order_acquire);
+      CancelWait();
+    }
+
+    void NotifyOne() { Notify(false); }
+    void NotifyAll() { Notify(true); }
+
+  private:
+    void Notify(bool all) {
+      if (waiters_.load(std::memory_order_seq_cst) == 0) {
+        return;
+      }
+      epoch_.fetch_add(1, std::memory_order_seq_cst);
+      if (all) {
+        epoch_.notify_all();
+      } else {
+        epoch_.notify_one();
+      }
+    }
+
+    std::atomic<uint64_t> epoch_{0};
+    std::atomic<size_t> waiters_{0};
+  };
 
   static int ValidateThreadCount(int count) {
     if (count <= 0 || count >= kMaxThreads) {
@@ -343,8 +393,9 @@ private:
   void ExecuteTask(TaskPtr p) {
     struct FinishTask {
       ThreadPoolTempl *pool;
-      ~FinishTask() { pool->TaskFinished(); }
-    } finish{this};
+      std::atomic<size_t> *outstanding;
+      ~FinishTask() { pool->TaskFinished(outstanding); }
+    } finish{this, p->outstanding};
     (*p)();
   }
 
@@ -398,9 +449,12 @@ private:
   };
 
   struct ThreadData {
-    ThreadData() : thread(), steal_partition(0), local_tasks(), mailbox(1024) {}
+    ThreadData()
+        : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
+          mailbox(1024) {}
     std::unique_ptr<Thread> thread;
     std::atomic<unsigned> steal_partition;
+    std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
 
@@ -441,11 +495,9 @@ private:
 
   std::mutex overflow_mutex_;
   std::deque<TaskPtr> overflow_tasks_;
-  std::mutex wake_mutex_;
-  std::condition_variable worker_cv_;
-  std::condition_variable waiter_cv_;
-  std::atomic<uint64_t> wake_generation_{0};
-  std::atomic<size_t> outstanding_tasks_{0};
+  EventCount worker_event_;
+  EventCount waiter_event_;
+  std::atomic<size_t> worker_task_waiters_{0};
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
 
@@ -461,8 +513,6 @@ private:
         return processed_anything;
       }
 
-      const uint64_t observed =
-          wake_generation_.load(std::memory_order_acquire);
       if (TryExecuteOne()) {
         processed_anything = true;
         if (once) {
@@ -492,11 +542,17 @@ private:
         continue;
       }
 
-      std::unique_lock<std::mutex> lock(wake_mutex_);
-      worker_cv_.wait(lock, [&]() {
-        return cancelled_.load(std::memory_order_acquire) || ShouldExit() ||
-               wake_generation_.load(std::memory_order_acquire) != observed;
-      });
+      const uint64_t token = worker_event_.PrepareWait();
+      if (TryExecuteOne()) {
+        worker_event_.CancelWait();
+        processed_anything = true;
+        continue;
+      }
+      if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
+        worker_event_.CancelWait();
+        return processed_anything;
+      }
+      worker_event_.Wait(token);
     }
   }
 
@@ -538,17 +594,19 @@ private:
   }
 
   void PublishTask(TaskPtr task, int target, bool local) {
-    outstanding_tasks_.fetch_add(1, std::memory_order_acq_rel);
+    auto &outstanding = thread_data_[target].outstanding_tasks;
+    task->outstanding = &outstanding;
+    outstanding.fetch_add(1, std::memory_order_relaxed);
     try {
       if (!thread_data_[target].PushTask(task, local)) {
         std::lock_guard<std::mutex> lock(overflow_mutex_);
         overflow_tasks_.push_back(task);
       }
     } catch (...) {
-      outstanding_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+      outstanding.fetch_sub(1, std::memory_order_relaxed);
       throw;
     }
-    NotifyOne();
+    WakeOneWorker();
   }
 
   TaskPtr PopOverflow() {
@@ -585,33 +643,36 @@ private:
     return true;
   }
 
-  void TaskFinished() {
-    const size_t previous =
-        outstanding_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+  void TaskFinished(std::atomic<size_t> *outstanding) {
+    assert(outstanding != nullptr);
+    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
     assert(previous > 0);
-    NotifyAll();
+    if (previous == 1 && done_.load(std::memory_order_acquire) &&
+        NoOutstandingTasks()) {
+      WakeAllWorkers();
+    }
+  }
+
+  bool NoOutstandingTasks() const {
+    for (const auto &data : thread_data_) {
+      if (data.outstanding_tasks.load(std::memory_order_acquire) != 0) {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool ShouldExit() const {
-    return done_.load(std::memory_order_acquire) &&
-           outstanding_tasks_.load(std::memory_order_acquire) == 0;
+    return done_.load(std::memory_order_acquire) && NoOutstandingTasks();
   }
 
-  void NotifyOne() {
-    {
-      std::lock_guard<std::mutex> lock(wake_mutex_);
-      wake_generation_.fetch_add(1, std::memory_order_release);
-    }
-    worker_cv_.notify_one();
-  }
+  void WakeOneWorker() { worker_event_.NotifyOne(); }
 
-  void NotifyAll() {
-    {
-      std::lock_guard<std::mutex> lock(wake_mutex_);
-      wake_generation_.fetch_add(1, std::memory_order_release);
-    }
-    worker_cv_.notify_all();
-    waiter_cv_.notify_all();
+  void WakeAllWorkers() { worker_event_.NotifyAll(); }
+
+  void WakeAll() {
+    WakeAllWorkers();
+    waiter_event_.NotifyAll();
   }
 
   void JoinThreads() {
@@ -623,17 +684,20 @@ private:
   void FlushQueues() {
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
+        auto *outstanding = task->outstanding;
         delete task;
-        outstanding_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
       }
     }
     std::lock_guard<std::mutex> lock(overflow_mutex_);
     while (!overflow_tasks_.empty()) {
-      delete overflow_tasks_.front();
+      TaskPtr task = overflow_tasks_.front();
       overflow_tasks_.pop_front();
-      outstanding_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+      auto *outstanding = task->outstanding;
+      delete task;
+      outstanding->fetch_sub(1, std::memory_order_relaxed);
     }
-    assert(outstanding_tasks_.load(std::memory_order_acquire) == 0);
+    assert(NoOutstandingTasks());
   }
 
   // Steal tries to steal work from other worker threads in the range [start,

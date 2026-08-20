@@ -53,9 +53,11 @@ namespace mpmc {
 static constexpr std::size_t hardwareInterferenceSize =
     OOX_EIGEN_CACHE_LINE_SIZE;
 static_assert(hardwareInterferenceSize >= alignof(void *) &&
+                  hardwareInterferenceSize <= 128 &&
                   (hardwareInterferenceSize & (hardwareInterferenceSize - 1)) ==
                       0,
-              "OOX_EIGEN_CACHE_LINE_SIZE must be a power of two");
+              "OOX_EIGEN_CACHE_LINE_SIZE must be a power of two between "
+              "alignof(void*) and 128");
 
 #if defined(__cpp_aligned_new)
 template <typename T> using AlignedAllocator = std::allocator<T>;
