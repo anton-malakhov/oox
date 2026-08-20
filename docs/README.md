@@ -99,7 +99,9 @@ Key properties of the model:
   consumed by `oox::run` as an argument.
 - **`oox::shared_var<T>`** — thread-safe, copyable, reference-counted
   counterpart. Multiple threads may register readers/writers through
-  `oox::run`, call `get()`/`wait()`, copy, and assign. See
+  `oox::run`, call `get()`/`wait()`, copy the handle, and assign `T` values.
+  Copy/move assignment that rebinds the same handle object requires external
+  synchronization, as it does for one `std::shared_ptr` object. See
   `docs/design-shared-var.md`.
 - **`oox::node`** — `var<void>`; carries only dependency info.
 
@@ -216,6 +218,11 @@ void wait_for_all(const shared_var<T, CanThrow>&);
 
 `CanThrow` (with `OOX_EXCEPTIONS_ENABLED=ON`) adds exception-aware state
 machinery: failed tasks propagate through the graph and `get()` rethrows.
+For `CanThrow == false`, operations performed by argument consumption are also
+part of the non-throwing contract: deferred/forwarded materialization and a
+copy/move conversion from the actual stored-value reference must be `noexcept`.
+Unsafe combinations are rejected at compile time even when exception machinery
+is disabled.
 
 ## 4. Build
 

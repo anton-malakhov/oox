@@ -71,6 +71,12 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
 
 endforeach ()
 
+add_test(NAME NonThrowConsumeCompile
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
+
 if (OOX_EXCEPTIONS_ENABLED)
   add_test(NAME ExceptionPolicyCompile
            COMMAND ${CMAKE_COMMAND}

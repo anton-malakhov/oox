@@ -16,6 +16,7 @@
 #include <oox/shared_var.h>
 
 #include <cstdint>
+#include <memory>
 
 namespace {
 
@@ -24,11 +25,7 @@ namespace {
 // form (a plain sum of squares gets folded by -O3, making the tasks ~free).
 constexpr int kComputeIters = 50000;
 
-void BenchGetHeavy(benchmark::State& state) {
-    // Google Benchmark calls this function once per benchmark thread. A local
-    // value would give every thread a private state and eliminate the claimed
-    // reader/writer contention, so all threads intentionally share this one.
-    static oox::shared_var<std::uint32_t> value(0);
+void BenchGetHeavy(benchmark::State& state, oox::shared_var<std::uint32_t>& value) {
     const int id = static_cast<int>(state.thread_index());
     const int threads = static_cast<int>(state.threads());
     const bool is_writer = id < threads / 2;
@@ -51,11 +48,29 @@ void BenchGetHeavy(benchmark::State& state) {
             benchmark::DoNotOptimize(value.get());
         }
     }
+    // The iteration loop is synchronized across benchmark threads. Drain the
+    // final shared writer tail before this calibration/repetition can finish,
+    // so no task leaks into the next run.
+    value.wait();
     state.SetItemsProcessed(state.iterations());
 }
 
-} // namespace
+void RegisterGetHeavyBenchmarks() {
+    for (int threads : {2, 4, 8, 16}) {
+        // One state per registered ThreadRange case, captured by every worker
+        // of that case. It is neither thread-local nor shared with other cases.
+        auto value = std::make_shared<oox::shared_var<std::uint32_t>>(0);
+        benchmark::RegisterBenchmark("BenchGetHeavy", [value](benchmark::State& state) {
+            BenchGetHeavy(state, *value);
+        })->Threads(threads)->UseRealTime();
+    }
+}
 
-BENCHMARK(BenchGetHeavy)->ThreadRange(2, 16)->UseRealTime();
+const bool get_heavy_benchmarks_registered = [] {
+    RegisterGetHeavyBenchmarks();
+    return true;
+}();
+
+} // namespace
 
 BENCHMARK_MAIN();

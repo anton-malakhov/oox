@@ -61,6 +61,28 @@ struct throwing_assignment_value {
     }
 };
 
+struct throwing_default_value {
+    throwing_default_value() {
+        throw std::runtime_error("default construction failed");
+    }
+    throwing_default_value(const throwing_default_value&) noexcept = default;
+    throwing_default_value(throwing_default_value&&) noexcept = default;
+};
+
+struct throwing_copy_value {
+    throwing_copy_value() noexcept = default;
+    throwing_copy_value(const throwing_copy_value&) {
+        throw std::runtime_error("copy construction failed");
+    }
+    throwing_copy_value(throwing_copy_value&&) noexcept = default;
+};
+
+struct immovable_default_value {
+    immovable_default_value() = default;
+    immovable_default_value(const immovable_default_value&) = delete;
+    immovable_default_value(immovable_default_value&&) = delete;
+};
+
 template <typename Var, typename Value>
 concept supports_value_assignment = requires(Var& var, Value&& value) {
     var = std::forward<Value>(value);
@@ -73,6 +95,15 @@ static_assert(!supports_value_assignment<oox::var<throwing_assignment_value, fal
 static_assert(!supports_value_assignment<oox::shared_var<throwing_assignment_value, false>,
                                          throwing_assignment_value>);
 static_assert(!oox::internal::shareable_value<oox::shared_var<int>>);
+static_assert(!oox::internal::policy_value_materializable<throwing_default_value, false>);
+static_assert(oox::internal::policy_value_materializable<throwing_default_value, true>);
+static_assert(!oox::internal::value_materializable<immovable_default_value>);
+static_assert(!oox::internal::argument_conversions_are_nothrow<
+              oox::internal::types<throwing_copy_value>,
+              oox::internal::types<throwing_copy_value&>>::value);
+static_assert(oox::internal::argument_conversions_are_nothrow<
+              oox::internal::types<throwing_copy_value>,
+              oox::internal::types<throwing_copy_value&&>>::value);
 #if OOX_EXCEPTIONS_ENABLED
 static_assert(supports_value_assignment<oox::var<throwing_assignment_value, true>,
                                         throwing_assignment_value>);
@@ -87,14 +118,14 @@ oox::shared_var<int>* plain_constructor_side_effect = nullptr;
 struct gated_default_value {
     int value = 0;
 
-    gated_default_value() {
+    gated_default_value() noexcept {
         default_constructor_gate->arrive_and_wait();
         oox::run([](int& side_effect) { ++side_effect; }, *default_constructor_side_effect);
     }
 };
 
 struct reentrant_plain_default_value {
-    reentrant_plain_default_value() {
+    reentrant_plain_default_value() noexcept {
         oox::run([](int& side_effect) { ++side_effect; }, *plain_constructor_side_effect);
     }
 };
@@ -397,6 +428,21 @@ TEST(SharedVar, DeferredMixedAliasesMaterializeBeforeEveryArgument) {
 }
 
 #if OOX_EXCEPTIONS_ENABLED
+TEST(SharedVar, ThrowingDeferredMaterializationPropagates) {
+    oox::shared_var<throwing_default_value, true> value(oox::deferred);
+    auto done = oox::run<true>([](throwing_default_value&) noexcept {}, value);
+
+    EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
+    EXPECT_THROW((void)value.get(), oox::cancelled_by_exception);
+}
+
+TEST(SharedVar, ThrowingActualCopyConversionPropagates) {
+    oox::shared_var<throwing_copy_value, true> value(throwing_copy_value{});
+    auto done = oox::run<true>([](throwing_copy_value) noexcept {}, value);
+
+    EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
+}
+
 TEST(SharedVar, ExceptionWakesWaiterAndRethrows) {
 #if defined(OOX_USING_SERIAL)
     GTEST_SKIP() << "the serial backend does not implement blocking waits";

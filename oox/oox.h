@@ -1481,6 +1481,16 @@ template <typename T, bool CanThrow>
 concept policy_move_value_assignable = move_value_assignable<T>
     && (CanThrow || std::is_nothrow_move_assignable_v<T>);
 
+template <typename T>
+concept value_materializable = std::is_default_constructible_v<T>
+    && (std::is_move_constructible_v<T> || std::is_copy_constructible_v<T>);
+
+template <typename T, bool CanThrow>
+concept policy_value_materializable = value_materializable<T>
+    && (CanThrow || (std::is_nothrow_default_constructible_v<T>
+        && (std::is_nothrow_move_constructible_v<T>
+            || std::is_nothrow_copy_constructible_v<T>)));
+
 struct var_storage {
     void* ptr = nullptr;
     bool forwarded = false;
@@ -1599,12 +1609,36 @@ std::string get_type(const char *m = "T") {
 
 template< typename... Args > struct types {};
 
+template <typename T, typename Types>
+struct prepend_type;
+
+template <typename T, typename... Types>
+struct prepend_type<T, types<Types...>> {
+    using type = types<T, Types...>;
+};
+
+template <typename Param, typename Actual>
+inline constexpr bool matching_value_conversion_is_nothrow =
+    !std::is_same_v<std::remove_cvref_t<Param>, std::remove_cvref_t<Actual>>
+    || std::is_nothrow_constructible_v<Param, Actual>;
+
+template <typename Params, typename Actuals>
+struct argument_conversions_are_nothrow : std::false_type {};
+
+template <typename... Params, typename... Actuals>
+struct argument_conversions_are_nothrow<types<Params...>, types<Actuals...>>
+    : std::bool_constant<(matching_value_conversion_is_nothrow<Params, Actuals> && ...)> {
+    static_assert(sizeof...(Params) == sizeof...(Actuals));
+};
+
 // Types is types<list> of user functor argument types
 // Args is variadic list of run argument types
 template< typename Types, bool SelfCanThrow, typename... Args > struct base_args;
 // User functor might have default arguments which are not specified thus ignoring them
 template< typename IgnoredTypes, bool SelfCanThrow > struct base_args<IgnoredTypes, SelfCanThrow> {
     static constexpr int write_nodes_count = 1; // for resulting node
+    static constexpr bool consume_is_nothrow = true;
+    using consumed_args_type = types<>;
     int setup(int, internal::task_node *) { return 0 /* resulting node is ready initially*/; }
 };
 
@@ -1618,6 +1652,9 @@ struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
     base_args( A&& a, Args&&... args ) : base_type( std::forward<Args>(args)... ), my_value(std::forward<A>(a)) {}
     std::decay_t<A>&& consume() { return std::move(my_value); }
     static constexpr int write_nodes_count = base_type::write_nodes_count;
+    static constexpr bool consume_is_nothrow = base_type::consume_is_nothrow;
+    using consumed_args_type = typename prepend_type<
+        std::decay_t<A>&&, typename base_type::consumed_args_type>::type;
     int setup( int port, internal::task_node *self, A&& a, Args&&... args ) {
         //__OOX_ASSERT(my_value == a, "");
         return base_type::setup( port, self, std::forward<Args>(args)...);
@@ -1636,14 +1673,15 @@ void* resolve_var_storage(var_storage storage) {
         base = static_cast<oox_var_base*>(base->storage_ptr);
     }
     if (!base->current_task && storage.initialize_if_empty) {
+        static_assert(policy_value_materializable<T, CanThrow>,
+                      "materializing an empty var violates its exception policy");
         auto& empty = *static_cast<var<T, CanThrow>*>(base);
-        if constexpr (std::is_default_constructible_v<T> && std::is_move_constructible_v<T>) {
+        if constexpr (std::is_move_constructible_v<T>
+                      && (CanThrow || std::is_nothrow_move_constructible_v<T>)) {
             empty = var<T, CanThrow>(T{});
-        } else if constexpr (std::is_default_constructible_v<T> && std::is_copy_constructible_v<T>) {
+        } else {
             T value;
             empty = var<T, CanThrow>(value);
-        } else {
-            __OOX_ASSERT_EX(false, "materializing an empty forwarded var requires a default-constructible value");
         }
     }
     __OOX_ASSERT_EX(base->current_task, "forwarded var resolved to an empty var without a recovery writer");
@@ -1664,6 +1702,10 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
     static constexpr int is_writer = (std::is_rvalue_reference_v<C>
         || (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>))? 1 : 0;
     static constexpr int write_nodes_count = base_type::write_nodes_count + is_writer;
+    static constexpr bool consume_is_nothrow = base_type::consume_is_nothrow
+        && (!is_writer || policy_value_materializable<ooxed_type, SelfCanThrow>);
+    using consumed_args_type = typename prepend_type<
+        C&&, typename base_type::consumed_args_type>::type;
 
     int setup( int port, internal::task_node *self, const var_type& cov, Args&&... args ) {
         int count = is_writer;
@@ -1694,7 +1736,7 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
-        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+        if constexpr (is_writer) {
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
@@ -1830,13 +1872,14 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         result_base::emplace(this->functor_base::value()());
         auto& result = result_base::value();
         if (!result.current_task) {
-            if constexpr (std::is_default_constructible_v<VT> && std::is_move_constructible_v<VT>) {
+            static_assert(policy_value_materializable<VT, CanThrow>,
+                          "returning an empty var violates its exception policy");
+            if constexpr (std::is_move_constructible_v<VT>
+                          && (CanThrow || std::is_nothrow_move_constructible_v<VT>)) {
                 result = var_type(VT{});
-            } else if constexpr (std::is_default_constructible_v<VT> && std::is_copy_constructible_v<VT>) {
+            } else {
                 VT value;
                 result = var_type(value);
-            } else {
-                __OOX_ASSERT_EX(false, "returning an empty var requires a default-constructible value");
             }
         }
         this->start_count.store(1, std::memory_order_release);
@@ -1967,12 +2010,21 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::run<true>(...) requires OOX_EXCEPTIONS_ENABLED=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
-    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
-                      || internal::functor_is_nothrow_invocable_v<F, call_args_type>,
-        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
-        "the callable must satisfy std::is_nothrow_invocable for its argument types. "
-        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
     using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
+    using consumed_args_type = typename args_type::consumed_args_type;
+    static_assert(CanThrow || args_type::consume_is_nothrow,
+        "oox::run with a non-throwing policy cannot perform potentially throwing "
+        "deferred or forwarded value materialization");
+    static_assert(CanThrow
+                      || internal::argument_conversions_are_nothrow<call_args_type,
+                                                                    consumed_args_type>::value,
+        "oox::run with a non-throwing policy cannot perform a potentially throwing "
+        "conversion from the value category returned by consume()");
+    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
+                      || internal::functor_is_nothrow_invocable_v<F, consumed_args_type>,
+        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
+        "the callable must satisfy std::is_nothrow_invocable for the actual arguments returned by consume(). "
+        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
     using functor_type = internal::oox_bind<F, args_type>;
     using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 

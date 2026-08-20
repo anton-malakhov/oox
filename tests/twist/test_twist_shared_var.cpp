@@ -18,7 +18,7 @@ oox::shared_var<int>* plain_constructor_side_effect = nullptr;
 struct gated_default_value {
     int value = 0;
 
-    gated_default_value() {
+    gated_default_value() noexcept {
         materialization_gate->fetch_add(1, std::memory_order_relaxed);
         while (materialization_gate->load(std::memory_order_relaxed) < 2) {
             twist::assist::PreemptionPoint();
@@ -38,8 +38,16 @@ struct copy_only_value {
     copy_only_value& operator=(copy_only_value&&) = delete;
 };
 
+struct immovable_default_value {
+    immovable_default_value() = default;
+    immovable_default_value(const immovable_default_value&) = delete;
+    immovable_default_value(immovable_default_value&&) = delete;
+};
+
+static_assert(!oox::internal::value_materializable<immovable_default_value>);
+
 struct reentrant_plain_default_value {
-    reentrant_plain_default_value() {
+    reentrant_plain_default_value() noexcept {
         oox::run([](int& side_effect) { ++side_effect; }, *plain_constructor_side_effect);
     }
 };

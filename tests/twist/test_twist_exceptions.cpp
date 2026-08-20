@@ -33,6 +33,22 @@ struct throwing_assignment_value {
     }
 };
 
+struct throwing_default_value {
+    throwing_default_value() {
+        throw DummyException{};
+    }
+    throwing_default_value(const throwing_default_value&) noexcept = default;
+    throwing_default_value(throwing_default_value&&) noexcept = default;
+};
+
+struct throwing_copy_value {
+    throwing_copy_value() noexcept = default;
+    throwing_copy_value(const throwing_copy_value&) {
+        throw DummyException{};
+    }
+    throwing_copy_value(throwing_copy_value&&) noexcept = default;
+};
+
 template <typename Var, typename Value>
 concept supports_value_assignment = requires(Var& var, Value&& value) {
     var = std::forward<Value>(value);
@@ -46,6 +62,11 @@ static_assert(supports_value_assignment<oox::var<throwing_assignment_value, true
                                         throwing_assignment_value>);
 static_assert(supports_value_assignment<oox::shared_var<throwing_assignment_value, true>,
                                         throwing_assignment_value>);
+static_assert(!oox::internal::policy_value_materializable<throwing_default_value, false>);
+static_assert(oox::internal::policy_value_materializable<throwing_default_value, true>);
+static_assert(!oox::internal::argument_conversions_are_nothrow<
+              oox::internal::types<throwing_copy_value>,
+              oox::internal::types<throwing_copy_value&>>::value);
 
 template <typename Exception, typename F>
 void ExpectThrows(F&& f, const char* message) {
@@ -68,6 +89,18 @@ void ThrowingProducerRethrowsOriginal() {
     ExpectThrows<DummyException>([&] {
         oox::wait_for_all(value);
     }, "throwing producer must rethrow original exception");
+}
+
+void ThrowingConsumeOperationsPropagate() {
+    oox::shared_var<throwing_default_value, true> deferred(oox::deferred);
+    auto materialization = oox::run<true>([](throwing_default_value&) noexcept {}, deferred);
+    ExpectThrows<DummyException>([&] { oox::wait_for_all(materialization); },
+                                 "throwing deferred materialization must complete with failure");
+
+    oox::shared_var<throwing_copy_value, true> ready(throwing_copy_value{});
+    auto copied = oox::run<true>([](throwing_copy_value) noexcept {}, ready);
+    ExpectThrows<DummyException>([&] { oox::wait_for_all(copied); },
+                                 "throwing actual copy conversion must complete with failure");
 }
 
 void ExceptionSkipsDependentBodies() {
@@ -341,6 +374,8 @@ int main() {
     static_assert(OOX_EXCEPTIONS_ENABLED, "exception Twist tests must compile with OOX_EXCEPTIONS_ENABLED=1");
 
     oox::twist_tests::RunRandomSeeds("ThrowingProducerRethrowsOriginal", ThrowingProducerRethrowsOriginal);
+    oox::twist_tests::RunRandomSeeds("ThrowingConsumeOperationsPropagate",
+                                     ThrowingConsumeOperationsPropagate);
     oox::twist_tests::RunRandomSeeds("ExceptionSkipsDependentBodies", ExceptionSkipsDependentBodies);
     oox::twist_tests::RunRandomSeeds("DeferredWriterPoisonCancelsReaders", DeferredWriterPoisonCancelsReaders);
     oox::twist_tests::RunRandomSeeds("LateConsumerAfterFailureSeesFailure", LateConsumerAfterFailureSeesFailure);

@@ -198,10 +198,16 @@ non-throwing policy (`CanThrow == false`), the selected assignment operation
 must additionally be `noexcept`; a potentially throwing assignment is accepted
 only by `CanThrow == true` and becomes graph failure instead of terminating the
 process. Deleted negative overloads prevent implicit conversion through
-`var(T)` or `shared_var(T)` from bypassing those constraints. Plain `oox::var` value
-assignment uses the analogous writer task when the var already has a slot. A
-copy-assignment payload has shared ownership so the task functor remains
-movable even when `T` itself is copy-only.
+`var(T)` or `shared_var(T)` from bypassing those constraints. Plain `oox::var`
+value assignment uses the analogous writer task when the var already has a
+slot. A copy-assignment payload has shared ownership so the task functor
+remains movable even when `T` itself is copy-only.
+
+The same policy applies before the callable body: `run<false>` checks the value
+categories actually returned by `consume()`, not only the callable's declared
+parameter list. A deferred writer therefore requires nothrow materialization,
+and passing the stored `T&` to a by-value `T` parameter requires a nothrow copy.
+With `run<true>`, either failure is caught by the task and propagated normally.
 
 ### 4.4 Destruction of the last handle
 
@@ -257,10 +263,17 @@ Access categories through `oox::run` are the same as for `var`:
 
 ## 6. Semantics guarantees (v1)
 
-- A `shared_var` object may be used by any number of threads concurrently:
-  `run` registration, `get`, `wait`, `cancel`, assignment, copy.
-- `T` must be default-constructible and cannot itself be a `shared_var`
-  specialization. Value assignment additionally requires the matching
+- The same `shared_var` handle object may be used concurrently for `run`
+  registration, `get`, `wait`, `cancel`, copy construction, and assignment of
+  a `T` value. Distinct handle copies may be used independently by any thread.
+  Copy/move assignment from another `shared_var` rebinds `state_`; rebinding
+  the same handle object concurrently with any operation on that object is a
+  data race and requires external synchronization, matching the
+  `std::shared_ptr` object contract.
+- `T` must be default-constructible and move- or copy-constructible, and cannot
+  itself be a `shared_var` specialization. A non-throwing policy requires
+  default construction and the selected move/copy materialization path to be
+  `noexcept`. Value assignment additionally requires the matching
   constructible-and-assignable concept, with nothrow assignment under a
   non-throwing policy.
 - Writer chain order for concurrently registered writers is linearized by the
@@ -269,8 +282,8 @@ Access categories through `oox::run` are the same as for `var`:
   order).
 - `get()` returns the value of the slot that was current at the linearization
   point of the call.
-- Moving a `shared_var` from two threads simultaneously is a data race on the
-  user side (same contract as `std::shared_ptr`).
+- Moving from or rebinding one handle object concurrently with another access
+  to that object is a data race on the user side.
 - Every blocking `get`/`wait` path, including an adopted forwarded `var`, uses
   a distinct waiter node and releases the shared-state mutex while blocked.
 

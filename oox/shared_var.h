@@ -28,7 +28,9 @@
 // Multiple threads may concurrently:
 //   - register readers/writers through oox::run(f, sv, ...);
 //   - call get()/wait()/cancel();
-//   - copy the handle (reference-counted) and assign new values.
+//   - copy the handle (reference-counted) and assign T values.
+// Copy/move assignment from another shared_var rebinds the handle object and,
+// like assigning one std::shared_ptr object, requires external synchronization.
 //
 // Writer serialization across threads is guaranteed: writers chained onto the
 // same shared_var are linearized by the internal state mutex, so their order
@@ -41,13 +43,13 @@
 // Design (variant 1, "thick handle"): see docs/design-shared-var.md.
 // v1 limitations:
 //   - get() returns a copy made under the state lock (T must be copyable);
-//   - T must be default-constructible;
+//   - T must satisfy the selected policy's value-materialization requirements;
 //   - T cannot itself be a shared_var specialization;
 //   - racing first materializations may construct multiple T{} candidates,
 //     but exactly one candidate is installed;
 //   - an adopted forwarded var is resolved after its producer completes;
-//   - moving a shared_var from two threads at once is a data race on the
-//     user side (same contract as std::shared_ptr).
+//   - moving from or rebinding one handle concurrently with another access to
+//     that handle is a user-side data race (same contract as std::shared_ptr).
 
 namespace oox {
 
@@ -329,6 +331,10 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
     static constexpr int is_writer = (std::is_rvalue_reference_v<C>
         || (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>)) ? 1 : 0;
     static constexpr int write_nodes_count = base_type::write_nodes_count + is_writer;
+    static constexpr bool consume_is_nothrow = base_type::consume_is_nothrow
+        && (!is_writer || policy_value_materializable<ooxed_type, SelfCanThrow>);
+    using consumed_args_type = typename prepend_type<
+        C&&, typename base_type::consumed_args_type>::type;
 
     // Registration is deferred to the outermost argument of this run(): the
     // setup context collects every shared_var argument, and the outermost
@@ -409,8 +415,9 @@ class shared_var {
                   "for const types use shared_ptr<T>.");
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow,
                   "oox::shared_var<T, true> requires OOX_EXCEPTIONS_ENABLED=1");
-    static_assert(std::is_default_constructible_v<T>,
-                  "oox::shared_var<T> requires a default-constructible value type");
+    static_assert(internal::policy_value_materializable<T, CanThrow>,
+                  "oox::shared_var<T> requires a default-constructible and move- or "
+                  "copy-constructible value; non-throwing policy requires nothrow materialization");
     static_assert(internal::shareable_value<T>,
                   "oox::shared_var<T> cannot store another shared_var specialization");
 
@@ -434,7 +441,8 @@ class shared_var {
                 }
             }
             var<T, CanThrow> candidate = [&] {
-                if constexpr (std::is_move_constructible_v<T>) {
+                if constexpr (std::is_move_constructible_v<T>
+                              && (CanThrow || std::is_nothrow_move_constructible_v<T>)) {
                     return var<T, CanThrow>(T{});
                 } else {
                     T value;
@@ -568,6 +576,9 @@ public:
     shared_var(T&& t) : state_(std::make_shared<shared_state>(std::move(t))) {}
     shared_var(var<T, CanThrow>&& v) : state_(std::make_shared<shared_state>(std::move(v))) {}
 
+    // These overloads rebind this handle object. As with assigning one
+    // std::shared_ptr object, concurrent access to the same object requires
+    // external synchronization. Assignment from T below is a graph write.
     shared_var(const shared_var&) = default;
     shared_var& operator=(const shared_var&) = default;
     shared_var(shared_var&&) noexcept = default;
