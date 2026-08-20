@@ -58,39 +58,6 @@ template <typename F> Task *MakeTask(F &&f) {
   return new UniqueTask<decltype(std::forward<F>(f))>{std::forward<F>(f)};
 }
 
-/**/
-template <typename F>
-struct ProxyTask : Task {
-  ProxyTask(F&& func)
-    : Func_{std::move(func)}
-  {}
-
-  void operator()() override {
-    // We should enter this function 2 times
-    // prevState:
-    // 0 => first entrance, run Func_
-    // 1 in same thread  => this thread finished Func_ before other thread entered
-    // 1 in other thread => other thread entered function before Func_ is finished
-    // 2 this is the last change of state, drop object
-    auto prevState = State_.fetch_add(1, std::memory_order_seq_cst);
-    if (prevState == 0) {
-      Func_();
-      prevState = State_.fetch_add(1, std::memory_order_seq_cst);
-    }
-    if (prevState == 2) {
-      delete this;
-    }
-  }
-
-  std::decay_t<F> Func_;
-  std::atomic_uint_fast32_t State_ = 0;
-};
-
-template <typename F> Task *MakeProxyTask(F &&f) {
-  return new ProxyTask{std::forward<F>(f)};
-}
-/**/
-
 // This defines an interface that ThreadPoolDevice can take to use
 // custom thread pools underneath.
 class ThreadPoolInterface {
@@ -297,17 +264,6 @@ public:
       return;
     }
     auto &event = registered ? worker_event_ : waiter_event_;
-    if (registered) {
-      worker_task_waiters_.fetch_add(1, std::memory_order_acq_rel);
-    }
-    struct WorkerWaitGuard {
-      std::atomic<size_t> *waiters;
-      ~WorkerWaitGuard() {
-        if (waiters) {
-          waiters->fetch_sub(1, std::memory_order_acq_rel);
-        }
-      }
-    } guard{registered ? &worker_task_waiters_ : nullptr};
 
     while (!ready()) {
       const uint64_t token = event.PrepareWait();
@@ -324,9 +280,7 @@ public:
   }
 
   void NotifyTaskCompletion() {
-    if (worker_task_waiters_.load(std::memory_order_acquire) != 0) {
-      worker_event_.NotifyAll();
-    }
+    worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
   }
 
@@ -349,6 +303,7 @@ private:
       // consistency makes either that check or a concurrent notification win.
       const uint64_t epoch = epoch_.load(std::memory_order_seq_cst);
       waiters_.fetch_add(1, std::memory_order_seq_cst);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       return epoch;
     }
 
@@ -364,6 +319,7 @@ private:
 
   private:
     void Notify(bool all) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       if (waiters_.load(std::memory_order_seq_cst) == 0) {
         return;
       }
@@ -497,7 +453,6 @@ private:
   std::deque<TaskPtr> overflow_tasks_;
   EventCount worker_event_;
   EventCount waiter_event_;
-  std::atomic<size_t> worker_task_waiters_{0};
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
 

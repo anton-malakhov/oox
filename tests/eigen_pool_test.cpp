@@ -173,6 +173,43 @@ TEST(EigenPool, PublicationWakesWorkerInsteadOfExternalWaiter) {
   EXPECT_TRUE(done.load());
 }
 
+TEST(EigenPool, RepeatedPublicationDoesNotLoseWakeups) {
+  ThreadPool pool(1, false, false);
+  for (int iteration = 0; iteration < 5000; ++iteration) {
+    auto completed = std::make_shared<std::promise<void>>();
+    auto result = completed->get_future();
+    pool.Schedule(MakeTask([completed] { completed->set_value(); }));
+    if (result.wait_for(1s) != std::future_status::ready) {
+      pool.Cancel();
+      FAIL() << "lost publication wakeup at iteration " << iteration;
+    }
+  }
+}
+
+TEST(EigenPool, RepeatedCompletionDoesNotLoseWakeups) {
+  ThreadPool pool(1, false, false);
+  for (int iteration = 0; iteration < 5000; ++iteration) {
+    auto entered = std::make_shared<std::atomic<bool>>(false);
+    auto released = std::make_shared<std::atomic<bool>>(false);
+    auto completed = std::make_shared<std::promise<void>>();
+    auto result = completed->get_future();
+    pool.Schedule(MakeTask([&, entered, released, completed] {
+      entered->store(true, std::memory_order_release);
+      entered->notify_one();
+      pool.Wait([&] { return released->load(std::memory_order_acquire); });
+      completed->set_value();
+    }));
+    entered->wait(false, std::memory_order_acquire);
+    released->store(true, std::memory_order_release);
+    pool.NotifyTaskCompletion();
+    if (result.wait_for(1s) != std::future_status::ready) {
+      pool.Cancel();
+      EXPECT_EQ(result.wait_for(1s), std::future_status::ready);
+      FAIL() << "lost completion wakeup at iteration " << iteration;
+    }
+  }
+}
+
 TEST(EigenPool, IdleWorkersPark) {
   const std::clock_t cpu_start = std::clock();
   {
