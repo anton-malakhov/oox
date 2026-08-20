@@ -75,6 +75,19 @@ add_test(NAME NonThrowConsumeCompile
          COMMAND ${CMAKE_COMMAND}
                  -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
                  -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 "-D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                 "-D OOX_CXX_COMPILER_TARGET=${CMAKE_CXX_COMPILER_TARGET}"
+                 "-D OOX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+                 "-D OOX_SYSROOT=${CMAKE_SYSROOT}"
+                 "-D OOX_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}"
+                 "-D OOX_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+                 "-D OOX_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                 "-D OOX_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
                  -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 
 if (OOX_EXCEPTIONS_ENABLED)
@@ -90,8 +103,19 @@ add_test(NAME ExportedPackageRequiresCxx20
                  -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
                  -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                  -D OOX_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
-                 -D OOX_GENERATOR=${CMAKE_GENERATOR}
-                 -D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 "-D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                 "-D OOX_CXX_COMPILER_TARGET=${CMAKE_CXX_COMPILER_TARGET}"
+                 "-D OOX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+                 "-D OOX_SYSROOT=${CMAKE_SYSROOT}"
+                 "-D OOX_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}"
+                 "-D OOX_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+                 "-D OOX_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                 "-D OOX_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
                  -D OOX_BUILD_CONFIG=$<CONFIG>
                  -P ${CMAKE_CURRENT_LIST_DIR}/exported_package_compile.cmake)
 

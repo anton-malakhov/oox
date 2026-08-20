@@ -50,7 +50,9 @@ shared_var<T, CanThrow>
 
 - Handle-state inspection and mutation run under `mtx`. User-controlled
   default construction (`T{}`), blocking waits, task publication, and task
-  execution run without any shared-state mutex held.
+  execution run without any shared-state mutex held. Lazy construction is a
+  graph task, so an exception becomes graph failure instead of escaping task
+  registration synchronously.
 - The graph operations themselves (`arc_list::add_arc`,
   `output_node::next_writer` exchange, `countdown`, `head` exchange,
   `start_count` decrement) are unchanged and stay lock-free; they are merely
@@ -88,11 +90,13 @@ the actual registration to a thread-local setup context:
    argument collection, the outer guard detaches its batch before materializing
    values and restores any enclosing batch when a nested run returns.
 3. Every unique empty state is lazily materialized before the multi-state lock
-   set is acquired. `A{}` constructs a candidate outside `mtx`; a short locked
-   compare/install chooses one candidate if several threads race. Therefore a
-   slow or re-entrant constructor never runs under one or more state locks.
-   More than one candidate (and thus more than one constructor side effect) may
-   occur in that first-materialization race, but exactly one value is installed.
+   set is acquired. Materialization publishes a small graph task outside
+   `mtx`; a short locked compare/install chooses one task if several threads
+   race. `A{}` and the transfer into result storage execute inside that task,
+   under its exception policy. Therefore a slow, re-entrant, or throwing
+   constructor never runs in registration or under state locks. More than one
+   candidate task (and thus more than one constructor side effect) may occur in
+   that first-materialization race, but exactly one value is installed.
 4. All involved states are locked **in canonical (address-sorted) order** and
    registrations are grouped by state and applied as one atomic unit. If
    several arguments alias one state, one writer registration (or one reader
@@ -130,8 +134,9 @@ semantics; the `shared_var` parts are registered atomically as one batch
 
 ### 4.2 `get()` / `wait()` — any thread, concurrently (A1: waiting is a graph edge)
 
-1. Materialize a default value if `inner` is empty, constructing `T{}` outside
-   the state mutex and locking only for the compare/install.
+1. Materialize a default value if `inner` is empty by publishing the graph task
+   described in §4.1, locking only for the compare/install. A throwing
+   materialization is observed through the normal failure path.
 2. `lock(state->mtx)`.
 3. If the inner var is **forwarded** (an adopted producer-returned plain
    `var`), attach a per-call waiter node to its current producer, unlock, and
@@ -192,7 +197,8 @@ publishes deferred states, remains ordered after existing readers/writers, and
 does not invoke synchronous continuations while `mtx` is held. Concurrent
 assignments are writer-chain ordered; the last registered assignment wins.
 
-The `const T&` overload requires copy construction plus copy assignment. The
+The `const T&` overload requires copy construction plus copy assignment and
+executes the exact checked expression `target = std::as_const(payload)`. The
 `T&&` overload requires move construction plus move assignment. With a
 non-throwing policy (`CanThrow == false`), the selected assignment operation
 must additionally be `noexcept`; a potentially throwing assignment is accepted
@@ -203,11 +209,21 @@ value assignment uses the analogous writer task when the var already has a
 slot. A copy-assignment payload has shared ownership so the task functor
 remains movable even when `T` itself is copy-only.
 
-The same policy applies before the callable body: `run<false>` checks the value
-categories actually returned by `consume()`, not only the callable's declared
-parameter list. A deferred writer therefore requires nothrow materialization,
-and passing the stored `T&` to a by-value `T` parameter requires a nothrow copy.
-With `run<true>`, either failure is caught by the task and propagated normally.
+The same policy applies before the callable body: `run<false>` checks every
+actual conversion from the value category returned by `consume()`, including
+cross-type conversions, not only the callable's declared parameter list. A
+deferred writer therefore requires nothrow materialization, and passing the
+stored `T&` to a by-value `T` parameter requires a nothrow copy. Omitted
+defaulted callable parameters are supported; only the supplied argument prefix
+is checked. With `run<true>`, a conversion or materialization failure is caught
+by the task and propagated normally.
+
+Materialization transfers `T{}` into graph storage by preferring a nothrow
+move, then a nothrow copy. A potentially throwing transfer is selected only
+inside a `CanThrow == true` task. For `run<false>`, the writer restriction is
+intentionally conservative at the type level even when a particular
+`shared_var` is already initialized: the runtime state may instead be lazy or
+forwarded, and a non-throwing graph has no failure channel for that case.
 
 ### 4.4 Destruction of the last handle
 
@@ -276,6 +292,11 @@ Access categories through `oox::run` are the same as for `var`:
   `noexcept`. Value assignment additionally requires the matching
   constructible-and-assignable concept, with nothrow assignment under a
   non-throwing policy.
+- Returning a populated `var<T>` from a task does not require `T` to be
+  default-constructible. If the returned var is empty, materializable types get
+  the policy-controlled default value; a non-materializable empty var becomes
+  `empty_forwarded_var` graph failure under `CanThrow == true` and is a contract
+  violation for a non-throwing task.
 - Writer chain order for concurrently registered writers is linearized by the
   mutex; every reader observes a value from the chain consistent with that
   order (same model as single-threaded `var`, now with a lock-defined total
@@ -319,8 +340,8 @@ Access categories through `oox::run` are the same as for `var`:
     multi-var writer registration (the anti-cycle guarantee);
   - `MutableAliasesShareOneWriterRegistration` — aliased mutable arguments
     share one graph registration and skipped output ports have no owner;
-  - `ConcurrentLazyMaterializationRunsOutsideRegistrationLocks` — `T{}` may
-    block and recursively call `run` without corrupting TLS or deadlocking;
+  - `ConcurrentLazyMaterializationRunsInGraphTasks` — `T{}` runs in graph
+    tasks outside registration locks without corrupting TLS or deadlocking;
   - `ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch` — user code
     reached from another argument's setup cannot join the enclosing TLS batch;
   - forwarded-var countertests — registration before the producer constructs

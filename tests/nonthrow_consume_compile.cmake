@@ -4,7 +4,10 @@ endif ()
 
 set(test_source_dir "${OOX_BINARY_DIR}/nonthrow_consume_compile_src")
 set(test_build_dir "${OOX_BINARY_DIR}/nonthrow_consume_compile_build")
+file(REMOVE_RECURSE "${test_build_dir}")
 file(MAKE_DIRECTORY "${test_source_dir}")
+include("${OOX_SOURCE_DIR}/tests/nested_cmake_toolchain.cmake")
+oox_get_nested_cmake_args(nested_cmake_args)
 
 file(WRITE "${test_source_dir}/CMakeLists.txt" [=[
 cmake_minimum_required(VERSION 3.14)
@@ -33,6 +36,7 @@ foreach (macro_value 0 1)
   expect_compile(nonthrow_consume_ok TRUE ${macro_value})
   expect_compile(nonthrow_consume_fail_default FALSE ${macro_value})
   expect_compile(nonthrow_consume_fail_copy FALSE ${macro_value})
+  expect_compile(nonthrow_consume_fail_cross_type FALSE ${macro_value})
   expect_compile(shared_var_fail_immovable FALSE ${macro_value})
 endforeach ()
 ]=])
@@ -40,6 +44,7 @@ endforeach ()
 execute_process(COMMAND ${CMAKE_COMMAND}
                         -S "${test_source_dir}"
                         -B "${test_build_dir}"
+                        ${nested_cmake_args}
                         -D "OOX_SOURCE_DIR=${OOX_SOURCE_DIR}"
                 RESULT_VARIABLE configure_result)
 if (configure_result)

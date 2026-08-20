@@ -46,6 +46,40 @@ struct copy_only_value {
     copy_only_value& operator=(copy_only_value&&) = delete;
 };
 
+struct copy_only_value_initialized {
+    int value;
+
+    copy_only_value_initialized() = default;
+    copy_only_value_initialized(const copy_only_value_initialized&) noexcept = default;
+    copy_only_value_initialized(copy_only_value_initialized&&) = delete;
+};
+
+struct throwing_move_copyable_value {
+    int value = 0;
+
+    throwing_move_copyable_value() noexcept = default;
+    throwing_move_copyable_value(const throwing_move_copyable_value&) noexcept = default;
+    throwing_move_copyable_value(throwing_move_copyable_value&&) {
+        throw std::runtime_error("move construction failed");
+    }
+};
+
+struct asymmetric_assignment_value {
+    int value = 0;
+
+    asymmetric_assignment_value() = default;
+    explicit asymmetric_assignment_value(int v) : value(v) {}
+    asymmetric_assignment_value(const asymmetric_assignment_value&) = default;
+    asymmetric_assignment_value(asymmetric_assignment_value&&) = default;
+    asymmetric_assignment_value& operator=(const asymmetric_assignment_value& other) noexcept {
+        value = other.value;
+        return *this;
+    }
+    asymmetric_assignment_value& operator=(asymmetric_assignment_value&) {
+        throw std::runtime_error("non-const assignment selected");
+    }
+};
+
 struct throwing_assignment_value {
     int value = 0;
 
@@ -75,6 +109,12 @@ struct throwing_copy_value {
         throw std::runtime_error("copy construction failed");
     }
     throwing_copy_value(throwing_copy_value&&) noexcept = default;
+};
+
+struct throwing_int_conversion {
+    throwing_int_conversion(int) {
+        throw std::runtime_error("cross-type conversion failed");
+    }
 };
 
 struct immovable_default_value {
@@ -183,9 +223,25 @@ TEST(SharedVar, LazyDefault) {
     EXPECT_EQ(sv.get(), 0); // lazy var materializes a default value
 }
 
-TEST(SharedVar, LazyMaterializationRunsUserCodeOutsideRegistrationLocks) {
+TEST(SharedVar, LazyMaterializationUsesValueInitializationAndSafeCopy) {
+    oox::shared_var<copy_only_value_initialized, false> initialized;
+    auto initialized_done = oox::run<false>([](copy_only_value_initialized& value) noexcept {
+        ++value.value;
+    }, initialized);
+    oox::wait_for_all(initialized_done);
+    EXPECT_EQ(initialized.get().value, 1);
+
+    oox::shared_var<throwing_move_copyable_value, false> copied;
+    auto copied_done = oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 42;
+    }, copied);
+    oox::wait_for_all(copied_done);
+    EXPECT_EQ(copied.get().value, 42);
+}
+
+TEST(SharedVar, LazyMaterializationRunsUserCodeInGraphTasks) {
     const auto completion = completes_within([] {
-        std::barrier gate(2);
+        std::barrier gate(1);
         oox::shared_var<int> side_effect(0);
         default_constructor_gate = &gate;
         default_constructor_side_effect = &side_effect;
@@ -211,7 +267,7 @@ TEST(SharedVar, LazyMaterializationRunsUserCodeOutsideRegistrationLocks) {
         }
         default_constructor_gate = nullptr;
         default_constructor_side_effect = nullptr;
-    }, "T{} ran while the shared registration lock set was held");
+    }, "lazy materializer graph tasks did not complete");
     EXPECT_TRUE(completion);
 }
 
@@ -294,6 +350,14 @@ TEST(SharedVar, CopyOnlyAssignmentUsesTheCopyOverload) {
     copy_only_value initial(1);
     copy_only_value replacement(42);
     oox::shared_var<copy_only_value> value(initial);
+    value = replacement;
+    EXPECT_EQ(value.get().value, 42);
+}
+
+TEST(SharedVar, CopyAssignmentUsesTheConstQualifiedExpression) {
+    asymmetric_assignment_value initial(1);
+    const asymmetric_assignment_value replacement(42);
+    oox::shared_var<asymmetric_assignment_value, false> value(initial);
     value = replacement;
     EXPECT_EQ(value.get().value, 42);
 }
@@ -428,12 +492,49 @@ TEST(SharedVar, DeferredMixedAliasesMaterializeBeforeEveryArgument) {
 }
 
 #if OOX_EXCEPTIONS_ENABLED
+TEST(SharedVar, BareLazyThrowingMaterializationIsAsynchronousAndReleasesTask) {
+    std::weak_ptr<int> captured;
+    auto scenario = [&] {
+        oox::shared_var<throwing_default_value, true> value;
+        auto resource = std::make_shared<int>(1);
+        captured = resource;
+        auto done = oox::run<true>([resource](throwing_default_value&) noexcept {}, value);
+        resource.reset();
+        EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
+    };
+    EXPECT_NO_THROW(scenario());
+    EXPECT_TRUE(captured.expired());
+}
+
 TEST(SharedVar, ThrowingDeferredMaterializationPropagates) {
     oox::shared_var<throwing_default_value, true> value(oox::deferred);
     auto done = oox::run<true>([](throwing_default_value&) noexcept {}, value);
 
     EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
     EXPECT_THROW((void)value.get(), oox::cancelled_by_exception);
+}
+
+TEST(SharedVar, CrossTypeConversionBecomesGraphFailure) {
+    oox::shared_var<int, true> value(1);
+    auto done = oox::run<true>([](throwing_int_conversion) noexcept {}, value);
+    EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
+}
+
+TEST(SharedVar, NonThrowingWriterUsesSafeCopyForThrowingStatePolicy) {
+    oox::shared_var<throwing_move_copyable_value, true> value;
+    auto done = oox::run<false>([](throwing_move_copyable_value& target) noexcept {
+        target.value = 42;
+    }, value);
+    EXPECT_NO_THROW(oox::wait_for_all(done));
+    EXPECT_EQ(value.get().value, 42);
+}
+
+TEST(SharedVar, ThrowingPolicyCopyAssignmentUsesTheConstQualifiedExpression) {
+    asymmetric_assignment_value initial(1);
+    const asymmetric_assignment_value replacement(42);
+    oox::shared_var<asymmetric_assignment_value, true> value(initial);
+    value = replacement;
+    EXPECT_EQ(value.get().value, 42);
 }
 
 TEST(SharedVar, ThrowingActualCopyConversionPropagates) {

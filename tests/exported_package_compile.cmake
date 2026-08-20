@@ -2,6 +2,8 @@ set(test_root "${OOX_BINARY_DIR}/tests/exported_package_consumer")
 set(install_root "${test_root}/install")
 set(consumer_build "${test_root}/build")
 file(REMOVE_RECURSE "${test_root}")
+include("${OOX_SOURCE_DIR}/tests/nested_cmake_toolchain.cmake")
+oox_get_nested_cmake_args(nested_cmake_args)
 
 set(install_command "${CMAKE_COMMAND}" --install "${OOX_BINARY_DIR}" --prefix "${install_root}")
 if (OOX_BUILD_CONFIG)
@@ -19,9 +21,8 @@ execute_process(
   COMMAND "${CMAKE_COMMAND}"
           -S "${OOX_SOURCE_DIR}/tests/cmake_consumer"
           -B "${consumer_build}"
-          -G "${OOX_GENERATOR}"
+          ${nested_cmake_args}
           -D "OOX_DIR=${install_root}/${OOX_INSTALL_LIBDIR}/cmake/OOX"
-          -D "CMAKE_CXX_COMPILER=${OOX_CXX_COMPILER}"
   RESULT_VARIABLE configure_result
   OUTPUT_VARIABLE configure_output
   ERROR_VARIABLE configure_error)

@@ -20,9 +20,7 @@ struct gated_default_value {
 
     gated_default_value() noexcept {
         materialization_gate->fetch_add(1, std::memory_order_relaxed);
-        while (materialization_gate->load(std::memory_order_relaxed) < 2) {
-            twist::assist::PreemptionPoint();
-        }
+        twist::assist::PreemptionPoint();
         oox::run([](int& side_effect) { ++side_effect; }, *materialization_side_effect);
     }
 };
@@ -36,6 +34,36 @@ struct copy_only_value {
     copy_only_value(copy_only_value&&) = delete;
     copy_only_value& operator=(const copy_only_value&) = default;
     copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
+struct copy_only_value_initialized {
+    int value;
+
+    copy_only_value_initialized() = default;
+    copy_only_value_initialized(const copy_only_value_initialized&) noexcept = default;
+    copy_only_value_initialized(copy_only_value_initialized&&) = delete;
+};
+
+struct throwing_move_copyable_value {
+    int value = 0;
+
+    throwing_move_copyable_value() noexcept = default;
+    throwing_move_copyable_value(const throwing_move_copyable_value&) noexcept = default;
+    throwing_move_copyable_value(throwing_move_copyable_value&&) { throw 1; }
+};
+
+struct asymmetric_assignment_value {
+    int value = 0;
+
+    asymmetric_assignment_value() = default;
+    explicit asymmetric_assignment_value(int v) : value(v) {}
+    asymmetric_assignment_value(const asymmetric_assignment_value&) = default;
+    asymmetric_assignment_value(asymmetric_assignment_value&&) = default;
+    asymmetric_assignment_value& operator=(const asymmetric_assignment_value& other) noexcept {
+        value = other.value;
+        return *this;
+    }
+    asymmetric_assignment_value& operator=(asymmetric_assignment_value&) { throw 1; }
 };
 
 struct immovable_default_value {
@@ -110,6 +138,31 @@ void CopyOnlyAssignmentUsesTheCopyOverload() {
     TWIST_ASSERT_M(value.get().value == 42, "copy-only shared_var assignment");
 }
 
+void MaterializationAndConstCopyAssignmentContracts() {
+    oox::shared_var<copy_only_value_initialized, false> initialized;
+    auto initialized_done = oox::run<false>([](copy_only_value_initialized& value) noexcept {
+        ++value.value;
+    }, initialized);
+    oox::wait_for_all(initialized_done);
+    TWIST_ASSERT_M(initialized.get().value == 1,
+                   "shared copy-only fallback must value-initialize");
+
+    oox::shared_var<throwing_move_copyable_value, false> copied;
+    auto copied_done = oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 42;
+    }, copied);
+    oox::wait_for_all(copied_done);
+    TWIST_ASSERT_M(copied.get().value == 42,
+                   "shared materialization must prefer the nothrow copy");
+
+    asymmetric_assignment_value initial(1);
+    const asymmetric_assignment_value replacement(42);
+    oox::shared_var<asymmetric_assignment_value, false> assigned(initial);
+    assigned = replacement;
+    TWIST_ASSERT_M(assigned.get().value == 42,
+                   "shared assignment must execute the const-qualified overload");
+}
+
 void AssignmentPublishesAfterReleasingStateLock() {
     oox::shared_var<int> value(oox::deferred);
     oox::shared_var<int> alias = value;
@@ -119,7 +172,7 @@ void AssignmentPublishesAfterReleasingStateLock() {
                    "assignment continuation runs after the shared state unlock");
 }
 
-void ConcurrentLazyMaterializationRunsOutsideRegistrationLocks() {
+void ConcurrentLazyMaterializationRunsInGraphTasks() {
     twist::ed::std::atomic<int> gate{0};
     oox::shared_var<int> side_effect(0);
     materialization_gate = &gate;
@@ -143,7 +196,7 @@ void ConcurrentLazyMaterializationRunsOutsideRegistrationLocks() {
     wg.Join();
     TWIST_ASSERT_M(first.get().value == 2 && second.get().value == 2,
                    "both writers survive concurrent lazy materialization");
-    TWIST_ASSERT_M(side_effect.get() >= 2, "default constructors ran outside registration locks");
+    TWIST_ASSERT_M(side_effect.get() >= 2, "default constructors ran in materializer tasks");
     materialization_gate = nullptr;
     materialization_side_effect = nullptr;
 }
@@ -426,10 +479,12 @@ int main() {
     oox::twist_tests::RunRandomSeeds("DeferredAssignmentWakesWaitingReader", DeferredAssignmentWakesWaitingReader);
     oox::twist_tests::RunRandomSeeds("CopyOnlyAssignmentUsesTheCopyOverload",
                                      CopyOnlyAssignmentUsesTheCopyOverload);
+    oox::twist_tests::RunRandomSeeds("MaterializationAndConstCopyAssignmentContracts",
+                                     MaterializationAndConstCopyAssignmentContracts);
     oox::twist_tests::RunRandomSeeds("AssignmentPublishesAfterReleasingStateLock",
                                      AssignmentPublishesAfterReleasingStateLock);
-    oox::twist_tests::RunRandomSeeds("ConcurrentLazyMaterializationRunsOutsideRegistrationLocks",
-                                     ConcurrentLazyMaterializationRunsOutsideRegistrationLocks);
+    oox::twist_tests::RunRandomSeeds("ConcurrentLazyMaterializationRunsInGraphTasks",
+                                     ConcurrentLazyMaterializationRunsInGraphTasks);
     oox::twist_tests::RunRandomSeeds("ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch",
                                      ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
     oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",

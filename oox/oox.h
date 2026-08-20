@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <new>
 #if HAVE_TWIST && OOX_TWIST_TEST
 #include <vector>
@@ -29,10 +30,6 @@
 #include <twist/ed/std/mutex.hpp>
 #include <twist/ed/std/thread.hpp>
 #endif
-#if OOX_EXCEPTIONS_ENABLED
-#include <exception>
-#endif
-
 #if HAVE_OMP
 #include <omp.h>
 #include <setjmp.h>
@@ -87,6 +84,12 @@ struct cancelled_by_exception final : std::exception {
 struct cancelled_by_user final : std::exception {
     [[nodiscard]] const char* what() const noexcept override {
         return "oox::cancelled_by_user";
+    }
+};
+
+struct empty_forwarded_var final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox task returned an empty var that cannot be materialized";
     }
 };
 #endif
@@ -163,17 +166,18 @@ struct twist_task_tracker {
     }
 
     void drain() {
-        std::size_t next = 0;
         while (true) {
-            sync::thread worker;
+            std::vector<sync::thread> batch;
             {
                 std::lock_guard<sync::mutex> lock(mutex);
-                if (next == workers.size()) {
+                if (workers.empty()) {
                     return;
                 }
-                worker = std::move(workers[next++]);
+                batch.swap(workers);
             }
-            worker.join();
+            for (auto& worker : batch) {
+                worker.join();
+            }
         }
     }
 };
@@ -302,7 +306,7 @@ struct result_state {
     template <typename... Args>
     void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
-            ::new (static_cast<void*>(storage.data)) T;
+            ::new (static_cast<void*>(storage.data)) T{};
         } else {
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
@@ -1491,6 +1495,20 @@ concept policy_value_materializable = value_materializable<T>
         && (std::is_nothrow_move_constructible_v<T>
             || std::is_nothrow_copy_constructible_v<T>)));
 
+template <bool CanThrow, typename T>
+decltype(auto) materialized_value_source(T& value) noexcept {
+    if constexpr (std::is_nothrow_move_constructible_v<T>) {
+        return std::move(value);
+    } else if constexpr (std::is_nothrow_copy_constructible_v<T>) {
+        return std::as_const(value);
+    } else if constexpr (CanThrow && std::is_move_constructible_v<T>) {
+        return std::move(value);
+    } else {
+        static_assert(CanThrow && std::is_copy_constructible_v<T>);
+        return std::as_const(value);
+    }
+}
+
 struct var_storage {
     void* ptr = nullptr;
     bool forwarded = false;
@@ -1595,6 +1613,18 @@ public:
 using node = var<void>;
 
 namespace internal {
+
+template <typename T, bool VarCanThrow, bool ActiveCanThrow>
+var<T, VarCanThrow> make_materialized_var() {
+    static_assert(policy_value_materializable<T, ActiveCanThrow>,
+                  "materializing an empty var violates the active task's exception policy");
+    T value{};
+    return var<T, VarCanThrow>(materialized_value_source<ActiveCanThrow>(value));
+}
+
+template <typename T, bool CanThrow>
+var<T, CanThrow> make_default_var_task();
+
 template< typename T >
 std::string get_type(const char *m = "T") {
     std::string s;
@@ -1619,17 +1649,18 @@ struct prepend_type<T, types<Types...>> {
 
 template <typename Param, typename Actual>
 inline constexpr bool matching_value_conversion_is_nothrow =
-    !std::is_same_v<std::remove_cvref_t<Param>, std::remove_cvref_t<Actual>>
-    || std::is_nothrow_constructible_v<Param, Actual>;
+    std::is_nothrow_constructible_v<Param, Actual>;
 
 template <typename Params, typename Actuals>
 struct argument_conversions_are_nothrow : std::false_type {};
 
-template <typename... Params, typename... Actuals>
-struct argument_conversions_are_nothrow<types<Params...>, types<Actuals...>>
-    : std::bool_constant<(matching_value_conversion_is_nothrow<Params, Actuals> && ...)> {
-    static_assert(sizeof...(Params) == sizeof...(Actuals));
-};
+template <typename... Params>
+struct argument_conversions_are_nothrow<types<Params...>, types<>> : std::true_type {};
+
+template <typename Param, typename... Params, typename Actual, typename... Actuals>
+struct argument_conversions_are_nothrow<types<Param, Params...>, types<Actual, Actuals...>>
+    : std::bool_constant<matching_value_conversion_is_nothrow<Param, Actual>
+        && argument_conversions_are_nothrow<types<Params...>, types<Actuals...>>::value> {};
 
 // Types is types<list> of user functor argument types
 // Args is variadic list of run argument types
@@ -1661,7 +1692,7 @@ struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
     }
 };
 
-template <typename T, bool CanThrow>
+template <typename T, bool VarCanThrow, bool ActiveCanThrow>
 void* resolve_var_storage(var_storage storage) {
     if (!storage.forwarded) {
         return storage.ptr;
@@ -1673,16 +1704,8 @@ void* resolve_var_storage(var_storage storage) {
         base = static_cast<oox_var_base*>(base->storage_ptr);
     }
     if (!base->current_task && storage.initialize_if_empty) {
-        static_assert(policy_value_materializable<T, CanThrow>,
-                      "materializing an empty var violates its exception policy");
-        auto& empty = *static_cast<var<T, CanThrow>*>(base);
-        if constexpr (std::is_move_constructible_v<T>
-                      && (CanThrow || std::is_nothrow_move_constructible_v<T>)) {
-            empty = var<T, CanThrow>(T{});
-        } else {
-            T value;
-            empty = var<T, CanThrow>(value);
-        }
+        auto& empty = *static_cast<var<T, VarCanThrow>*>(base);
+        empty = make_materialized_var<T, VarCanThrow, ActiveCanThrow>();
     }
     __OOX_ASSERT_EX(base->current_task, "forwarded var resolved to an empty var without a recovery writer");
     return base->storage_ptr;
@@ -1711,12 +1734,8 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
         int count = is_writer;
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("oox::var<A>").c_str(), cov.current_task, get_type<T>("T").c_str(), count);
         if( !cov.current_task ) {
-            if constexpr (std::is_move_constructible_v<ooxed_type>) {
-                new( &const_cast<var_type&>(cov) ) var_type(ooxed_type());
-            } else {
-                ooxed_type value;
-                new( &const_cast<var_type&>(cov) ) var_type(value);
-            }
+            new (&const_cast<var_type&>(cov)) var_type(
+                make_default_var_task<ooxed_type, VarCanThrow>());
         }
         if constexpr (is_writer) {
             static_assert(VarCanThrow || !SelfCanThrow, "throwing task cannot write to non-throwing var");
@@ -1732,7 +1751,7 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow>(my_storage);
+        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow, SelfCanThrow>(my_storage);
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
@@ -1786,8 +1805,16 @@ template<int slots, typename F, typename R, bool CanThrow>
 struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, CanThrow> {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, CanThrow>;
+    static_assert(CanThrow || std::is_nothrow_move_constructible_v<R>
+                      || std::is_nothrow_copy_constructible_v<R>,
+                  "a non-throwing task must store its result through a nothrow move or copy");
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+
+    void invoke_and_store() {
+        R produced = this->functor_base::value()();
+        result_base::emplace(materialized_value_source<CanThrow>(produced));
+    }
 
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1799,7 +1826,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
                 return nullptr;
             }
             try {
-                result_base::emplace(this->functor_base::value()());
+                invoke_and_store();
                 task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
@@ -1808,7 +1835,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
         } else
 #endif
         {
-            result_base::emplace(this->functor_base::value()());
+            invoke_and_store();
             task_node::notify_successors<slots, false>();
         }
         return nullptr;
@@ -1872,14 +1899,17 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         result_base::emplace(this->functor_base::value()());
         auto& result = result_base::value();
         if (!result.current_task) {
-            static_assert(policy_value_materializable<VT, CanThrow>,
-                          "returning an empty var violates its exception policy");
-            if constexpr (std::is_move_constructible_v<VT>
-                          && (CanThrow || std::is_nothrow_move_constructible_v<VT>)) {
-                result = var_type(VT{});
+            if constexpr (policy_value_materializable<VT, CanThrow>) {
+                result = make_materialized_var<VT, VarCanThrow, CanThrow>();
             } else {
-                VT value;
-                result = var_type(value);
+#if OOX_EXCEPTIONS_ENABLED
+                if constexpr (CanThrow) {
+                    throw empty_forwarded_var{};
+                }
+#endif
+                __OOX_ASSERT_EX(false,
+                                "task returned an empty var that cannot be materialized");
+                std::terminate();
             }
         }
         this->start_count.store(1, std::memory_order_release);
@@ -2029,6 +2059,9 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
     task_type *t = internal::task::allocate<task_type>( functor_type(std::forward<F>(f), args_type(std::forward<Args>(args)...)) );
+    t->life_set_count(1);
+    auto release_unpublished = [](task_type* task) { task->release(1); };
+    std::unique_ptr<task_type, decltype(release_unpublished)> setup_guard(t, release_unpublished);
     __OOX_TRACE("%p oox::run: write ports %d",t,args_type::write_nodes_count);
     int protect_count = internal::task_node::start_count_mask;
     t->start_count.store(protect_count, std::memory_order_release);
@@ -2037,9 +2070,21 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
                          ->value()
                          .my_args.setup(1, t, std::forward<Args>(args)...);
     auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
+    setup_guard.release();
     t->remove_prerequisite( protect_count ); // publish it
     return r;
 }
+
+namespace internal {
+
+template <typename T, bool CanThrow>
+var<T, CanThrow> make_default_var_task() {
+    return oox::run<CanThrow>([]() noexcept(std::is_nothrow_default_constructible_v<T>) -> T {
+        return T{};
+    });
+}
+
+} // namespace internal
 
 template<typename T, bool CanThrow>
 var<T, CanThrow>& var<T, CanThrow>::operator=(const T& t)
@@ -2049,7 +2094,7 @@ var<T, CanThrow>& var<T, CanThrow>::operator=(const T& t)
     }
     auto value = std::make_shared<T>(t);
     run<CanThrow>([value = std::move(value)](T& target) noexcept(std::is_nothrow_copy_assignable_v<T>) {
-        target = *value;
+        target = std::as_const(*value);
     }, *this);
     return *this;
 }

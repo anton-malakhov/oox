@@ -8,6 +8,7 @@
 #include <twist/test/body/wg.hpp>
 
 #include <exception>
+#include <memory>
 #include <type_traits>
 
 namespace {
@@ -47,6 +48,42 @@ struct throwing_copy_value {
         throw DummyException{};
     }
     throwing_copy_value(throwing_copy_value&&) noexcept = default;
+};
+
+struct throwing_move_copyable_value {
+    int value = 0;
+
+    throwing_move_copyable_value() noexcept = default;
+    throwing_move_copyable_value(const throwing_move_copyable_value&) noexcept = default;
+    throwing_move_copyable_value(throwing_move_copyable_value&&) { throw DummyException{}; }
+};
+
+struct throwing_int_conversion {
+    throwing_int_conversion(int) { throw DummyException{}; }
+};
+
+struct asymmetric_assignment_value {
+    int value = 0;
+
+    asymmetric_assignment_value() = default;
+    explicit asymmetric_assignment_value(int v) : value(v) {}
+    asymmetric_assignment_value(const asymmetric_assignment_value&) = default;
+    asymmetric_assignment_value(asymmetric_assignment_value&&) = default;
+    asymmetric_assignment_value& operator=(const asymmetric_assignment_value& other) noexcept {
+        value = other.value;
+        return *this;
+    }
+    asymmetric_assignment_value& operator=(asymmetric_assignment_value&) {
+        throw DummyException{};
+    }
+};
+
+struct non_default_forwarded_value {
+    int value;
+
+    explicit non_default_forwarded_value(int v) : value(v) {}
+    non_default_forwarded_value(const non_default_forwarded_value&) = default;
+    non_default_forwarded_value(non_default_forwarded_value&&) = default;
 };
 
 template <typename Var, typename Value>
@@ -101,6 +138,68 @@ void ThrowingConsumeOperationsPropagate() {
     auto copied = oox::run<true>([](throwing_copy_value) noexcept {}, ready);
     ExpectThrows<DummyException>([&] { oox::wait_for_all(copied); },
                                  "throwing actual copy conversion must complete with failure");
+
+    oox::shared_var<int, true> integer(1);
+    auto converted = oox::run<true>([](throwing_int_conversion) noexcept {}, integer);
+    ExpectThrows<DummyException>([&] { oox::wait_for_all(converted); },
+                                 "throwing cross-type conversion must complete with failure");
+}
+
+void LazyMaterializationAndCompatibilityContracts() {
+    std::weak_ptr<int> captured;
+    {
+        oox::shared_var<throwing_default_value, true> value;
+        auto resource = std::make_shared<int>(1);
+        captured = resource;
+        auto done = oox::run<true>([resource](throwing_default_value&) noexcept {}, value);
+        resource.reset();
+        ExpectThrows<DummyException>([&] { oox::wait_for_all(done); },
+                                     "bare lazy materialization must fail asynchronously");
+    }
+    oox::internal::active_twist_task_tracker->drain();
+    TWIST_ASSERT_M(captured.expired(), "failed setup task must release captured resources");
+
+    auto recovered = oox::run<true>([]() -> oox::var<throwing_move_copyable_value, true> {
+        throw DummyException{};
+    });
+    auto recovery = oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 42;
+    }, recovered);
+    oox::wait_for_all(recovery);
+    TWIST_ASSERT_M(oox::wait_and_get(recovered).value == 42,
+                   "nonthrowing forwarded recovery must use the safe copy");
+
+    oox::shared_var<throwing_move_copyable_value, true> shared;
+    auto shared_writer = oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 43;
+    }, shared);
+    oox::wait_for_all(shared_writer);
+    TWIST_ASSERT_M(shared.get().value == 43,
+                   "nonthrowing shared writer must use the safe copy");
+
+    asymmetric_assignment_value initial(1);
+    const asymmetric_assignment_value replacement(42);
+    oox::var<asymmetric_assignment_value, true> plain(initial);
+    plain = replacement;
+    TWIST_ASSERT_M(oox::wait_and_get(plain).value == 42,
+                   "throwing-policy var assignment must use const RHS");
+    oox::shared_var<asymmetric_assignment_value, true> shared_assignment(initial);
+    shared_assignment = replacement;
+    TWIST_ASSERT_M(shared_assignment.get().value == 42,
+                   "throwing-policy shared assignment must use const RHS");
+
+    auto omitted = oox::run<true>([](int value = 42) noexcept { return value; });
+    auto partial = oox::run<true>([](int first, int second = 2) noexcept {
+        return first + second;
+    }, 40);
+    TWIST_ASSERT_M(oox::wait_and_get(omitted) == 42, "throwing policy omitted default");
+    TWIST_ASSERT_M(oox::wait_and_get(partial) == 42, "throwing policy partial default");
+
+    auto empty = oox::run<true>([]() -> oox::var<non_default_forwarded_value, true> {
+        return {};
+    });
+    ExpectThrows<oox::empty_forwarded_var>([&] { oox::wait_for_all(empty); },
+                                           "empty nonmaterializable var must be graph failure");
 }
 
 void ExceptionSkipsDependentBodies() {
@@ -376,6 +475,8 @@ int main() {
     oox::twist_tests::RunRandomSeeds("ThrowingProducerRethrowsOriginal", ThrowingProducerRethrowsOriginal);
     oox::twist_tests::RunRandomSeeds("ThrowingConsumeOperationsPropagate",
                                      ThrowingConsumeOperationsPropagate);
+    oox::twist_tests::RunRandomSeeds("LazyMaterializationAndCompatibilityContracts",
+                                     LazyMaterializationAndCompatibilityContracts);
     oox::twist_tests::RunRandomSeeds("ExceptionSkipsDependentBodies", ExceptionSkipsDependentBodies);
     oox::twist_tests::RunRandomSeeds("DeferredWriterPoisonCancelsReaders", DeferredWriterPoisonCancelsReaders);
     oox::twist_tests::RunRandomSeeds("LateConsumerAfterFailureSeesFailure", LateConsumerAfterFailureSeesFailure);

@@ -45,8 +45,11 @@
 //   - get() returns a copy made under the state lock (T must be copyable);
 //   - T must satisfy the selected policy's value-materialization requirements;
 //   - T cannot itself be a shared_var specialization;
-//   - racing first materializations may construct multiple T{} candidates,
-//     but exactly one candidate is installed;
+//   - lazy T{} construction runs in a graph task outside state locks;
+//   - racing first materializations may run multiple candidate tasks, but
+//     exactly one candidate is installed;
+//   - run<false> writer materialization requirements are conservative even for
+//     a particular state that is already initialized;
 //   - an adopted forwarded var is resolved after its producer completes;
 //   - moving from or rebinding one handle concurrently with another access to
 //     that handle is a user-side data race (same contract as std::shared_ptr).
@@ -369,7 +372,7 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
     C&& consume() {
         const internal::var_storage storage{
             my_storage.ptr, my_storage.forwarded, my_storage.initialize_if_empty};
-        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow>(storage);
+        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow, SelfCanThrow>(storage);
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
@@ -440,15 +443,7 @@ class shared_var {
                     return;
                 }
             }
-            var<T, CanThrow> candidate = [&] {
-                if constexpr (std::is_move_constructible_v<T>
-                              && (CanThrow || std::is_nothrow_move_constructible_v<T>)) {
-                    return var<T, CanThrow>(T{});
-                } else {
-                    T value;
-                    return var<T, CanThrow>(value);
-                }
-            }();
+            var<T, CanThrow> candidate = internal::make_default_var_task<T, CanThrow>();
             std::unique_lock<internal::shared_var_mutex> lock(mtx);
             if (!inner.current_task) {
                 inner = std::move(candidate);
@@ -588,7 +583,7 @@ public:
     shared_var& operator=(const T& t) requires internal::policy_copy_value_assignable<T, CanThrow> {
         auto value = std::make_shared<T>(t);
         run<CanThrow>([value = std::move(value)](T& target) noexcept(std::is_nothrow_copy_assignable_v<T>) {
-            target = *value;
+            target = std::as_const(*value);
         }, *this);
         return *this;
     }

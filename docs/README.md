@@ -220,9 +220,12 @@ void wait_for_all(const shared_var<T, CanThrow>&);
 machinery: failed tasks propagate through the graph and `get()` rethrows.
 For `CanThrow == false`, operations performed by argument consumption are also
 part of the non-throwing contract: deferred/forwarded materialization and a
-copy/move conversion from the actual stored-value reference must be `noexcept`.
-Unsafe combinations are rejected at compile time even when exception machinery
-is disabled.
+copy/move or cross-type conversion from the actual stored-value reference must
+be `noexcept`. Omitted defaulted callable parameters are allowed; checks cover
+only the supplied argument prefix. Lazy materialization prefers a nothrow move,
+then a nothrow copy, and runs in a graph task so exception-enabled failures are
+propagated asynchronously. Unsafe non-throwing combinations are rejected at
+compile time even when exception machinery is disabled.
 
 ## 4. Build
 
