@@ -263,8 +263,14 @@ struct task_life {
     }
 };
 
+inline constexpr std::size_t var_storage_pointer_alignment = 4;
+
+// var_storage keeps two flags in result-state pointer bits. Make that alignment
+// part of the storage contract instead of relying on surrounding task layout.
 template <typename T, bool CanThrow = false>
-struct result_state {
+struct alignas(alignof(T) < var_storage_pointer_alignment
+                   ? var_storage_pointer_alignment
+                   : alignof(T)) result_state {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
     static constexpr unsigned char state_set = 1;
@@ -314,7 +320,7 @@ struct result_state {
 };
 
 template <bool CanThrow>
-struct result_state<void, CanThrow> {};
+struct alignas(var_storage_pointer_alignment) result_state<void, CanThrow> {};
 
 #if OOX_SERIAL_DEBUG  ////////////////////// Serial backend //////////////////////////////////
 
@@ -1510,10 +1516,41 @@ decltype(auto) materialized_value_source(T& value) noexcept {
 }
 
 struct var_storage {
-    void* ptr = nullptr;
-    bool forwarded = false;
-    bool initialize_if_empty = false;
+    static constexpr std::uintptr_t forwarded_tag = 0x1;
+    static constexpr std::uintptr_t initialize_if_empty_tag = 0x2;
+    static constexpr std::uintptr_t tag_mask = forwarded_tag | initialize_if_empty_tag;
+
+    std::uintptr_t tagged_ptr = 0;
+
+    var_storage() = default;
+    var_storage(void* ptr, bool forwarded, bool initialize_if_empty = false) noexcept
+        : tagged_ptr(reinterpret_cast<std::uintptr_t>(ptr)
+              | (forwarded ? forwarded_tag : 0)
+              | (initialize_if_empty ? initialize_if_empty_tag : 0)) {
+        __OOX_ASSERT_EX((reinterpret_cast<std::uintptr_t>(ptr) & tag_mask) == 0,
+                        "var storage pointer does not have two free low bits");
+    }
+
+    [[nodiscard]] bool has_tags() const noexcept { return (tagged_ptr & tag_mask) != 0; }
+    [[nodiscard]] bool forwarded() const noexcept { return (tagged_ptr & forwarded_tag) != 0; }
+    [[nodiscard]] bool initialize_if_empty() const noexcept {
+        return (tagged_ptr & initialize_if_empty_tag) != 0;
+    }
+    [[nodiscard]] void* ptr() const noexcept {
+        return reinterpret_cast<void*>(tagged_ptr & ~tag_mask);
+    }
+    void set_initialize_if_empty(bool value) noexcept {
+        if (value) {
+            tagged_ptr |= initialize_if_empty_tag;
+        } else {
+            tagged_ptr &= ~initialize_if_empty_tag;
+        }
+    }
 };
+static_assert(sizeof(var_storage) == sizeof(void*),
+              "oox argument storage descriptor must remain pointer-sized");
+static_assert(var_storage::tag_mask < var_storage_pointer_alignment,
+              "result-state alignment must leave room for all pointer tags");
 
 } // namespace internal
 
@@ -1694,16 +1731,21 @@ struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
 
 template <typename T, bool VarCanThrow, bool ActiveCanThrow>
 void* resolve_var_storage(var_storage storage) {
-    if (!storage.forwarded) {
-        return storage.ptr;
+    if (!storage.has_tags()) {
+        return reinterpret_cast<void*>(storage.tagged_ptr);
     }
 
-    oox_var_base* base = static_cast<oox_var_base*>(storage.ptr);
+    void* ptr = storage.ptr();
+    if (!storage.forwarded()) {
+        return ptr;
+    }
+
+    oox_var_base* base = static_cast<oox_var_base*>(ptr);
     while (base->current_port_and_flags.is_forwarded) {
         __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage pointer");
         base = static_cast<oox_var_base*>(base->storage_ptr);
     }
-    if (!base->current_task && storage.initialize_if_empty) {
+    if (!base->current_task && storage.initialize_if_empty()) {
         auto& empty = *static_cast<var<T, VarCanThrow>*>(base);
         empty = make_materialized_var<T, VarCanThrow, ActiveCanThrow>();
     }
@@ -1745,7 +1787,8 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
             static_assert(SelfCanThrow || !VarCanThrow, "non-throwing task cannot depend on throwing task");
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
         }
-        my_storage = {cov.storage_ptr, cov.current_port_and_flags.is_forwarded != 0, is_writer != 0};
+        const bool forwarded = cov.current_port_and_flags.is_forwarded != 0;
+        my_storage = {cov.storage_ptr, forwarded, forwarded && is_writer != 0};
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
         //    ov.~var(); // TODO: no need in sync for not yet published task
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);

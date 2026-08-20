@@ -132,6 +132,22 @@ void ImmediateValueConsistency() {
     TWIST_ASSERT_M(oox::wait_and_get(tmp) == 1, "immediate var consistency");
 }
 
+void VarStorageKeepsFlagsInPointerTags() {
+    static_assert(sizeof(oox::internal::var_storage) == sizeof(void*));
+    static_assert(std::is_trivially_copyable_v<oox::internal::var_storage>);
+    static_assert(alignof(oox::internal::result_state<unsigned char>) >=
+                  oox::internal::var_storage_pointer_alignment);
+
+    alignas(4) unsigned char slot[4]{};
+    oox::internal::var_storage direct(slot, false, false);
+    oox::internal::var_storage both(slot, true, true);
+    TWIST_ASSERT_M(direct.tagged_ptr == reinterpret_cast<std::uintptr_t>(slot),
+                   "untagged storage pointer must keep its fast representation");
+    TWIST_ASSERT_M(both.ptr() == slot, "tagged storage pointer must round-trip");
+    TWIST_ASSERT_M(both.forwarded(), "forwarded flag must use a pointer tag");
+    TWIST_ASSERT_M(both.initialize_if_empty(), "initialize flag must use a pointer tag");
+}
+
 void ValueAssignmentPublishesAndSerializes() {
     oox::var<int> deferred(oox::deferred);
     auto deferred_reader = oox::run([](int value) { return value + 1; }, deferred);
@@ -297,6 +313,8 @@ int main() {
     oox::twist_tests::RunRandomSeeds("DeferredForwardingLayer", DeferredForwardingLayer);
     oox::twist_tests::RunRandomSeeds("DeferredArrayLayered", DeferredArrayLayered);
     oox::twist_tests::RunRandomSeeds("ImmediateValueConsistency", ImmediateValueConsistency);
+    oox::twist_tests::RunRandomSeeds("VarStorageKeepsFlagsInPointerTags",
+                                     VarStorageKeepsFlagsInPointerTags);
     oox::twist_tests::RunRandomSeeds("ValueAssignmentPublishesAndSerializes",
                                      ValueAssignmentPublishesAndSerializes);
     oox::twist_tests::RunRandomSeeds("CopyOnlyAssignmentUsesTheCopyOverload",

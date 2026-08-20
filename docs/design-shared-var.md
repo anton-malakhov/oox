@@ -126,6 +126,13 @@ storage; the graph guarantees that producer completed before `consume()` runs,
 so the object's lifetime has begun and the full forwarding chain can safely be
 walked. The slot remains alive through the existing graph ownership rules.
 
+The captured descriptor stays pointer-sized. Its `forwarded` and
+`initialize-if-empty` states occupy the two low pointer bits, while an
+untagged direct `oox::var` descriptor retains the exact raw result-state
+pointer representation and fast path. Result-state storage therefore has an
+explicit minimum four-byte alignment; compile-time assertions and ordinary
+plus Twist countertests protect both the layout and tag round-trip.
+
 `oox::run` arguments are handled **per argument kind**: a single task may mix
 plain `oox::var` and `oox::shared_var` arguments (each kind matched by its own
 `base_args` specialization). The plain-var parts keep their single-threaded

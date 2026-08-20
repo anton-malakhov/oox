@@ -79,11 +79,7 @@ using shared_var_mutex = sync::mutex;
 using shared_var_mutex = std::mutex;
 #endif
 
-struct shared_var_storage {
-    void* ptr = nullptr;
-    bool forwarded = false;
-    bool initialize_if_empty = false;
-};
+using shared_var_storage = var_storage;
 
 // ---------------------------------------------------------------------------
 // shared_state_base: type-erased state for atomic multi-state registration
@@ -124,7 +120,7 @@ struct shared_var_registration {
             count = state->preregister_reader(self, port);
         }
         *my_storage = state->capture_storage();
-        my_storage->initialize_if_empty = is_writer;
+        my_storage->set_initialize_if_empty(is_writer);
     }
 
     void discard_alias(const shared_var_storage& primary_storage) {
@@ -370,13 +366,11 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
     // producer's write before this read, and the storage slot is kept alive by
     // the owning shared state.
     C&& consume() {
-        const internal::var_storage storage{
-            my_storage.ptr, my_storage.forwarded, my_storage.initialize_if_empty};
-        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow, SelfCanThrow>(storage);
+        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow, SelfCanThrow>(my_storage);
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
-        if (my_storage.initialize_if_empty && !state->has_value()) {
+        if (my_storage.initialize_if_empty() && !state->has_value()) {
             state->emplace(); // requires default-constructible T
         }
         __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");

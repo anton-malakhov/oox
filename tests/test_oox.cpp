@@ -189,6 +189,27 @@ TEST(OOX, ConsistencyInfLoop) {
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
 }
 
+TEST(OOX, VarStorageKeepsFlagsInPointerTags) {
+    static_assert(sizeof(oox::internal::var_storage) == sizeof(void*));
+    static_assert(std::is_trivially_copyable_v<oox::internal::var_storage>);
+    static_assert(alignof(oox::internal::result_state<unsigned char>) >=
+                  oox::internal::var_storage_pointer_alignment);
+
+    alignas(4) unsigned char slot[4]{};
+    oox::internal::var_storage direct(slot, false, false);
+    oox::internal::var_storage forwarded(slot, true, false);
+    oox::internal::var_storage initializing(slot, false, true);
+    oox::internal::var_storage both(slot, true, true);
+
+    EXPECT_EQ(direct.tagged_ptr, reinterpret_cast<std::uintptr_t>(slot));
+    EXPECT_EQ(forwarded.ptr(), slot);
+    EXPECT_TRUE(forwarded.forwarded());
+    EXPECT_EQ(initializing.ptr(), slot);
+    EXPECT_TRUE(initializing.initialize_if_empty());
+    EXPECT_TRUE(both.forwarded());
+    EXPECT_TRUE(both.initialize_if_empty());
+}
+
 TEST(OOX, ValueAssignmentPublishesDeferredVar) {
     oox::var<int> value(oox::deferred);
     auto reader = oox::run(plus, 1, value);
