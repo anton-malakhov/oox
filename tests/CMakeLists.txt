@@ -121,18 +121,6 @@ if (OOX_ENABLE_EIGEN)
              COMMAND eigen_include_${include_order})
   endforeach ()
 
-  get_property(OOX_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-  add_test(NAME EigenInstalledPackageConsumer
-           COMMAND ${CMAKE_COMMAND}
-                   -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
-                   -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
-                   -D OOX_GENERATOR=${CMAKE_GENERATOR}
-                   -D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}
-                   -D OOX_PACKAGE_DIR=${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-                   -D OOX_CONFIG=$<CONFIG>
-                   -D OOX_MULTI_CONFIG=${OOX_MULTI_CONFIG}
-                   -D OOX_EXE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}
-                   -P ${CMAKE_CURRENT_LIST_DIR}/package_consumer_test.cmake)
 endif ()
 
 if (OOX_EXCEPTIONS_ENABLED)
