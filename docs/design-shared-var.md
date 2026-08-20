@@ -96,7 +96,11 @@ the actual registration to a thread-local setup context:
    execute inside that task, under its exception policy. Therefore a slow,
    re-entrant, or throwing constructor never runs in registration or under
    state locks, while racing callers observe the installed task and cannot
-   create losing materializers or duplicate constructor side effects.
+   create losing materializers or duplicate constructor side effects. If the
+   backend rejects publication, the installed materializer is executed
+   synchronously to a terminal graph state before the submission exception is
+   rethrown; concurrent waiters therefore cannot remain attached to an
+   unspawned task.
 4. All involved states are locked **in canonical (address-sorted) order** and
    registrations are grouped by state and applied as one atomic unit. If
    several arguments alias one state, one writer registration (or one reader

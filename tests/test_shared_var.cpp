@@ -162,6 +162,22 @@ struct counted_default_value {
     }
 };
 
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+std::atomic<bool>* publication_fallback_started = nullptr;
+std::atomic<bool>* publication_fallback_release = nullptr;
+
+struct publication_fallback_value {
+    int value = 42;
+
+    publication_fallback_value() noexcept {
+        publication_fallback_started->store(true, std::memory_order_release);
+        while (!publication_fallback_release->load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+};
+#endif
+
 struct reentrant_plain_default_value {
     reentrant_plain_default_value() noexcept {
         oox::run([](int& side_effect) { ++side_effect; }, *plain_constructor_side_effect);
@@ -302,6 +318,53 @@ TEST(SharedVar, ConcurrentGetPublishesOneLazyMaterializer) {
     EXPECT_EQ(default_constructor_count.load(std::memory_order_relaxed),
               constructors_before + 1);
 }
+
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+TEST(SharedVar, PublicationFailureExecutesInstalledMaterializerInline) {
+    std::atomic<bool> fallback_started{false};
+    std::atomic<bool> release_fallback{false};
+    std::atomic<bool> spawn_failure{false};
+    publication_fallback_started = &fallback_started;
+    publication_fallback_release = &release_fallback;
+    oox::shared_var<publication_fallback_value> value;
+
+    oox::internal::inject_next_task_spawn_failure(spawn_failure);
+    auto publisher = std::async(std::launch::async, [&] {
+        try {
+            (void)value.get();
+        } catch (const oox::internal::injected_task_spawn_failure&) {
+            return true;
+        }
+        return false;
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + k_async_test_timeout;
+    while (!fallback_started.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(fallback_started.load(std::memory_order_acquire));
+
+    std::atomic<bool> waiter_entered{false};
+    auto waiter = std::async(std::launch::async, [&] {
+        waiter_entered.store(true, std::memory_order_release);
+        return value.get().value;
+    });
+    while (!waiter_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(waiter.wait_for(20ms), std::future_status::timeout);
+
+    release_fallback.store(true, std::memory_order_release);
+    EXPECT_TRUE(publisher.get());
+    ASSERT_EQ(waiter.wait_for(k_async_test_timeout), std::future_status::ready);
+    EXPECT_EQ(waiter.get(), 42);
+    EXPECT_EQ(value.get().value, 42);
+    oox::internal::clear_task_spawn_failure_injection();
+    publication_fallback_started = nullptr;
+    publication_fallback_release = nullptr;
+}
+#endif
 
 TEST(SharedVar, ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch) {
     oox::shared_var<int> value(0);

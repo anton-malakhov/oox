@@ -151,6 +151,27 @@ inline void preemption_point() {}
 
 } // namespace sync
 
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+struct injected_task_spawn_failure {};
+inline sync::atomic<bool>* task_spawn_failure_flag = nullptr;
+
+inline void inject_next_task_spawn_failure(sync::atomic<bool>& flag) {
+    task_spawn_failure_flag = &flag;
+    flag.store(true, std::memory_order_release);
+}
+
+inline void clear_task_spawn_failure_injection() {
+    task_spawn_failure_flag = nullptr;
+}
+
+inline void maybe_inject_task_spawn_failure() {
+    if (task_spawn_failure_flag
+        && task_spawn_failure_flag->exchange(false, std::memory_order_acq_rel)) {
+        throw injected_task_spawn_failure{};
+    }
+}
+#endif
+
 #if HAVE_TWIST && OOX_TWIST_TEST
 // The Twist backend launches detached worker threads. A value becomes ready
 // just before its worker exits, so a test scenario can otherwise return while
@@ -450,6 +471,9 @@ struct task : public tbb_task, task_life {
 #endif
     }
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
 #if TBB_USE_ASSERT
         is_spawned.store(true, std::memory_order_release);
 #endif
@@ -492,6 +516,9 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
         get_tf_pool().silent_async([this]{
             this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
         });
@@ -526,6 +553,9 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
 #if OOX_TWIST_TEST
         auto* tracker = active_twist_task_tracker;
 #endif
@@ -592,6 +622,9 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
          get_fiber_manager().add([this] {
             this->execute();
         });
@@ -622,6 +655,9 @@ struct task : task_life {
         return new T(std::forward<Args>(args)...);
     }
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
         std::async(std::launch::async, &task::execute, this);
     }
     void wait() {
@@ -1883,6 +1919,49 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
         }
         return nullptr;
     }
+
+    // Keep the fallback separate from execute(): ordinary run() task
+    // specializations must not acquire another call in their execution path.
+    // This body is instantiated only for an installed lazy materializer.
+    void execute_after_publication_failure() {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                invoke_and_store();
+                task_node::notify_successors<slots, false>();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+            }
+        } else
+#endif
+        {
+            invoke_and_store();
+            task_node::notify_successors<slots, false>();
+        }
+    }
+
+    void publish_installed(int protect_count) {
+#if defined(OOX_USING_SERIAL)
+        this->remove_prerequisite(protect_count);
+#else
+        try {
+            this->remove_prerequisite(protect_count);
+        } catch (...) {
+            // A throwing backend submission has not accepted the task. Complete
+            // the already-visible graph node inline so registered successors
+            // reach a terminal state, then preserve the caller-visible error.
+            auto publication_failure = std::current_exception();
+            execute_after_publication_failure();
+            std::rethrow_exception(publication_failure);
+        }
+#endif
+    }
     ~functional_task() {
         result_base::reset();
     }
@@ -2126,13 +2205,13 @@ struct default_var_factory {
     }
 };
 
-template <typename T, bool CanThrow>
+template <typename T, bool CanThrow, typename Task>
 struct unpublished_default_var_task {
     var<T, CanThrow> value;
-    task_node* node;
+    Task* node;
     int protect_count;
 
-    unpublished_default_var_task(var<T, CanThrow>&& v, task_node* n, int count) noexcept
+    unpublished_default_var_task(var<T, CanThrow>&& v, Task* n, int count) noexcept
         : value(std::move(v)), node(n), protect_count(count) {}
     unpublished_default_var_task(const unpublished_default_var_task&) = delete;
     unpublished_default_var_task& operator=(const unpublished_default_var_task&) = delete;
@@ -2145,14 +2224,14 @@ struct unpublished_default_var_task {
     }
 
     void publish() {
-        task_node* task = std::exchange(node, nullptr);
+        Task* task = std::exchange(node, nullptr);
         __OOX_ASSERT_EX(task, "default materializer was already published");
-        task->remove_prerequisite(protect_count);
+        task->publish_installed(protect_count);
     }
 };
 
 template <typename T, bool CanThrow>
-unpublished_default_var_task<T, CanThrow> make_unpublished_default_var_task() {
+auto make_unpublished_default_var_task() {
     static_assert(policy_value_materializable<T, CanThrow>);
     using factory_type = default_var_factory<T>;
     using args_type = base_args<types<>, CanThrow>;
@@ -2167,7 +2246,7 @@ unpublished_default_var_task<T, CanThrow> make_unpublished_default_var_task() {
                          ->value()
                          .my_args.setup(1, task);
     auto result = gen_oox<T, CanThrow>::bind_to(task);
-    return unpublished_default_var_task<T, CanThrow>(
+    return unpublished_default_var_task<T, CanThrow, task_type>(
         std::move(result), task, protect_count);
 }
 

@@ -14,6 +14,8 @@ namespace {
 twist::ed::std::atomic<int>* materialization_gate = nullptr;
 oox::shared_var<int>* materialization_side_effect = nullptr;
 oox::shared_var<int>* plain_constructor_side_effect = nullptr;
+twist::ed::std::atomic<bool>* publication_fallback_started = nullptr;
+twist::ed::std::atomic<bool>* publication_fallback_release = nullptr;
 
 struct gated_default_value {
     int value = 0;
@@ -22,6 +24,17 @@ struct gated_default_value {
         materialization_gate->fetch_add(1, std::memory_order_relaxed);
         twist::assist::PreemptionPoint();
         oox::run([](int& side_effect) { ++side_effect; }, *materialization_side_effect);
+    }
+};
+
+struct publication_fallback_value {
+    int value = 42;
+
+    publication_fallback_value() noexcept {
+        publication_fallback_started->store(true, std::memory_order_release);
+        while (!publication_fallback_release->load(std::memory_order_acquire)) {
+            twist::ed::std::this_thread::yield();
+        }
     }
 };
 
@@ -224,6 +237,49 @@ void ConcurrentGetPublishesOneLazyMaterializer() {
     TWIST_ASSERT_M(side_effect.get() == 1, "only the installed materializer entered user code");
     materialization_gate = nullptr;
     materialization_side_effect = nullptr;
+}
+
+void PublicationFailureExecutesInstalledMaterializerInline() {
+    twist::ed::std::atomic<bool> fallback_started{false};
+    twist::ed::std::atomic<bool> release_fallback{false};
+    twist::ed::std::atomic<bool> waiter_entered{false};
+    twist::ed::std::atomic<bool> publisher_caught{false};
+    twist::ed::std::atomic<bool> spawn_failure{false};
+    publication_fallback_started = &fallback_started;
+    publication_fallback_release = &release_fallback;
+    oox::shared_var<publication_fallback_value> value;
+    twist::test::body::WaitGroup wg;
+
+    oox::internal::inject_next_task_spawn_failure(spawn_failure);
+    wg.Add(1, [&] {
+        try {
+            (void)value.get();
+        } catch (const oox::internal::injected_task_spawn_failure&) {
+            publisher_caught.store(true, std::memory_order_release);
+        }
+    });
+    wg.Add(1, [&] {
+        while (!fallback_started.load(std::memory_order_acquire)) {
+            twist::ed::std::this_thread::yield();
+        }
+        waiter_entered.store(true, std::memory_order_release);
+        TWIST_ASSERT_M(value.get().value == 42, "concurrent waiter completes");
+    });
+    wg.Add(1, [&] {
+        while (!waiter_entered.load(std::memory_order_acquire)) {
+            twist::ed::std::this_thread::yield();
+        }
+        twist::assist::PreemptionPoint();
+        release_fallback.store(true, std::memory_order_release);
+    });
+    wg.Join();
+
+    TWIST_ASSERT_M(publisher_caught.load(std::memory_order_acquire),
+                   "first get observes the backend publication failure");
+    TWIST_ASSERT_M(value.get().value == 42, "retry observes the inline materialized value");
+    oox::internal::clear_task_spawn_failure_injection();
+    publication_fallback_started = nullptr;
+    publication_fallback_release = nullptr;
 }
 
 void ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch() {
@@ -512,6 +568,8 @@ int main() {
                                      ConcurrentLazyMaterializationRunsInGraphTasks);
     oox::twist_tests::RunRandomSeeds("ConcurrentGetPublishesOneLazyMaterializer",
                                      ConcurrentGetPublishesOneLazyMaterializer);
+    oox::twist_tests::RunRandomSeeds("PublicationFailureExecutesInstalledMaterializerInline",
+                                     PublicationFailureExecutesInstalledMaterializerInline);
     oox::twist_tests::RunRandomSeeds("ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch",
                                      ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
     oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",

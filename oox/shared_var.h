@@ -47,6 +47,8 @@
 //   - T cannot itself be a shared_var specialization;
 //   - lazy T{} construction runs in a graph task outside state locks;
 //   - racing first materializations install and publish exactly one task;
+//   - if backend submission of that installed task throws, it is completed
+//     synchronously before the submission exception escapes;
 //   - run<false> writer materialization requirements are conservative even for
 //     a particular state that is already initialized;
 //   - an adopted forwarded var is resolved after its producer completes;

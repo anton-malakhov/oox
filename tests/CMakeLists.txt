@@ -28,6 +28,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
           ${PROJECT_NAME}
           ${OOX_GTEST_LIB}
   )
+  if (unittest STREQUAL "test_shared_var")
+    target_compile_definitions(${unittest}
+            PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+  endif ()
   gtest_discover_tests(${unittest})
 
   # Serial debugging implementation
@@ -47,6 +51,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     if (OOX_EXCEPTIONS_ENABLED)
       target_compile_definitions(${unittest}_tbb PRIVATE TBB_USE_EXCEPTIONS=1)
     endif ()
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tbb
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+    endif ()
     target_link_libraries(${unittest}_tbb
             PRIVATE
             ${PROJECT_NAME}
@@ -60,6 +68,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
     target_compile_definitions(${unittest}_tf PRIVATE HAVE_TF)
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tf
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+    endif ()
     target_link_libraries(${unittest}_tf
             PRIVATE
             ${PROJECT_NAME}
