@@ -46,8 +46,7 @@
 //   - T must satisfy the selected policy's value-materialization requirements;
 //   - T cannot itself be a shared_var specialization;
 //   - lazy T{} construction runs in a graph task outside state locks;
-//   - racing first materializations may run multiple candidate tasks, but
-//     exactly one candidate is installed;
+//   - racing first materializations install and publish exactly one task;
 //   - run<false> writer materialization requirements are conservative even for
 //     a particular state that is already initialized;
 //   - an adopted forwarded var is resolved after its producer completes;
@@ -431,17 +430,15 @@ class shared_var {
         explicit shared_state(var<T, CanThrow>&& v) : inner(std::move(v)) {}
 
         void materialize() override {
-            {
-                std::unique_lock<internal::shared_var_mutex> lock(mtx);
-                if (inner.current_task) {
-                    return;
-                }
-            }
-            var<T, CanThrow> candidate = internal::make_default_var_task<T, CanThrow>();
             std::unique_lock<internal::shared_var_mutex> lock(mtx);
-            if (!inner.current_task) {
-                inner = std::move(candidate);
+            if (inner.current_task) {
+                return;
             }
+            auto materializer =
+                internal::make_unpublished_default_var_task<T, CanThrow>();
+            inner = std::move(materializer.value);
+            lock.unlock();
+            materializer.publish();
         }
 
         void chain_writer(int port, internal::task_node* self) override {

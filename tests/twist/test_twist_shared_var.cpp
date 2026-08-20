@@ -196,7 +196,32 @@ void ConcurrentLazyMaterializationRunsInGraphTasks() {
     wg.Join();
     TWIST_ASSERT_M(first.get().value == 2 && second.get().value == 2,
                    "both writers survive concurrent lazy materialization");
-    TWIST_ASSERT_M(side_effect.get() >= 2, "default constructors ran in materializer tasks");
+    TWIST_ASSERT_M(gate.load(std::memory_order_relaxed) == 2,
+                   "one materializer was published for each shared state");
+    TWIST_ASSERT_M(side_effect.get() == 2, "default constructors ran exactly once per state");
+    materialization_gate = nullptr;
+    materialization_side_effect = nullptr;
+}
+
+void ConcurrentGetPublishesOneLazyMaterializer() {
+    twist::ed::std::atomic<int> constructors{0};
+    oox::shared_var<int> side_effect(0);
+    materialization_gate = &constructors;
+    materialization_side_effect = &side_effect;
+    oox::shared_var<gated_default_value> value;
+    twist::test::body::WaitGroup wg;
+
+    for (int i = 0; i < 4; ++i) {
+        wg.Add(1, [&] {
+            twist::assist::PreemptionPoint();
+            TWIST_ASSERT_M(value.get().value == 0, "lazy value materialized");
+        });
+    }
+    wg.Join();
+
+    TWIST_ASSERT_M(constructors.load(std::memory_order_relaxed) == 1,
+                   "concurrent gets publish one lazy materializer");
+    TWIST_ASSERT_M(side_effect.get() == 1, "only the installed materializer entered user code");
     materialization_gate = nullptr;
     materialization_side_effect = nullptr;
 }
@@ -485,6 +510,8 @@ int main() {
                                      AssignmentPublishesAfterReleasingStateLock);
     oox::twist_tests::RunRandomSeeds("ConcurrentLazyMaterializationRunsInGraphTasks",
                                      ConcurrentLazyMaterializationRunsInGraphTasks);
+    oox::twist_tests::RunRandomSeeds("ConcurrentGetPublishesOneLazyMaterializer",
+                                     ConcurrentGetPublishesOneLazyMaterializer);
     oox::twist_tests::RunRandomSeeds("ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch",
                                      ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
     oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",

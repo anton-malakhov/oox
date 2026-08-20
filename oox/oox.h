@@ -2119,11 +2119,61 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
 
 namespace internal {
 
+template <typename T>
+struct default_var_factory {
+    T operator()() const noexcept(std::is_nothrow_default_constructible_v<T>) {
+        return T{};
+    }
+};
+
+template <typename T, bool CanThrow>
+struct unpublished_default_var_task {
+    var<T, CanThrow> value;
+    task_node* node;
+    int protect_count;
+
+    unpublished_default_var_task(var<T, CanThrow>&& v, task_node* n, int count) noexcept
+        : value(std::move(v)), node(n), protect_count(count) {}
+    unpublished_default_var_task(const unpublished_default_var_task&) = delete;
+    unpublished_default_var_task& operator=(const unpublished_default_var_task&) = delete;
+    unpublished_default_var_task(unpublished_default_var_task&& other) noexcept
+        : value(std::move(other.value)),
+          node(std::exchange(other.node, nullptr)),
+          protect_count(other.protect_count) {}
+    ~unpublished_default_var_task() {
+        __OOX_ASSERT_EX(!node, "unpublished default materializer was not published");
+    }
+
+    void publish() {
+        task_node* task = std::exchange(node, nullptr);
+        __OOX_ASSERT_EX(task, "default materializer was already published");
+        task->remove_prerequisite(protect_count);
+    }
+};
+
+template <typename T, bool CanThrow>
+unpublished_default_var_task<T, CanThrow> make_unpublished_default_var_task() {
+    static_assert(policy_value_materializable<T, CanThrow>);
+    using factory_type = default_var_factory<T>;
+    using args_type = base_args<types<>, CanThrow>;
+    using functor_type = oox_bind<factory_type, args_type>;
+    using task_type = functional_task<args_type::write_nodes_count, functor_type, T, CanThrow>;
+
+    auto* task = internal::task::allocate<task_type>(
+        functor_type(factory_type{}, args_type{}));
+    int protect_count = task_node::start_count_mask;
+    task->start_count.store(protect_count, std::memory_order_release);
+    protect_count -= static_cast<storage_task<args_type::write_nodes_count, functor_type>*>(task)
+                         ->value()
+                         .my_args.setup(1, task);
+    auto result = gen_oox<T, CanThrow>::bind_to(task);
+    return unpublished_default_var_task<T, CanThrow>(
+        std::move(result), task, protect_count);
+}
+
 template <typename T, bool CanThrow>
 var<T, CanThrow> make_default_var_task() {
-    return oox::run<CanThrow>([]() noexcept(std::is_nothrow_default_constructible_v<T>) -> T {
-        return T{};
-    });
+    return oox::run<CanThrow>(default_var_factory<T>{});
 }
 
 } // namespace internal

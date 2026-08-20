@@ -206,6 +206,12 @@ testing::AssertionResult completes_within(F&& scenario, const char* timeout_mess
     return testing::AssertionSuccess();
 }
 
+void drain_backend_task_epilogues() {
+#if defined(OOX_USING_TF)
+    oox::internal::get_tf_pool().wait_for_all();
+#endif
+}
+
 } // namespace
 
 /////////////////////////////////////// BASIC API ////////////////////////////////////////
@@ -263,11 +269,38 @@ TEST(SharedVar, LazyMaterializationRunsUserCodeInGraphTasks) {
         const auto constructors_after =
             default_constructor_count.load(std::memory_order_relaxed);
         if (first_value != 2 || second_value != 2
-            || constructors_after < constructors_before + 2) {
+            || constructors_after != constructors_before + 2) {
             throw std::runtime_error("lazy materialization lost a writer or constructor side effect");
         }
     }, "lazy materializer graph tasks did not complete");
     EXPECT_TRUE(completion);
+}
+
+TEST(SharedVar, ConcurrentGetPublishesOneLazyMaterializer) {
+    constexpr int kThreads = 16;
+    const auto constructors_before =
+        default_constructor_count.load(std::memory_order_relaxed);
+    oox::shared_var<counted_default_value> value;
+    std::barrier start(kThreads);
+    std::atomic<int> completed{0};
+    std::vector<std::thread> getters;
+    getters.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        getters.emplace_back([&] {
+            start.arrive_and_wait();
+            if (value.get().value == 0) {
+                completed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& getter : getters) {
+        getter.join();
+    }
+
+    EXPECT_EQ(completed.load(std::memory_order_relaxed), kThreads);
+    EXPECT_EQ(default_constructor_count.load(std::memory_order_relaxed),
+              constructors_before + 1);
 }
 
 TEST(SharedVar, ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch) {
@@ -450,6 +483,7 @@ TEST(SharedVar, SameStateTwiceAsWriter) {
         ++b;
     }, value, value);
     oox::wait_for_all(done);
+    drain_backend_task_epilogues();
     EXPECT_EQ(done.current_task->life_get_count(), 2);
     EXPECT_EQ(value.get(), 2);
 }
@@ -462,6 +496,7 @@ TEST(SharedVar, CopiedStateTwiceAsWriter) {
         ++b;
     }, value, alias);
     oox::wait_for_all(done);
+    drain_backend_task_epilogues();
     EXPECT_EQ(done.current_task->life_get_count(), 2);
     EXPECT_EQ(value.get(), 2);
     EXPECT_EQ(alias.get(), 2);
@@ -500,6 +535,7 @@ TEST(SharedVar, BareLazyThrowingMaterializationIsAsynchronousAndReleasesTask) {
         auto done = oox::run<true>([resource](throwing_default_value&) noexcept {}, value);
         resource.reset();
         EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
+        drain_backend_task_epilogues();
     };
     EXPECT_NO_THROW(scenario());
     EXPECT_TRUE(captured.expired());
@@ -807,6 +843,7 @@ TEST(SharedVar, WriterSwitchWhileGetPending) {
     });
     reader.join();
     writer.join();
+    value.wait();
     const int v = seen.load(std::memory_order_relaxed);
     EXPECT_TRUE(v == 0 || v == 7) << "reader must observe a consistent slot value, got " << v;
 }

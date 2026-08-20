@@ -119,6 +119,17 @@ add_test(NAME ExportedPackageRequiresCxx20
                  -D OOX_BUILD_CONFIG=$<CONFIG>
                  -P ${CMAKE_CURRENT_LIST_DIR}/exported_package_compile.cmake)
 
+add_test(NAME NestedCMakePreservesListValues
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nested_cmake_list_values.cmake)
+
 if (OOX_BUILD_TWIST_TESTS)
   add_subdirectory(twist)
 endif ()

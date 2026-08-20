@@ -90,13 +90,13 @@ the actual registration to a thread-local setup context:
    argument collection, the outer guard detaches its batch before materializing
    values and restores any enclosing batch when a nested run returns.
 3. Every unique empty state is lazily materialized before the multi-state lock
-   set is acquired. Materialization publishes a small graph task outside
-   `mtx`; a short locked compare/install chooses one task if several threads
-   race. `A{}` and the transfer into result storage execute inside that task,
-   under its exception policy. Therefore a slow, re-entrant, or throwing
-   constructor never runs in registration or under state locks. More than one
-   candidate task (and thus more than one constructor side effect) may occur in
-   that first-materialization race, but exactly one value is installed.
+   set is acquired. The first caller creates an unpublished materializer while
+   holding that state's mutex, installs it as `inner`, releases the mutex, and
+   only then publishes the task. `A{}` and the transfer into result storage
+   execute inside that task, under its exception policy. Therefore a slow,
+   re-entrant, or throwing constructor never runs in registration or under
+   state locks, while racing callers observe the installed task and cannot
+   create losing materializers or duplicate constructor side effects.
 4. All involved states are locked **in canonical (address-sorted) order** and
    registrations are grouped by state and applied as one atomic unit. If
    several arguments alias one state, one writer registration (or one reader
