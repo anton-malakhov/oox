@@ -128,6 +128,7 @@ if (OOX_ENABLE_EIGEN)
                    -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                    -D OOX_GENERATOR=${CMAKE_GENERATOR}
                    -D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+                   -D OOX_PACKAGE_DIR=${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
                    -D OOX_CONFIG=$<CONFIG>
                    -D OOX_MULTI_CONFIG=${OOX_MULTI_CONFIG}
                    -D OOX_EXE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}

@@ -11,12 +11,17 @@ if (NOT install_result EQUAL 0)
   message(FATAL_ERROR "OOX install failed: ${install_result}")
 endif ()
 
+set(package_dir "${install_dir}/${OOX_PACKAGE_DIR}")
+if (NOT EXISTS "${package_dir}/OOXConfig.cmake")
+  message(FATAL_ERROR "OOX package config was not installed to ${package_dir}")
+endif ()
+
 execute_process(
   COMMAND "${CMAKE_COMMAND}"
           -S "${OOX_SOURCE_DIR}/tests/package_consumer"
           -B "${consumer_build_dir}"
           -G "${OOX_GENERATOR}"
-          -D "CMAKE_PREFIX_PATH=${install_dir}"
+          -D "OOX_DIR=${package_dir}"
           -D "CMAKE_CXX_COMPILER=${OOX_CXX_COMPILER}"
           -D CMAKE_CXX_EXTENSIONS=OFF
   RESULT_VARIABLE configure_result)
