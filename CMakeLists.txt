@@ -224,7 +224,7 @@ configure_package_config_file(
         ${PROJECT_NAME}Config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
         INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-        PATH_VARS CMAKE_INSTALL_FULL_INCLUDEDIR
+        PATH_VARS CMAKE_INSTALL_INCLUDEDIR
 )
 
 write_basic_package_version_file(
