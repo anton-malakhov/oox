@@ -51,7 +51,7 @@ int Fib(int n, tf::Subflow& sbf) {  // TaskFlow: High-level blocking style progr
 - `oox::var<T>`: Basic representation of data in the OOX graph. In concept, a new form of `std::future` for continuations. It carries both: a value and dependency info
   - `using oox::node = oox::var<void>`: carries solely dependency info
 - `oox::var<T> oox::run(T(Func&)(...), Args...)`: Basic tasking API, spawns a task when arguments are ready and returns `oox::var` as a promise to provide the result of Func in future. If there are `oox::var` arguments, which are not ready yet (i.e. they are "promises" themselves), it makes a continuation task, which depends on completion of pending `oox::var` arguments.
-- `oox::shared_var<T>`: thread-safe, copyable counterpart of `oox::var`. Multiple threads may safely register readers/writers through `oox::run`, call `get()`/`wait()`, copy, or assign it. Writer serialization across threads is guaranteed. `T` must be default-constructible, cannot itself be a `shared_var`, and `get()` returns a copy. Value assignment requires the matching copy/move construction and assignment operations (see `docs/design-shared-var.md`).
+- `oox::shared_var<T>`: thread-safe, copyable counterpart of `oox::var`. Multiple threads may safely register readers/writers through `oox::run`, call `get()`/`wait()`, copy, or assign it. Writer serialization across threads is guaranteed. `T` must be default-constructible, cannot itself be a `shared_var`, and `get()` returns a copy. Value assignment requires the matching copy/move construction and assignment operations; assignment must be `noexcept` when `CanThrow == false` (see `docs/design-shared-var.md`).
 
 ## Design
 Pillars:

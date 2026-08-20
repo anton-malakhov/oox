@@ -185,6 +185,24 @@ void MutableAliasesShareOneWriterRegistration() {
                    "reader/writer aliases share the writer registration and storage");
 }
 
+void DeferredMixedAliasesMaterializeBeforeEveryArgument() {
+    oox::shared_var<int> read_first(oox::deferred);
+    auto first = oox::run([](int old, int& out) noexcept {
+        twist::assist::PreemptionPoint();
+        out = old + 1;
+    }, read_first, read_first);
+    oox::wait_for_all(first);
+    TWIST_ASSERT_M(read_first.get() == 1, "read-first alias observes materialized writer storage");
+
+    oox::shared_var<int> write_first(oox::deferred);
+    auto second = oox::run([](int& out, int old) noexcept {
+        twist::assist::PreemptionPoint();
+        out = old + 1;
+    }, write_first, write_first);
+    oox::wait_for_all(second);
+    TWIST_ASSERT_M(write_first.get() == 1, "write-first alias preserves the same semantics");
+}
+
 void FailedWaiterSubscriptionReleasesArc() {
     oox::var<int> ready(1);
     auto* waiter = oox::internal::task::allocate<oox::internal::shared_var_waiter>();
@@ -408,6 +426,8 @@ int main() {
                                      ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
     oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",
                                      MutableAliasesShareOneWriterRegistration);
+    oox::twist_tests::RunRandomSeeds("DeferredMixedAliasesMaterializeBeforeEveryArgument",
+                                     DeferredMixedAliasesMaterializeBeforeEveryArgument);
     oox::twist_tests::RunRandomSeeds("FailedWaiterSubscriptionReleasesArc",
                                      FailedWaiterSubscriptionReleasesArc);
     oox::twist_tests::RunRandomSeeds("ConcurrentReaderAndWriterRegistration", ConcurrentReaderAndWriterRegistration);

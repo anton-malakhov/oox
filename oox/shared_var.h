@@ -77,6 +77,7 @@ using shared_var_mutex = std::mutex;
 struct shared_var_storage {
     void* ptr = nullptr;
     bool forwarded = false;
+    bool initialize_if_empty = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,9 +119,10 @@ struct shared_var_registration {
             count = state->preregister_reader(self, port);
         }
         *my_storage = state->capture_storage();
+        my_storage->initialize_if_empty = is_writer;
     }
 
-    void discard_alias() {
+    void discard_alias(const shared_var_storage& primary_storage) {
         if (is_writer) {
             __OOX_ASSERT(self->out(port).next_writer.load(std::memory_order_acquire) == nullptr,
                          "aliased writer output was already registered");
@@ -128,7 +130,7 @@ struct shared_var_registration {
                                               std::memory_order_release);
         }
         count = 0;
-        *my_storage = state->capture_storage();
+        *my_storage = primary_storage;
     }
 };
 
@@ -184,7 +186,7 @@ struct shared_var_setup_context {
             primary.apply();
             for (auto& op : ops) {
                 if (op.state.get() == state && &op != &primary) {
-                    op.discard_alias();
+                    op.discard_alias(*primary.my_storage);
                 }
             }
         }
@@ -359,24 +361,14 @@ struct shared_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...
     // producer's write before this read, and the storage slot is kept alive by
     // the owning shared state.
     C&& consume() {
-        void* state_ptr = nullptr;
-        if (my_storage.forwarded) {
-            oox_var_base* base = static_cast<oox_var_base*>(my_storage.ptr);
-            while (base->current_port_and_flags.is_forwarded) {
-                __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage pointer");
-                base = static_cast<oox_var_base*>(base->storage_ptr);
-            }
-            state_ptr = base->storage_ptr;
-        } else {
-            state_ptr = my_storage.ptr;
-        }
+        const internal::var_storage storage{
+            my_storage.ptr, my_storage.forwarded, my_storage.initialize_if_empty};
+        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow>(storage);
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
-        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
-            if (!state->has_value()) {
-                state->emplace(); // requires default-constructible T
-            }
+        if (my_storage.initialize_if_empty && !state->has_value()) {
+            state->emplace(); // requires default-constructible T
         }
         __OOX_ASSERT_EX(state->has_value(), "read from empty result_state");
         return static_cast<C&&>(state->value());
@@ -582,21 +574,21 @@ public:
     shared_var& operator=(shared_var&&) noexcept = default;
 
     // Write through the same shared registration path as every other writer.
-    shared_var& operator=(const T& t) requires internal::copy_value_assignable<T> {
+    shared_var& operator=(const T& t) requires internal::policy_copy_value_assignable<T, CanThrow> {
         auto value = std::make_shared<T>(t);
-        run<CanThrow>([value = std::move(value)](T& target) noexcept(!CanThrow) {
+        run<CanThrow>([value = std::move(value)](T& target) noexcept(std::is_nothrow_copy_assignable_v<T>) {
             target = *value;
         }, *this);
         return *this;
     }
-    shared_var& operator=(const T&) requires (!internal::copy_value_assignable<T>) = delete;
-    shared_var& operator=(T&& t) requires internal::move_value_assignable<T> {
-        run<CanThrow>([value = std::move(t)](T& target) mutable noexcept(!CanThrow) {
+    shared_var& operator=(const T&) requires (!internal::policy_copy_value_assignable<T, CanThrow>) = delete;
+    shared_var& operator=(T&& t) requires internal::policy_move_value_assignable<T, CanThrow> {
+        run<CanThrow>([value = std::move(t)](T& target) mutable noexcept(std::is_nothrow_move_assignable_v<T>) {
             target = std::move(value);
         }, *this);
         return *this;
     }
-    shared_var& operator=(T&&) requires (!internal::move_value_assignable<T>) = delete;
+    shared_var& operator=(T&&) requires (!internal::policy_move_value_assignable<T, CanThrow>) = delete;
 
     // Wait for the current slot and return a copy of its value.
     // Safe to call from any number of threads concurrently.

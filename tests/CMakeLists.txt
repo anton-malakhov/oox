@@ -79,6 +79,16 @@ if (OOX_EXCEPTIONS_ENABLED)
                    -P ${CMAKE_CURRENT_LIST_DIR}/exception_policy_compile.cmake)
 endif ()
 
+add_test(NAME ExportedPackageRequiresCxx20
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 -D OOX_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
+                 -D OOX_GENERATOR=${CMAKE_GENERATOR}
+                 -D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+                 -D OOX_BUILD_CONFIG=$<CONFIG>
+                 -P ${CMAKE_CURRENT_LIST_DIR}/exported_package_compile.cmake)
+
 if (OOX_BUILD_TWIST_TESTS)
   add_subdirectory(twist)
 endif ()

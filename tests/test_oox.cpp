@@ -73,6 +73,23 @@ struct copy_only_value {
     copy_only_value& operator=(copy_only_value&&) = delete;
 };
 
+#if OOX_EXCEPTIONS_ENABLED
+struct throwing_var_assignment_value {
+    int value = 0;
+
+    throwing_var_assignment_value() = default;
+    explicit throwing_var_assignment_value(int v) : value(v) {}
+    throwing_var_assignment_value(const throwing_var_assignment_value&) = default;
+    throwing_var_assignment_value(throwing_var_assignment_value&&) = default;
+    throwing_var_assignment_value& operator=(const throwing_var_assignment_value&) {
+        throw std::runtime_error("copy assignment failed");
+    }
+    throwing_var_assignment_value& operator=(throwing_var_assignment_value&&) {
+        throw std::runtime_error("move assignment failed");
+    }
+};
+#endif
+
 TEST(OOX, Simple) {
     const oox::var<int> a = oox::run(plus, 2, 3);
     oox::var<int> b = oox::run(plus, 1, a);
@@ -896,6 +913,31 @@ TEST(OOX, ExceptionForwardingThrowsBeforeReturningVar) {
     oox::var<int> r = oox::run(bad_forward, a);
 
     EXPECT_THROW(oox::wait_and_get(r), dummy_exception);
+}
+
+TEST(OOX, ExceptionForwardedFailureCanBeRecovered) {
+    auto written = oox::run<true>([]() -> oox::var<int, true> {
+        throw dummy_exception{};
+    });
+    oox::run<true>([](int& value) { value = 42; }, written);
+    EXPECT_EQ(oox::wait_and_get(written), 42);
+
+    auto assigned = oox::run<true>([]() -> oox::var<int, true> {
+        throw dummy_exception{};
+    });
+    assigned = 43;
+    EXPECT_EQ(oox::wait_and_get(assigned), 43);
+}
+
+TEST(OOX, ExceptionThrowingValueAssignmentPropagates) {
+    oox::var<throwing_var_assignment_value, true> copied(throwing_var_assignment_value{1});
+    const throwing_var_assignment_value replacement(2);
+    copied = replacement;
+    EXPECT_THROW((void)oox::wait_and_get(copied), oox::cancelled_by_exception);
+
+    oox::var<throwing_var_assignment_value, true> moved(throwing_var_assignment_value{1});
+    moved = throwing_var_assignment_value{2};
+    EXPECT_THROW((void)oox::wait_and_get(moved), oox::cancelled_by_exception);
 }
 
 TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {

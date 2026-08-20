@@ -193,9 +193,12 @@ does not invoke synchronous continuations while `mtx` is held. Concurrent
 assignments are writer-chain ordered; the last registered assignment wins.
 
 The `const T&` overload requires copy construction plus copy assignment. The
-`T&&` overload requires move construction plus move assignment. Deleted
-negative overloads prevent implicit conversion through `var(T)` or
-`shared_var(T)` from bypassing those constraints. Plain `oox::var` value
+`T&&` overload requires move construction plus move assignment. With a
+non-throwing policy (`CanThrow == false`), the selected assignment operation
+must additionally be `noexcept`; a potentially throwing assignment is accepted
+only by `CanThrow == true` and becomes graph failure instead of terminating the
+process. Deleted negative overloads prevent implicit conversion through
+`var(T)` or `shared_var(T)` from bypassing those constraints. Plain `oox::var` value
 assignment uses the analogous writer task when the var already has a slot. A
 copy-assignment payload has shared ownership so the task functor remains
 movable even when `T` itself is copy-only.
@@ -226,8 +229,8 @@ public:
     shared_var(shared_var&&) noexcept;
     shared_var& operator=(shared_var&&) noexcept;
 
-    shared_var& operator=(const T&);          // copy-constructible + copy-assignable T
-    shared_var& operator=(T&&);               // move-constructible + move-assignable T
+    shared_var& operator=(const T&);          // copy construct/assign; noexcept assign if !CanThrow
+    shared_var& operator=(T&&);               // move construct/assign; noexcept assign if !CanThrow
 
     [[nodiscard]] T get() const;             // copy; requires copyable T
     void wait() const;
@@ -258,7 +261,8 @@ Access categories through `oox::run` are the same as for `var`:
   `run` registration, `get`, `wait`, `cancel`, assignment, copy.
 - `T` must be default-constructible and cannot itself be a `shared_var`
   specialization. Value assignment additionally requires the matching
-  constructible-and-assignable concept.
+  constructible-and-assignable concept, with nothrow assignment under a
+  non-throwing policy.
 - Writer chain order for concurrently registered writers is linearized by the
   mutex; every reader observes a value from the chain consistent with that
   order (same model as single-threaded `var`, now with a lock-defined total

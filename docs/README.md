@@ -219,7 +219,7 @@ machinery: failed tasks propagate through the graph and `get()` rethrows.
 
 ## 4. Build
 
-Requirements: CMake ≥ 3.14, a C++17/20 compiler, GTest, Google Benchmark,
+Requirements: CMake ≥ 3.14, a C++20 compiler, GTest, Google Benchmark,
 optionally TBB / TaskFlow / Folly / OpenMP / Twist.
 
 ```sh

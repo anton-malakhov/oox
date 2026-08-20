@@ -18,6 +18,35 @@ struct DummyException final : std::exception {
     }
 };
 
+struct throwing_assignment_value {
+    int value = 0;
+
+    throwing_assignment_value() = default;
+    explicit throwing_assignment_value(int v) : value(v) {}
+    throwing_assignment_value(const throwing_assignment_value&) = default;
+    throwing_assignment_value(throwing_assignment_value&&) = default;
+    throwing_assignment_value& operator=(const throwing_assignment_value&) {
+        throw DummyException{};
+    }
+    throwing_assignment_value& operator=(throwing_assignment_value&&) {
+        throw DummyException{};
+    }
+};
+
+template <typename Var, typename Value>
+concept supports_value_assignment = requires(Var& var, Value&& value) {
+    var = std::forward<Value>(value);
+};
+
+static_assert(!supports_value_assignment<oox::var<throwing_assignment_value, false>,
+                                         throwing_assignment_value>);
+static_assert(!supports_value_assignment<oox::shared_var<throwing_assignment_value, false>,
+                                         throwing_assignment_value>);
+static_assert(supports_value_assignment<oox::var<throwing_assignment_value, true>,
+                                        throwing_assignment_value>);
+static_assert(supports_value_assignment<oox::shared_var<throwing_assignment_value, true>,
+                                        throwing_assignment_value>);
+
 template <typename Exception, typename F>
 void ExpectThrows(F&& f, const char* message) {
     bool seen = false;
@@ -212,6 +241,34 @@ void SharedVarForwardedProducerExceptionPropagates() {
                    "dependent body must not run after forwarded producer failure");
 }
 
+void ForwardedProducerFailureCanBeRecovered() {
+    auto plain = oox::run<true>([]() -> oox::var<int, true> {
+        throw DummyException{};
+    });
+    oox::run<true>([](int& value) { value = 41; }, plain);
+    TWIST_ASSERT_M(oox::wait_and_get(plain) == 41, "plain var writer recovers failed forwarding");
+
+    auto failed_shared = oox::run<true>([]() -> oox::var<int, true> {
+        throw DummyException{};
+    });
+    oox::shared_var<int, true> shared(std::move(failed_shared));
+    shared = 42;
+    TWIST_ASSERT_M(shared.get() == 42, "shared_var assignment recovers failed forwarding");
+}
+
+void ThrowingValueAssignmentPropagates() {
+    oox::var<throwing_assignment_value, true> plain(throwing_assignment_value{1});
+    plain = throwing_assignment_value{2};
+    ExpectThrows<oox::cancelled_by_exception>([&] { (void)oox::wait_and_get(plain); },
+                                              "throwing var assignment must cancel its output");
+
+    oox::shared_var<throwing_assignment_value, true> shared(throwing_assignment_value{1});
+    const throwing_assignment_value replacement(2);
+    shared = replacement;
+    ExpectThrows<oox::cancelled_by_exception>([&] { (void)shared.get(); },
+                                              "throwing shared_var assignment must cancel its output");
+}
+
 void SharedVarCancellationPropagates() {
     oox::shared_var<int, true> gate(oox::deferred);
     auto producer = oox::run<true>([](int input) { return input + 1; }, gate);
@@ -293,6 +350,10 @@ int main() {
     oox::twist_tests::RunRandomSeeds("SharedVarExceptionWakesWaiter", SharedVarExceptionWakesWaiter);
     oox::twist_tests::RunRandomSeeds("SharedVarForwardedProducerExceptionPropagates",
                                      SharedVarForwardedProducerExceptionPropagates);
+    oox::twist_tests::RunRandomSeeds("ForwardedProducerFailureCanBeRecovered",
+                                     ForwardedProducerFailureCanBeRecovered);
+    oox::twist_tests::RunRandomSeeds("ThrowingValueAssignmentPropagates",
+                                     ThrowingValueAssignmentPropagates);
     oox::twist_tests::RunRandomSeeds("SharedVarCancellationPropagates", SharedVarCancellationPropagates);
     oox::twist_tests::RunRandomSeeds("WaitStatusNoThrowRethrowsOriginalForProducer",
                                      WaitStatusNoThrowRethrowsOriginalForProducer);

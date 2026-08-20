@@ -46,6 +46,21 @@ struct copy_only_value {
     copy_only_value& operator=(copy_only_value&&) = delete;
 };
 
+struct throwing_assignment_value {
+    int value = 0;
+
+    throwing_assignment_value() = default;
+    explicit throwing_assignment_value(int v) : value(v) {}
+    throwing_assignment_value(const throwing_assignment_value&) = default;
+    throwing_assignment_value(throwing_assignment_value&&) = default;
+    throwing_assignment_value& operator=(const throwing_assignment_value&) {
+        throw std::runtime_error("copy assignment failed");
+    }
+    throwing_assignment_value& operator=(throwing_assignment_value&&) {
+        throw std::runtime_error("move assignment failed");
+    }
+};
+
 template <typename Var, typename Value>
 concept supports_value_assignment = requires(Var& var, Value&& value) {
     var = std::forward<Value>(value);
@@ -53,7 +68,17 @@ concept supports_value_assignment = requires(Var& var, Value&& value) {
 
 static_assert(!supports_value_assignment<oox::var<non_assignable_value>, non_assignable_value>);
 static_assert(!supports_value_assignment<oox::shared_var<non_assignable_value>, non_assignable_value>);
+static_assert(!supports_value_assignment<oox::var<throwing_assignment_value, false>,
+                                         throwing_assignment_value>);
+static_assert(!supports_value_assignment<oox::shared_var<throwing_assignment_value, false>,
+                                         throwing_assignment_value>);
 static_assert(!oox::internal::shareable_value<oox::shared_var<int>>);
+#if OOX_EXCEPTIONS_ENABLED
+static_assert(supports_value_assignment<oox::var<throwing_assignment_value, true>,
+                                        throwing_assignment_value>);
+static_assert(supports_value_assignment<oox::shared_var<throwing_assignment_value, true>,
+                                        throwing_assignment_value>);
+#endif
 
 std::barrier<>* default_constructor_gate = nullptr;
 oox::shared_var<int>* default_constructor_side_effect = nullptr;
@@ -357,6 +382,20 @@ TEST(SharedVar, SameStateAsReaderAndWriterUsesOneRegistration) {
     EXPECT_EQ(value.get(), 6);
 }
 
+TEST(SharedVar, DeferredMixedAliasesMaterializeBeforeEveryArgument) {
+    oox::shared_var<int> read_first(oox::deferred);
+    auto first = oox::run([](int old, int& out) noexcept { out = old + 1; },
+                          read_first, read_first);
+    oox::wait_for_all(first);
+    EXPECT_EQ(read_first.get(), 1);
+
+    oox::shared_var<int> write_first(oox::deferred);
+    auto second = oox::run([](int& out, int old) noexcept { out = old + 1; },
+                           write_first, write_first);
+    oox::wait_for_all(second);
+    EXPECT_EQ(write_first.get(), 1);
+}
+
 #if OOX_EXCEPTIONS_ENABLED
 TEST(SharedVar, ExceptionWakesWaiterAndRethrows) {
 #if defined(OOX_USING_SERIAL)
@@ -387,6 +426,34 @@ TEST(SharedVar, ForwardedProducerExceptionRethrows) {
     EXPECT_THROW((void)value.get(), shared_var_test_error);
     EXPECT_THROW((void)oox::wait_and_get(dependent), shared_var_test_error);
     EXPECT_FALSE(dependent_ran.load(std::memory_order_relaxed));
+}
+
+TEST(SharedVar, ForwardedProducerFailureCanBeRecovered) {
+    auto failed_writer = oox::run<true>([]() -> oox::var<int, true> {
+        throw shared_var_test_error{};
+    });
+    oox::shared_var<int, true> written(std::move(failed_writer));
+    auto recovery = oox::run<true>([](int& value) { value = 42; }, written);
+    oox::wait_for_all(recovery);
+    EXPECT_EQ(written.get(), 42);
+
+    auto failed_assignment = oox::run<true>([]() -> oox::var<int, true> {
+        throw shared_var_test_error{};
+    });
+    oox::shared_var<int, true> assigned(std::move(failed_assignment));
+    assigned = 43;
+    EXPECT_EQ(assigned.get(), 43);
+}
+
+TEST(SharedVar, ThrowingValueAssignmentPropagates) {
+    oox::shared_var<throwing_assignment_value, true> copied(throwing_assignment_value{1});
+    const throwing_assignment_value replacement(2);
+    copied = replacement;
+    EXPECT_THROW((void)copied.get(), oox::cancelled_by_exception);
+
+    oox::shared_var<throwing_assignment_value, true> moved(throwing_assignment_value{1});
+    moved = throwing_assignment_value{2};
+    EXPECT_THROW((void)moved.get(), oox::cancelled_by_exception);
 }
 
 TEST(SharedVar, CancellationPropagatesThroughWaiter) {
