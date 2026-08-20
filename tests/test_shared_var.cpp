@@ -320,15 +320,17 @@ TEST(SharedVar, ConcurrentGetPublishesOneLazyMaterializer) {
 }
 
 #if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
-TEST(SharedVar, PublicationFailureExecutesInstalledMaterializerInline) {
+TEST(SharedVar, ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline) {
     std::atomic<bool> fallback_started{false};
     std::atomic<bool> release_fallback{false};
-    std::atomic<bool> spawn_failure{false};
+    std::atomic<bool> waiter_subscribed{false};
+    std::atomic<unsigned> spawn_failures{0};
     publication_fallback_started = &fallback_started;
     publication_fallback_release = &release_fallback;
     oox::shared_var<publication_fallback_value> value;
 
-    oox::internal::inject_next_task_spawn_failure(spawn_failure);
+    oox::internal::observe_shared_var_waiter_subscription(waiter_subscribed);
+    oox::internal::inject_task_spawn_failures(spawn_failures, 2);
     auto publisher = std::async(std::launch::async, [&] {
         try {
             (void)value.get();
@@ -345,12 +347,10 @@ TEST(SharedVar, PublicationFailureExecutesInstalledMaterializerInline) {
     }
     ASSERT_TRUE(fallback_started.load(std::memory_order_acquire));
 
-    std::atomic<bool> waiter_entered{false};
     auto waiter = std::async(std::launch::async, [&] {
-        waiter_entered.store(true, std::memory_order_release);
         return value.get().value;
     });
-    while (!waiter_entered.load(std::memory_order_acquire)) {
+    while (!waiter_subscribed.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
     EXPECT_EQ(waiter.wait_for(20ms), std::future_status::timeout);
@@ -360,6 +360,7 @@ TEST(SharedVar, PublicationFailureExecutesInstalledMaterializerInline) {
     ASSERT_EQ(waiter.wait_for(k_async_test_timeout), std::future_status::ready);
     EXPECT_EQ(waiter.get(), 42);
     EXPECT_EQ(value.get().value, 42);
+    EXPECT_EQ(spawn_failures.load(std::memory_order_acquire), 0u);
     oox::internal::clear_task_spawn_failure_injection();
     publication_fallback_started = nullptr;
     publication_fallback_release = nullptr;

@@ -32,6 +32,25 @@ function(expect_compile case_name expected macro_value)
   endif ()
 endfunction()
 
+function(expect_no_compiler_exceptions_compile)
+  if (MSVC)
+    set(no_exceptions_flag "/EHs-c-")
+  else ()
+    set(no_exceptions_flag "-fno-exceptions")
+  endif ()
+  try_compile(result
+              "${CMAKE_BINARY_DIR}/shared_var_no_compiler_exceptions"
+              "${OOX_SOURCE_DIR}/tests/compile_cases/shared_var_no_compiler_exceptions.cpp"
+              COMPILE_DEFINITIONS
+                "-I${OOX_SOURCE_DIR}"
+                "-DOOX_EXCEPTIONS_ENABLED=0"
+                "${no_exceptions_flag}"
+              OUTPUT_VARIABLE output)
+  if (NOT result)
+    message(FATAL_ERROR "Expected shared_var to compile without compiler exceptions:\n${output}")
+  endif ()
+endfunction()
+
 foreach (macro_value 0 1)
   expect_compile(nonthrow_consume_ok TRUE ${macro_value})
   expect_compile(nonthrow_consume_fail_default FALSE ${macro_value})
@@ -39,6 +58,8 @@ foreach (macro_value 0 1)
   expect_compile(nonthrow_consume_fail_cross_type FALSE ${macro_value})
   expect_compile(shared_var_fail_immovable FALSE ${macro_value})
 endforeach ()
+
+expect_no_compiler_exceptions_compile()
 ]=])
 
 execute_process(COMMAND ${CMAKE_COMMAND}

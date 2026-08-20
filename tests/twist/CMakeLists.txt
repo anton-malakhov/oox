@@ -54,6 +54,9 @@ oox_add_twist_exception_test(test_twist_exception_coverage test_twist_exception_
 oox_add_twist_test(test_twist_shared_var test_twist_shared_var.cpp)
 target_compile_definitions(test_twist_shared_var
         PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+oox_add_twist_exception_test(test_twist_shared_var_exceptions test_twist_shared_var.cpp)
+target_compile_definitions(test_twist_shared_var_exceptions
+        PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
 
 if (TWIST_SIM)
   oox_add_twist_test(test_twist_known_deferred_race test_twist_known_deferred_race.cpp)

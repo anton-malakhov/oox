@@ -239,18 +239,19 @@ void ConcurrentGetPublishesOneLazyMaterializer() {
     materialization_side_effect = nullptr;
 }
 
-void PublicationFailureExecutesInstalledMaterializerInline() {
+void ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline() {
     twist::ed::std::atomic<bool> fallback_started{false};
     twist::ed::std::atomic<bool> release_fallback{false};
-    twist::ed::std::atomic<bool> waiter_entered{false};
+    twist::ed::std::atomic<bool> waiter_subscribed{false};
     twist::ed::std::atomic<bool> publisher_caught{false};
-    twist::ed::std::atomic<bool> spawn_failure{false};
+    twist::ed::std::atomic<unsigned> spawn_failures{0};
     publication_fallback_started = &fallback_started;
     publication_fallback_release = &release_fallback;
     oox::shared_var<publication_fallback_value> value;
     twist::test::body::WaitGroup wg;
 
-    oox::internal::inject_next_task_spawn_failure(spawn_failure);
+    oox::internal::observe_shared_var_waiter_subscription(waiter_subscribed);
+    oox::internal::inject_task_spawn_failures(spawn_failures, 2);
     wg.Add(1, [&] {
         try {
             (void)value.get();
@@ -262,11 +263,10 @@ void PublicationFailureExecutesInstalledMaterializerInline() {
         while (!fallback_started.load(std::memory_order_acquire)) {
             twist::ed::std::this_thread::yield();
         }
-        waiter_entered.store(true, std::memory_order_release);
         TWIST_ASSERT_M(value.get().value == 42, "concurrent waiter completes");
     });
     wg.Add(1, [&] {
-        while (!waiter_entered.load(std::memory_order_acquire)) {
+        while (!waiter_subscribed.load(std::memory_order_acquire)) {
             twist::ed::std::this_thread::yield();
         }
         twist::assist::PreemptionPoint();
@@ -276,6 +276,8 @@ void PublicationFailureExecutesInstalledMaterializerInline() {
 
     TWIST_ASSERT_M(publisher_caught.load(std::memory_order_acquire),
                    "first get observes the backend publication failure");
+    TWIST_ASSERT_M(spawn_failures.load(std::memory_order_acquire) == 0,
+                   "materializer and attached waiter submissions were rejected");
     TWIST_ASSERT_M(value.get().value == 42, "retry observes the inline materialized value");
     oox::internal::clear_task_spawn_failure_injection();
     publication_fallback_started = nullptr;
@@ -568,8 +570,8 @@ int main() {
                                      ConcurrentLazyMaterializationRunsInGraphTasks);
     oox::twist_tests::RunRandomSeeds("ConcurrentGetPublishesOneLazyMaterializer",
                                      ConcurrentGetPublishesOneLazyMaterializer);
-    oox::twist_tests::RunRandomSeeds("PublicationFailureExecutesInstalledMaterializerInline",
-                                     PublicationFailureExecutesInstalledMaterializerInline);
+    oox::twist_tests::RunRandomSeeds("ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline",
+                                     ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline);
     oox::twist_tests::RunRandomSeeds("ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch",
                                      ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch);
     oox::twist_tests::RunRandomSeeds("MutableAliasesShareOneWriterRegistration",

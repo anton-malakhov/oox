@@ -48,7 +48,8 @@
 //   - lazy T{} construction runs in a graph task outside state locks;
 //   - racing first materializations install and publish exactly one task;
 //   - if backend submission of that installed task throws, it is completed
-//     synchronously before the submission exception escapes;
+//     synchronously before the submission exception escapes; attached tasks
+//     rejected while notifying its arcs are also completed inline;
 //   - run<false> writer materialization requirements are conservative even for
 //     a particular state that is already initialized;
 //   - an adopted forwarded var is resolved after its producer completes;
@@ -285,6 +286,11 @@ struct shared_var_waiter : task_node {
     bool subscribe(task_node* producer) {
         auto* successor = new arc(this, 0, arc::flow_only);
         if (producer->add_arc(successor)) {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+            if (shared_var_waiter_subscribed_flag) {
+                shared_var_waiter_subscribed_flag->store(true, std::memory_order_release);
+            }
+#endif
             return true;
         }
         delete successor;
@@ -295,6 +301,10 @@ struct shared_var_waiter : task_node {
         execute_lifetime_guard oox_waiter_lifetime_guard{this};
         wakeup(); // the backend's own waiter-release (pool-native)
         return nullptr;
+    }
+    void execute_inline_after_spawn_failure() override {
+        execute_lifetime_guard oox_waiter_lifetime_guard{this};
+        wakeup();
     }
 #if OOX_EXCEPTIONS_ENABLED
     void notify_successors_virtual() override {

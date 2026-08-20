@@ -21,6 +21,18 @@
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif
 
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#define OOX_COMPILER_EXCEPTIONS_AVAILABLE 1
+#else
+#define OOX_COMPILER_EXCEPTIONS_AVAILABLE 0
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define OOX_COLD_ATTRIBUTE [[gnu::cold]]
+#else
+#define OOX_COLD_ATTRIBUTE
+#endif
+
 #if HAVE_TWIST
 #include <mutex>
 #include <twist/assist/assert.hpp>
@@ -153,21 +165,34 @@ inline void preemption_point() {}
 
 #if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
 struct injected_task_spawn_failure {};
-inline sync::atomic<bool>* task_spawn_failure_flag = nullptr;
+inline sync::atomic<unsigned>* task_spawn_failures_remaining = nullptr;
+inline sync::atomic<bool>* shared_var_waiter_subscribed_flag = nullptr;
 
-inline void inject_next_task_spawn_failure(sync::atomic<bool>& flag) {
-    task_spawn_failure_flag = &flag;
-    flag.store(true, std::memory_order_release);
+inline void inject_task_spawn_failures(sync::atomic<unsigned>& remaining, unsigned count) {
+    task_spawn_failures_remaining = &remaining;
+    remaining.store(count, std::memory_order_release);
+}
+
+inline void observe_shared_var_waiter_subscription(sync::atomic<bool>& subscribed) {
+    shared_var_waiter_subscribed_flag = &subscribed;
+    subscribed.store(false, std::memory_order_release);
 }
 
 inline void clear_task_spawn_failure_injection() {
-    task_spawn_failure_flag = nullptr;
+    task_spawn_failures_remaining = nullptr;
+    shared_var_waiter_subscribed_flag = nullptr;
 }
 
 inline void maybe_inject_task_spawn_failure() {
-    if (task_spawn_failure_flag
-        && task_spawn_failure_flag->exchange(false, std::memory_order_acq_rel)) {
-        throw injected_task_spawn_failure{};
+    if (task_spawn_failures_remaining) {
+        unsigned remaining = task_spawn_failures_remaining->load(std::memory_order_acquire);
+        while (remaining != 0) {
+            if (task_spawn_failures_remaining->compare_exchange_weak(
+                    remaining, remaining - 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                throw injected_task_spawn_failure{};
+            }
+        }
     }
 }
 #endif
@@ -913,6 +938,11 @@ struct task_node : public task, arc_list {
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
     // Account for completion of n prerequisites
     void remove_prerequisite( int n=1 );
+    // A backend rejected this ready task before accepting ownership. Execute
+    // it synchronously so its visible graph node still reaches completion.
+    OOX_COLD_ATTRIBUTE virtual void execute_inline_after_spawn_failure() {
+        __OOX_ASSERT(false, "task cannot be submitted or executed inline");
+    }
     // Process next writer notification
     int  notify_next_writer( task_node* d );
     // Account for removal of a back_arc
@@ -1200,7 +1230,17 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 n->publish_failure_from(this, arc_port);
             }
 #endif
+#if OOX_COMPILER_EXCEPTIONS_AVAILABLE && !defined(OOX_USING_SERIAL)
+            try {
+                n->remove_prerequisite();
+            } catch (...) {
+                // An attached successor has no publication caller to recover
+                // it. Complete it inline and continue the detached arc list.
+                n->execute_inline_after_spawn_failure();
+            }
+#else
             n->remove_prerequisite();
+#endif
         }
         if (delete_arc) {
             delete j;
@@ -1906,11 +1946,12 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
             }
             try {
                 invoke_and_store();
-                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
+                return nullptr;
             }
+            task_node::notify_successors<slots, false>();
         } else
 #endif
         {
@@ -1922,8 +1963,7 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
 
     // Keep the fallback separate from execute(): ordinary run() task
     // specializations must not acquire another call in their execution path.
-    // This body is instantiated only for an installed lazy materializer.
-    void execute_after_publication_failure() {
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
@@ -1933,11 +1973,12 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
             }
             try {
                 invoke_and_store();
-                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
+                return;
             }
+            task_node::notify_successors<slots, false>();
         } else
 #endif
         {
@@ -1947,19 +1988,16 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
     }
 
     void publish_installed(int protect_count) {
-#if defined(OOX_USING_SERIAL)
-        this->remove_prerequisite(protect_count);
-#else
+#if OOX_COMPILER_EXCEPTIONS_AVAILABLE && !defined(OOX_USING_SERIAL)
         try {
             this->remove_prerequisite(protect_count);
         } catch (...) {
-            // A throwing backend submission has not accepted the task. Complete
-            // the already-visible graph node inline so registered successors
-            // reach a terminal state, then preserve the caller-visible error.
             auto publication_failure = std::current_exception();
-            execute_after_publication_failure();
+            execute_inline_after_spawn_failure();
             std::rethrow_exception(publication_failure);
         }
+#else
+        this->remove_prerequisite(protect_count);
 #endif
     }
     ~functional_task() {
@@ -1985,11 +2023,12 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
             }
             try {
                 this->functor_base::value()();
-                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
+                return nullptr;
             }
+            task_node::notify_successors<slots, false>();
         } else
 #endif
         {
@@ -1997,6 +2036,29 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
             task_node::notify_successors<slots, false>();
         }
         return nullptr;
+    }
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                this->functor_base::value()();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            task_node::notify_successors<slots, false>();
+        } else
+#endif
+        {
+            this->functor_base::value()();
+            task_node::notify_successors<slots, false>();
+        }
     }
     ~functional_task() override {}
 };
@@ -2050,6 +2112,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
+            bool forwarded_failure = false;
             if (this->has_start_failure()) [[unlikely]] {
                 task_node::notify_successors<slots, true>();
                 return nullptr;
@@ -2061,8 +2124,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                     }
                     if (result_base::value().current_task->has_failure()) {
                         this->publish_failure_from(result_base::value().current_task, 0);
-                        task_node::notify_successors<slots, true>();
-                        return nullptr;
+                        forwarded_failure = true;
                     }
                 }
             } catch(...) {
@@ -2077,6 +2139,10 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                 task_node::notify_successors<slots, true>();
                 return nullptr;
             }
+            if (forwarded_failure) {
+                task_node::notify_successors<slots, true>();
+                return nullptr;
+            }
         } else
 #endif
         {
@@ -2087,6 +2153,49 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         __OOX_TRACE("%p do_run: notify forward",this);
         task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
         return nullptr;
+    }
+
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            bool forwarded_failure = false;
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                if ( !result_base::has_value() ) {
+                    if (this->try_forward_result()) {
+                        return;
+                    }
+                    if (result_base::value().current_task->has_failure()) {
+                        this->publish_failure_from(result_base::value().current_task, 0);
+                        forwarded_failure = true;
+                    }
+                }
+            } catch(...) {
+                auto error = std::current_exception();
+                if (!result_base::has_value()) {
+                    result_base::emplace(var_type{});
+                }
+                this->set_exception(std::move(error));
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            if (forwarded_failure) {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+        } else
+#endif
+        {
+            if ( !result_base::has_value() && this->try_forward_result() ) {
+                return;
+            }
+        }
+        __OOX_TRACE("%p do_run: notify forward inline",this);
+        task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
     }
 
     ~functional_task() {
@@ -2378,6 +2487,8 @@ template<typename T, bool CanThrow>
 #undef TASK_EXECUTE_METHOD
 #undef OOX_TASK_EXECUTE_LIFETIME_REF
 #undef OOX_TASK_EXECUTE_LIFETIME_GUARD
+#undef OOX_COMPILER_EXCEPTIONS_AVAILABLE
+#undef OOX_COLD_ATTRIBUTE
 
 } // namespace oox
 #endif // __OOX_H__

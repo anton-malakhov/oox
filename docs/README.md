@@ -88,6 +88,13 @@ Key properties of the model:
   handle and the graph's notifications keep nodes alive until all consumers
   are done. Raw `release(n)` accounting is what makes retains (bumping
   `life_count` as an external hold) invalid — see the shared_var design doc.
+- **Submission rejection** — when compiler exception handling is available,
+  an attached successor rejected by a backend is completed inline while the
+  producer continues traversing its detached arc list. Lazy `shared_var`
+  publication preserves its caller-visible submission exception after the
+  installed materializer and its waiters reach terminal states. With compiler
+  exceptions disabled (`-fno-exceptions`), these recovery catches are not
+  compiled and publication uses the direct backend path.
 - **Writer chain** — multiple writers on one handle are linked through
   `next_writer`; the last registered writer is the *current* one, and each
   writer runs after the previous completes (anti-dependency via `countdown`).

@@ -100,7 +100,12 @@ the actual registration to a thread-local setup context:
    backend rejects publication, the installed materializer is executed
    synchronously to a terminal graph state before the submission exception is
    rethrown; concurrent waiters therefore cannot remain attached to an
-   unspawned task.
+   unspawned task. If submission of an attached waiter (or another successor)
+   is rejected during that synchronous completion, the successor executes
+   inline and traversal continues from the already detached arc list. A
+   notification exception is never handled by restarting `notify_successors()`.
+   Recovery catches are compiled only when the compiler supports exceptions;
+   `-fno-exceptions` builds retain the direct publication path.
 4. All involved states are locked **in canonical (address-sorted) order** and
    registrations are grouped by state and applied as one atomic unit. If
    several arguments alias one state, one writer registration (or one reader
