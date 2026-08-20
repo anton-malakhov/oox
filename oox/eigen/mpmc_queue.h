@@ -28,10 +28,13 @@ SOFTWARE.
 #include <atomic>
 #include <cassert>
 #include <cstddef> // offsetof
+#include <cstdlib>
 #include <limits>
 #include <memory>
-#include <new> // std::hardware_destructive_interference_size
+#include <new>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 #ifndef __cpp_aligned_new
 #ifdef _WIN32
@@ -41,14 +44,18 @@ SOFTWARE.
 #endif
 #endif
 
-namespace rigtorp {
-namespace mpmc {
-#if defined(__cpp_lib_hardware_interference_size) && !defined(__APPLE__)
-static constexpr size_t hardwareInterferenceSize =
-    std::hardware_destructive_interference_size;
-#else
-static constexpr size_t hardwareInterferenceSize = 128;
+#ifndef OOX_EIGEN_CACHE_LINE_SIZE
+#define OOX_EIGEN_CACHE_LINE_SIZE 64
 #endif
+
+namespace oox::detail::eigen_pool::rigtorp {
+namespace mpmc {
+static constexpr std::size_t hardwareInterferenceSize =
+    OOX_EIGEN_CACHE_LINE_SIZE;
+static_assert(hardwareInterferenceSize >= alignof(void *) &&
+                  (hardwareInterferenceSize & (hardwareInterferenceSize - 1)) ==
+                      0,
+              "OOX_EIGEN_CACHE_LINE_SIZE must be a power of two");
 
 #if defined(__cpp_aligned_new)
 template <typename T> using AlignedAllocator = std::allocator<T>;
@@ -279,11 +286,7 @@ private:
 private:
   const size_t capacity_;
   Slot<T> *slots_;
-#if defined(__has_cpp_attribute) && __has_cpp_attribute(no_unique_address)
-  Allocator allocator_ [[no_unique_address]];
-#else
-  Allocator allocator_;
-#endif
+  [[no_unique_address]] Allocator allocator_;
 
   // Align to avoid false sharing between head_ and tail_
   alignas(hardwareInterferenceSize) std::atomic<size_t> head_;
@@ -295,4 +298,4 @@ template <typename T,
           typename Allocator = mpmc::AlignedAllocator<mpmc::Slot<T>>>
 using MPMCQueue = mpmc::Queue<T, Allocator>;
 
-} // namespace rigtorp
+} // namespace oox::detail::eigen_pool::rigtorp

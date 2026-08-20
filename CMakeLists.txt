@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.14)
 MESSAGE(STATUS "CMAKE_ROOT=" ${CMAKE_ROOT})
 
 # Project name
@@ -23,6 +23,8 @@ option(OOX_BUILD_TESTS "Enables builds of tests" ON)
 option(OOX_BUILD_TWIST_TESTS "Build Twist-based concurrency tests" OFF)
 option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_ENABLE_EIGEN "Enable the bundled Eigen work-stealing backend" ON)
+set(OOX_EIGEN_THREADS "0" CACHE STRING
+    "OOX Eigen worker count (0 uses hardware_concurrency with a fallback of 1)")
 option(OOX_LOCAL_TBB "Force local copy of TBB" OFF)
 option(OOX_ENABLE_TF "Enable Taskflow for threading" ON)
 option(OOX_LOCAL_TF "Force local copy of TaskFlow" OFF)
@@ -70,10 +72,6 @@ if (OOX_ENABLE_TBB)
     add_subdirectory(thirdparty/oneTBB onetbb)
     set(TBB_FOUND ON)
   endif ()
-endif ()
-
-if (OOX_ENABLE_EIGEN)
-  set(EIGEN_FOUND ON)
 endif ()
 
 if (OOX_ENABLE_TF)
@@ -157,7 +155,7 @@ endif ()
 # Library
 add_library(${PROJECT_NAME} INTERFACE)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
-target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_11)
+target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_20)
 target_link_libraries(${PROJECT_NAME} INTERFACE Threads::Threads)
 if (OOX_EXCEPTIONS_ENABLED)
   target_compile_definitions(${PROJECT_NAME} INTERFACE OOX_EXCEPTIONS_ENABLED=1)
@@ -168,6 +166,20 @@ target_include_directories(${PROJECT_NAME} INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
         $<INSTALL_INTERFACE:include/>
 )
+
+if (OOX_ENABLE_EIGEN)
+  if (NOT OOX_EIGEN_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "OOX_EIGEN_THREADS must be a non-negative integer")
+  endif ()
+  add_library(OOXEigen INTERFACE)
+  add_library(${PROJECT_NAME}::eigen ALIAS OOXEigen)
+  set_target_properties(OOXEigen PROPERTIES EXPORT_NAME eigen)
+  target_compile_features(OOXEigen INTERFACE cxx_std_20)
+  target_compile_definitions(OOXEigen INTERFACE
+          HAVE_EIGEN=1
+          OOX_EIGEN_NUM_THREADS=${OOX_EIGEN_THREADS})
+  target_link_libraries(OOXEigen INTERFACE ${PROJECT_NAME} Threads::Threads)
+endif ()
 
 enable_testing()
 if (OOX_BUILD_TESTS)
@@ -187,15 +199,19 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/oox DESTINATION ${CMAKE_INSTALL_IN
 
 # export target
 set_target_properties(${PROJECT_NAME} PROPERTIES EXPORT_NAME ${PROJECT_NAME})
+set(OOX_EXPORT_TARGETS ${PROJECT_NAME})
+if (OOX_ENABLE_EIGEN)
+  list(APPEND OOX_EXPORT_TARGETS OOXEigen)
+endif ()
 
 export(
-        TARGETS ${PROJECT_NAME}
+        TARGETS ${OOX_EXPORT_TARGETS}
         NAMESPACE ${PROJECT_NAME}::
         FILE ${PROJECT_NAME}Targets.cmake
 )
 export(PACKAGE ${PROJECT_NAME})
 
-install(TARGETS ${PROJECT_NAME} EXPORT ${PROJECT_NAME}Targets)
+install(TARGETS ${OOX_EXPORT_TARGETS} EXPORT ${PROJECT_NAME}Targets)
 install(
         EXPORT ${PROJECT_NAME}Targets
         NAMESPACE ${PROJECT_NAME}::

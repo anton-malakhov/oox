@@ -6,14 +6,13 @@
 #define __OOX_H__
 
 #include <utility>
-#include <algorithm>
 #include <type_traits>
 #include <limits>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#include <thread>
+#include <string>
 #ifndef OOX_EXCEPTIONS_ENABLED
 #define OOX_EXCEPTIONS_ENABLED 0
 #endif

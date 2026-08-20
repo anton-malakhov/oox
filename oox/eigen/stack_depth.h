@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#pragma once
+#ifndef OOX_EIGEN_STACK_DEPTH_H
+#define OOX_EIGEN_STACK_DEPTH_H
 
 #include <cassert>
 #include <cstddef>
@@ -9,7 +10,7 @@
 #include <pthread.h>
 #endif
 
-namespace Eigen::internal {
+namespace oox::detail::eigen_pool::internal {
 
 class StackBounds {
 public:
@@ -49,4 +50,6 @@ inline bool IsStackHalfConsumed() noexcept {
   return bounds.HalfConsumed(&anchor);
 }
 
-} // namespace Eigen::internal
+} // namespace oox::detail::eigen_pool::internal
+
+#endif // OOX_EIGEN_STACK_DEPTH_H

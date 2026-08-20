@@ -1,8 +1,25 @@
-#pragma once
+// This file is part of Eigen, a lightweight C++ template library
+// for linear algebra.
+//
+// Copyright (C) 2008-2015 Gael Guennebaud <gael.guennebaud@inria.fr>
+// Copyright (C) 2008-2009 Benoit Jacob <jacob.benoit.1@gmail.com>
+// Copyright (C) 2009 Kenneth Riddile <kfriddile@yahoo.com>
+// Copyright (C) 2010 Hauke Heibel <hauke.heibel@gmail.com>
+// Copyright (C) 2010 Thomas Capricelli <orzel@freehackers.org>
+// Copyright (C) 2013 Pavel Holoborodko <pavel@holoborodko.com>
+//
+// This Source Code Form is subject to the terms of the Mozilla
+// Public License v. 2.0. If a copy of the MPL was not distributed
+// with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+#ifndef OOX_EIGEN_MEMORY_H
+#define OOX_EIGEN_MEMORY_H
+
 #include <cassert>
+#include <cstdlib>
 #include <cstdint>
-#include <memory>
-namespace internal {
+
+namespace oox::detail::eigen_pool::internal {
 inline void *handmade_aligned_malloc(std::size_t size, std::size_t alignment) {
   assert(alignment >= sizeof(void *) && alignment <= 128 &&
          (alignment & (alignment - 1)) == 0 &&
@@ -26,4 +43,6 @@ inline void handmade_aligned_free(void *ptr) {
     std::free(original);
   }
 }
-} // namespace internal
+} // namespace oox::detail::eigen_pool::internal
+
+#endif // OOX_EIGEN_MEMORY_H
