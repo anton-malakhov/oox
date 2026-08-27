@@ -27,16 +27,16 @@ ctest --test-dir build-eval -R scheduler_eval --output-on-failure
 
 CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
-`EIGEN_SHARING_STEALING`. TBB contributes simple, automatic, and affinity
-partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
+`EIGEN_SHARING_STEALING`, plus the pool-backed `RAPID_START` experiment. TBB
+contributes simple, automatic, and affinity partitioners. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
-`RAPID_START` waits for every requested trapper task to register before its
-warm-up publication. It supports at most 64 workers. Because the prototype has
-one global publication descriptor and is not reentrant, its target omits nested
-matrix multiplication and transpose; normalized reports use only cases present
-in every selected mode. Nested workloads and registrations live in separate
-sources that CMake attaches only to reentrant modes.
+`RAPID_START` uses the Eigen pool's lifetime worker registrations. Each
+invocation creates an independent stack region and publishes a hierarchical
+activation tree through per-worker inboxes with exactly-once ordinary-queue
+fallback tickets. Nested calls inherit contiguous worker domains, so nested
+matrix multiplication and transpose are enabled. The implementation supports
+the pool's full 65535-worker limit rather than the historical 64-bit mask.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

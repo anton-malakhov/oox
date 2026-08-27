@@ -92,6 +92,14 @@ if (OOX_ENABLE_EIGEN)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
 
+  add_executable(eigen_rapid_start_test eigen_rapid_start_test.cpp)
+  target_link_libraries(eigen_rapid_start_test PRIVATE
+          ${PROJECT_NAME}::eigen
+          ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_rapid_start_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30)
+
   find_package(Eigen3 3.4 QUIET NO_MODULE)
   if (TARGET Eigen3::Eigen)
     set(OOX_UPSTREAM_EIGEN_TARGET Eigen3::Eigen)

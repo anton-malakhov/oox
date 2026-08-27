@@ -33,11 +33,15 @@ Vorkozhokov, Vitaly Aksenov, and Anton Malakhov as authors. Its placeholder
 conference metadata must not be used as evidence that the manuscript appeared in
 those proceedings.
 
+The historical measurements in this document predate the pool-backed Rapid
+Start rewrite. References to persistent trappers, one bitmask descriptor, and
+the 64-worker limit describe the preserved research artifact and old result
+files, not the current `RAPID_START` executable.
+
 Two mechanisms in OOX are also distinct:
 
-- **Rapid Start** is the bitmask prototype: the publisher and a persistent group
-  of registered trappers observe one shared descriptor, and every participating
-  slot computes its static range locally.
+- **Rapid Start** now uses independent rapid regions, inherited worker domains,
+  and a hierarchical activation/completion tree on the fixed Eigen pool.
 - **Eigen sharing-stealing** is the historical hybrid method: it first distributes
   ranges through targeted mailboxes, waits for a calibrated timespan before exposing
   balancing work, and derives a grain from iterations completed during that time.
@@ -350,7 +354,7 @@ gate is optimal. OOX must estimate those quantities from its own traces.
 
 | Mode | Initial distribution | Grain and later balancing |
 | --- | --- | --- |
-| `RAPID_START` | One shared epoch/descriptor observed by publisher plus persistent trappers | One contiguous block per participating slot; no stealing |
+| `RAPID_START` | Hierarchical region activation through rapid inboxes plus exactly-once fallback tickets | Proportional contiguous worker/data subtrees with inherited nested domains |
 | `EIGEN_STEALING` | One root range | Binary splitting to a caller-supplied fixed grain (1 in this benchmark), then deque stealing |
 | `EIGEN_SHARING` | `K_SPLIT=2` targeted mailbox tree | Binary splitting to a caller-supplied fixed grain (1 here), then stealing |
 | `EIGEN_STEALING_GRAINSIZE` | One root range | Root measures a timespan-derived grain, then chunk stealing |
@@ -360,10 +364,10 @@ Two details are easy to miss:
 
 1. Eigen's `Balancing::STATIC` means a fixed grain, not immutable static worker
    blocks. The range is still recursively split and can be stolen.
-2. A targeted Eigen publication inserts the same execute-once proxy into the
-   target mailbox and the normal scheduling path. In sharing modes, an idle
-   worker may also consume another worker's mailbox. The duplicate references
-   improve availability; an atomic state ensures that the body runs once.
+2. A rapid publication uses two distinct non-owning tickets: a targeted inbox
+   ticket and an embedded ordinary-queue fallback. They reference one
+   generation-stamped activation and compete through its claim CAS; no owning
+   task pointer is published twice.
 
 With enough iterations, the Eigen sharing tree performs at most
 $\min(P,N)-1$ targeted publications. For fixed `K_SPLIT=2`, sufficient work at
@@ -526,7 +530,7 @@ The parameters do not all belong to every mode:
 | --- | --- | --- | --- |
 | Worker count $P$ | Yes | Yes | Enumerate topology-aware choices; include one-worker and performance-core-only baselines |
 | Reuse $q$ / lifetime | Exogenous: process-static runtime today | Exogenous pool lifetime | Report $I(P)/q$ for realistic application lifetimes; do not optimize it without a lifetime/resource cost |
-| Membership/topology | Future knob: all trappers stay registered until destruction | Mailbox targets are implementation-defined | Instrument first; parameterize before claiming a search over membership |
+| Membership/topology | Immutable inherited domains; optional whole-subtree leases | Mailbox targets are implementation-defined | Enumerate balanced topology subtrees and measure before adding affinity policy |
 | Tree fanout $K$ | No | Yes, but compile-time today | Rebuild or make it runtime-configurable, then enumerate small integers |
 | Gate $\tau$ | No | Yes, but `INIT_TIME` is compile-time today | Rebuild or parameterize; seed from an upper-confidence p99 of mode-specific $G_{m,P,z}$ |
 | Grain $g$ | No: ranges follow $N/P$ and membership | Caller-supplied fixed or timespan-derived | Seed Eigen from observed work during $\tau$, then test multiplicative neighbors |

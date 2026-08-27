@@ -15,6 +15,17 @@ destructor draining and nested waits. Full local deques and mailboxes spill to a
 unbounded guarded queue, so nested spawning never falls back to recursive inline
 execution.
 
+`rapid_start.h` builds a reentrant rapid-region layer on this pool. Workers keep
+their pool-lifetime, generation-stamped registrations; loop invocations do not
+register or trap workers. Immutable groups name contiguous domains, activation
+trees split both workers and iterations proportionally, and TLS region contexts
+propagate subdomains into nested loops. A per-worker atomic inbox with a bounded
+lock-free overflow is checked with a fairness budget before ordinary work. Each
+activation also has a distinct embedded ordinary-queue ticket, and both paths
+compete through one claim CAS. Descriptors come from a preallocated,
+generation-stamped slab and completion follows the activation tree. Optional
+elastic lending leases one balanced topology subtree with one stamped CAS.
+
 ## File provenance and license
 
 | File | Source | License retained |

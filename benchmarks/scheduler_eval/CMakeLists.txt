@@ -1,14 +1,14 @@
 set(OOX_SCHEDULER_EVAL_MODES)
-set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
+set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES)
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     EIGEN_STEALING EIGEN_SHARING
-    EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
+    EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING RAPID_START)
 endif()
 if(TBB_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    TBB_SIMPLE TBB_AUTO TBB_AFFINITY RAPID_START)
+    TBB_SIMPLE TBB_AUTO TBB_AFFINITY)
 endif()
 if(OpenMP_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
@@ -24,8 +24,8 @@ function(oox_configure_scheduler_eval_target target mode)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
-      RAPID_START_MODE=1 TBB_MODE=TBB_RAPID)
-    target_link_libraries(${target} PRIVATE OOX TBB::tbb)
+      RAPID_START_MODE=1 EIGEN_MODE=EIGEN_RAPID)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^TBB")
     target_compile_definitions(${target} PRIVATE TBB_MODE=${mode})
     target_link_libraries(${target} PRIVATE OOX TBB::tbb)
@@ -103,7 +103,7 @@ if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
   set_tests_properties(scheduler_eval_runner_smoke PROPERTIES TIMEOUT 180)
 endif()
 
-if(TBB_FOUND AND Python3_Interpreter_FOUND)
+if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
   add_test(NAME scheduler_eval_rapid_runner_smoke
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
       --build ${PROJECT_BINARY_DIR}

@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -36,10 +37,68 @@
 
 namespace oox::detail::eigen_pool {
 
+class RapidRegionBase;
+
+struct DomainId {
+  unsigned start = 0;
+  unsigned limit = 0;
+
+  size_t Size() const noexcept { return limit - start; }
+  bool Contains(size_t worker) const noexcept {
+    return worker >= start && worker < limit;
+  }
+};
+
+struct RegionContext {
+  RapidRegionBase *region = nullptr;
+  DomainId domain;
+  RegionContext *parent = nullptr;
+};
+
+struct Task;
+
+class RapidTask {
+public:
+  virtual void AddTickets(size_t count) = 0;
+  virtual bool TryRun() = 0;
+  virtual void Cancel() noexcept = 0;
+  virtual void ReleaseTicket() = 0;
+  virtual RegionContext *Context() noexcept = 0;
+  virtual Task *FallbackTicket() noexcept = 0;
+  virtual ~RapidTask() = default;
+};
+
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
+  RegionContext *region_context = nullptr;
   virtual void operator()() = 0;
+  virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
+};
+
+class RapidFallbackTask final : public Task {
+public:
+  void Bind(RapidTask *task) noexcept {
+    rapid_ = task;
+    region_context = task->Context();
+  }
+  void operator()() final {
+    RapidTask *task = rapid_;
+    rapid_ = nullptr;
+    task->TryRun();
+    task->ReleaseTicket();
+  }
+  void Discard() noexcept final {
+    RapidTask *task = rapid_;
+    rapid_ = nullptr;
+    if (task) {
+      task->Cancel();
+      task->ReleaseTicket();
+    }
+  }
+
+private:
+  RapidTask *rapid_ = nullptr;
 };
 
 template <typename F> struct UniqueTask : Task {
@@ -179,7 +238,7 @@ public:
       return;
     }
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
     threadIndex = threadIndex % num_threads_;
@@ -195,7 +254,7 @@ public:
     }
     AssertBounds(start, limit);
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
 
@@ -217,6 +276,7 @@ public:
 
   void Cancel() override {
     cancelled_.store(true, std::memory_order_release);
+    CancelRapidQueues();
     done_.store(true, std::memory_order_release);
 
     // Let each thread know it's been cancelled.
@@ -258,6 +318,78 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+  RegionContext *CurrentRegionContext() const noexcept {
+    const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
+    return pt->region_context;
+  }
+
+  template <typename F>
+  decltype(auto) ExecuteInRegion(RegionContext *context, F &&function) {
+    PerThread *pt = GetPerThread();
+    RegionContext *previous = pt->region_context;
+    pt->region_context = context;
+    struct RestoreContext {
+      PerThread *thread;
+      RegionContext *previous;
+      ~RestoreContext() { thread->region_context = previous; }
+    } restore{pt, previous};
+    return std::forward<F>(function)();
+  }
+
+  size_t WorkerRegistrationCount() const noexcept {
+    return registrations_started_.load(std::memory_order_acquire);
+  }
+
+  void ScheduleRapid(RapidTask *rapid, size_t target) {
+    if (rapid == nullptr) {
+      return;
+    }
+    target %= static_cast<size_t>(num_threads_);
+    if (cancelled_.load(std::memory_order_acquire)) {
+      rapid->Cancel();
+      return;
+    }
+    rapid->AddTickets(2);
+    UpdateRapidLinger();
+    TaskPtr fallback = rapid->FallbackTicket();
+    try {
+      static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
+      if (!thread_data_[target].PushRapid(rapid)) {
+        rapid->ReleaseTicket();
+      }
+      if (cancelled_.load(std::memory_order_acquire)) {
+        rapid->Cancel();
+      }
+    } catch (...) {
+      fallback->Discard();
+      rapid->ReleaseTicket();
+      throw;
+    }
+    try {
+      PublishTask(fallback, static_cast<int>(target), false);
+    } catch (...) {
+      fallback->Discard();
+      throw;
+    }
+  }
+
+  template <typename Region> void HelpUntil(Region &region) {
+    const bool registered = IsRegistered(GetPerThread());
+    auto &event = registered ? worker_event_ : waiter_event_;
+    while (!region.IsComplete()) {
+      const uint64_t token = event.PrepareWait();
+      if (registered && TryExecuteOne()) {
+        event.CancelWait();
+        continue;
+      }
+      if (region.IsComplete()) {
+        event.CancelWait();
+        return;
+      }
+      event.Wait(token);
+    }
+  }
+
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
     if (ready()) {
@@ -295,6 +427,7 @@ private:
   static const int kMaxPartitionBits = 16;
   static const int kMaxThreads = 1 << kMaxPartitionBits;
   static const int kSpinCount = 64;
+  static const unsigned kRapidFairness = 8;
 
   class EventCount {
   public:
@@ -352,6 +485,14 @@ private:
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
+    PerThread *pt = GetPerThread();
+    RegionContext *previous_context = pt->region_context;
+    pt->region_context = p->region_context;
+    struct RestoreContext {
+      PerThread *thread;
+      RegionContext *previous;
+      ~RestoreContext() { thread->region_context = previous; }
+    } restore{pt, previous_context};
     (*p)();
   }
 
@@ -396,23 +537,53 @@ private:
   struct PerThread {
     constexpr PerThread()
         : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
-          owns_queue(false) {}
+          owns_queue(false), rapid_streak(0), region_context(nullptr) {}
     ThreadPoolTempl *pool; // Parent pool, or null for normal threads.
     uint64_t pool_generation;
     uint64_t rand;         // Random generator state.
     int thread_id;         // Worker thread index in pool.
     bool owns_queue;
+    unsigned rapid_streak;
+    RegionContext *region_context;
   };
 
   struct ThreadData {
     ThreadData()
         : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
-          mailbox(1024) {}
+          mailbox(1024), rapid_slot(nullptr), rapid_overflow(1024) {}
     std::unique_ptr<Thread> thread;
     std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+    std::atomic<RapidTask *> rapid_slot;
+    rigtorp::mpmc::Queue<RapidTask *> rapid_overflow;
+
+    bool PushRapid(RapidTask *task) {
+      RapidTask *empty = nullptr;
+      if (rapid_slot.compare_exchange_strong(empty, task,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed)) {
+        return true;
+      }
+      return rapid_overflow.try_push(task);
+    }
+
+    RapidTask *PopRapid() {
+      if (RapidTask *task =
+              rapid_slot.exchange(nullptr, std::memory_order_acquire)) {
+        return task;
+      }
+      RapidTask *task = nullptr;
+      rapid_overflow.try_pop(task);
+      return task;
+    }
+
+    void FlushRapid() {
+      while (RapidTask *task = PopRapid()) {
+        task->ReleaseTicket();
+      }
+    }
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
@@ -455,6 +626,9 @@ private:
   EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
+  std::atomic<size_t> registrations_started_{0};
+  std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
+  std::atomic<uint64_t> last_rapid_publication_ns_{0};
 
   bool creator_registered_ = false;
   std::thread::id creator_thread_id_;
@@ -481,7 +655,9 @@ private:
 
       bool found_work = false;
       if (allow_spinning_) {
-        for (int i = 0; i < kSpinCount; ++i) {
+        const unsigned spin_count =
+            rapid_linger_iterations_.load(std::memory_order_relaxed);
+        for (unsigned i = 0; i < spin_count; ++i) {
           if (cancelled_.load(std::memory_order_acquire)) {
             return processed_anything;
           }
@@ -516,12 +692,34 @@ private:
     return next.fetch_add(1, std::memory_order_relaxed);
   }
 
+  void UpdateRapidLinger() noexcept {
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const uint64_t previous =
+        last_rapid_publication_ns_.exchange(now, std::memory_order_relaxed);
+    if (previous == 0) {
+      return;
+    }
+    const uint64_t interval = now - previous;
+    const unsigned target =
+        interval < 50'000 ? 256 : (interval < 500'000 ? 128 : 32);
+    const unsigned current =
+        rapid_linger_iterations_.load(std::memory_order_relaxed);
+    rapid_linger_iterations_.store((current * 7 + target) / 8,
+                                   std::memory_order_relaxed);
+  }
+
   void RegisterThread(PerThread *pt, int thread_id, bool owns_queue) {
     pt->pool = this;
     pt->pool_generation = pool_generation_;
     pt->rand = GlobalThreadIdHash();
     pt->thread_id = thread_id;
     pt->owns_queue = owns_queue;
+    pt->rapid_streak = 0;
+    pt->region_context = nullptr;
+    registrations_started_.fetch_add(1, std::memory_order_release);
   }
 
   void RegisterCreator(bool owns_queue) {
@@ -578,6 +776,11 @@ private:
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
+    if (pt->rapid_streak < kRapidFairness && TryExecuteRapid()) {
+      ++pt->rapid_streak;
+      return true;
+    }
+
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
       task = thread_data_[pt->thread_id].PopFront();
@@ -592,9 +795,50 @@ private:
       task = GlobalSteal(true);
     }
     if (!task) {
+      if (TryExecuteRapid()) {
+        ++pt->rapid_streak;
+        return true;
+      }
       return false;
     }
+    pt->rapid_streak = 0;
     ExecuteTask(task);
+    return true;
+  }
+
+  bool TryExecuteRapid() {
+    PerThread *pt = GetPerThread();
+    RapidTask *rapid = nullptr;
+    if (pt->owns_queue) {
+      rapid = thread_data_[pt->thread_id].PopRapid();
+    }
+    if (!rapid) {
+      unsigned start = 0;
+      unsigned limit = static_cast<unsigned>(num_threads_);
+      if (pt->region_context && pt->region_context->domain.Size() != 0) {
+        start = pt->region_context->domain.start;
+        limit = pt->region_context->domain.limit;
+      }
+      for (unsigned worker = start; worker < limit && !rapid; ++worker) {
+        if (worker != static_cast<unsigned>(pt->thread_id)) {
+          rapid = thread_data_[worker].PopRapid();
+        }
+      }
+    }
+    if (!rapid) {
+      return false;
+    }
+    RegionContext *previous = pt->region_context;
+    pt->region_context = rapid->Context();
+    try {
+      rapid->TryRun();
+    } catch (...) {
+      pt->region_context = previous;
+      rapid->ReleaseTicket();
+      throw;
+    }
+    pt->region_context = previous;
+    rapid->ReleaseTicket();
     return true;
   }
 
@@ -630,6 +874,15 @@ private:
     waiter_event_.NotifyAll();
   }
 
+  void CancelRapidQueues() {
+    for (auto &data : thread_data_) {
+      while (RapidTask *rapid = data.PopRapid()) {
+        rapid->Cancel();
+        rapid->ReleaseTicket();
+      }
+    }
+  }
+
   void JoinThreads() {
     for (auto &data : thread_data_) {
       data.thread.reset();
@@ -640,16 +893,17 @@ private:
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
         auto *outstanding = task->outstanding;
-        delete task;
+        task->Discard();
         outstanding->fetch_sub(1, std::memory_order_relaxed);
       }
+      data.FlushRapid();
     }
     std::lock_guard<std::mutex> lock(overflow_mutex_);
     while (!overflow_tasks_.empty()) {
       TaskPtr task = overflow_tasks_.front();
       overflow_tasks_.pop_front();
       auto *outstanding = task->outstanding;
-      delete task;
+      task->Discard();
       outstanding->fetch_sub(1, std::memory_order_relaxed);
     }
     assert(NoOutstandingTasks());
@@ -687,6 +941,10 @@ private:
   TaskPtr LocalSteal(bool force) {
     PerThread *pt = GetPerThread();
     unsigned partition = GetStealPartition(pt->thread_id);
+    if (pt->region_context && pt->region_context->domain.Size() != 0) {
+      partition = EncodePartition(pt->region_context->domain.start,
+                                  pt->region_context->domain.limit);
+    }
     // If thread steal partition is the same as global partition, there is no
     // need to go through the steal loop twice.
     if (global_steal_partition_ == partition)

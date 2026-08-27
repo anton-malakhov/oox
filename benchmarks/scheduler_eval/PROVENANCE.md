@@ -57,9 +57,9 @@ backend abstraction. No runner clones the reference at execution time.
 9. The report generator is Python-standard-library-only and emits SVG rather
    than depending on a plotting installation. Raw Google Benchmark and trace
    JSON remain available for external analysis.
-10. The Rapid Start prototype is limited to 64 workers and is not reentrant.
-    Nested matrix workloads are omitted for that mode, and aggregate scores use
-    only benchmark cases shared by every selected mode.
+10. The historical Rapid Start source remains provenance only. The evaluated
+    mode is the reentrant OOX activation-tree implementation, supports nested
+    workloads, and is not limited by a 64-bit participant mask.
 
 ## Evaluation rules
 
