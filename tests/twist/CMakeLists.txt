@@ -52,6 +52,11 @@ oox_add_twist_test(test_twist_api_coverage test_twist_api_coverage.cpp)
 oox_add_twist_exception_test(test_twist_exceptions test_twist_exceptions.cpp)
 oox_add_twist_exception_test(test_twist_exception_coverage test_twist_exception_coverage.cpp)
 oox_add_twist_test(test_twist_shared_var test_twist_shared_var.cpp)
+target_compile_definitions(test_twist_shared_var
+        PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+oox_add_twist_exception_test(test_twist_shared_var_exceptions test_twist_shared_var.cpp)
+target_compile_definitions(test_twist_shared_var_exceptions
+        PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
 
 if (TWIST_SIM)
   oox_add_twist_test(test_twist_known_deferred_race test_twist_known_deferred_race.cpp)
@@ -90,6 +95,10 @@ if (TWIST_SIM)
           test_twist_shared_var_countertests.cpp)
   add_test(NAME test_twist_shared_var_adopt_forwarded
           COMMAND test_twist_shared_var_countertests AdoptForwardedVar)
+  add_test(NAME test_twist_shared_var_register_forwarded_before_producer
+          COMMAND test_twist_shared_var_countertests RegisterAdoptedForwardedVarBeforeProducerRuns)
+  add_test(NAME test_twist_shared_var_forwarded_wait_unlocks
+          COMMAND test_twist_shared_var_countertests ForwardedWaitDoesNotBlockWriterRegistration)
   add_test(NAME test_twist_shared_var_wait_during_publication
           COMMAND test_twist_shared_var_countertests WaitOnDeferredDoesNotBlockPublication)
   add_test(NAME test_twist_shared_var_opposite_writer_order
@@ -97,6 +106,8 @@ if (TWIST_SIM)
   set_tests_properties(test_twist_shared_var_adopt_forwarded
           PROPERTIES LABELS "twist;countertest" TIMEOUT 30)
   set_tests_properties(
+          test_twist_shared_var_register_forwarded_before_producer
+          test_twist_shared_var_forwarded_wait_unlocks
           test_twist_shared_var_wait_during_publication
           test_twist_shared_var_opposite_writer_order
           PROPERTIES LABELS "twist;concurrency;countertest" TIMEOUT 30)

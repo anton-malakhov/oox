@@ -24,16 +24,17 @@ We want `oox::shared_var<T>`: a copyable, reference-counted handle that
    must be shareable across threads; the result of a task is owned by its
    caller as usual.
 2. `get()` returns a **copy** (`T` must be copyable). It never returns a
-   reference to the stored value.
-3. **Forwarding is supported for adopted vars**: a `shared_var` constructed
-   from a forwarded `var` (a producer that returned a var) resolves the chain
-   on `get()`/`wait()` — the producer is waited for first (its result storage
-   is materialized during execution), then the chain is walked to the final
-   slot. Registering a forwarded shared_var as a *run argument* stays one
-   level deep (same limitation as `oox::var`'s own consume path).
-4. The **Folly backend limitation** is documented, not fixed: `folly::fibers::Baton`
-   is a single-waiter primitive, so `get()`/`wait()` on the same node from
-   multiple fibers is not supported on the Folly backend.
+   reference to the stored value. The copy is made under the state mutex so a
+   concurrent writer cannot retire the captured slot; v1 therefore rejects a
+   nested `shared_var` value and expects `T`'s copy operation not to re-enter
+   the same handle indirectly.
+3. **Forwarding is supported for an adopted plain `var`**: a `shared_var`
+   constructed from a forwarded `var` records a descriptor for the future
+   `var` object. Both registration and `get()`/`wait()` resolve that descriptor
+   only after the outer producer completes, then walk the complete forwarding
+   chain. A task-produced/forwarded `shared_var` is not part of this contract.
+4. Blocking uses one waiter node per call, including the adopted-forwarded-var
+   path. No backend task object is used as a shared multi-waiter primitive.
 5. Implementation strategy: **variant 1, "thick handle"** — one mutex per
    shared state, zero changes to the graph machinery.
 
@@ -47,9 +48,11 @@ shared_var<T, CanThrow>
     └── var<T, CanThrow> inner // the "eternal owner" handle: keeps slots alive
 ```
 
-- All handle-state mutations (writer registration, reader registration, lazy
-  materialization, `get`/`wait` snapshot, `cancel`, value assignment) run
-  under `mtx`.
+- Handle-state inspection and mutation run under `mtx`. User-controlled
+  default construction (`T{}`), blocking waits, task publication, and task
+  execution run without any shared-state mutex held. Lazy construction is a
+  graph task, so an exception becomes graph failure instead of escaping task
+  registration synchronously.
 - The graph operations themselves (`arc_list::add_arc`,
   `output_node::next_writer` exchange, `countdown`, `head` exchange,
   `start_count` decrement) are unchanged and stay lock-free; they are merely
@@ -81,15 +84,47 @@ the actual registration to a thread-local setup context:
 
 1. Each shared_var argument records a pending registration (its state, the
    task, the port, and whether it is a writer) instead of locking immediately.
-2. The **outermost** shared_var argument commits the whole batch: all involved
-   states are locked **in canonical (address-sorted) order**, then every
-   registration is applied as one atomic unit:
-   - lazy materialization: if `inner.current_task == nullptr`, assign a
-     default `var<A>(A{})` (same requirement as `var`: `A` default-constructible);
+2. A TLS batch is identified by the task being registered, rather than merely
+   by “some batch is active”. A nested `oox::run` therefore gets an independent
+   batch even if user code re-enters during another argument's setup. After
+   argument collection, the outer guard detaches its batch before materializing
+   values and restores any enclosing batch when a nested run returns.
+3. Every unique empty state is lazily materialized before the multi-state lock
+   set is acquired. The first caller creates an unpublished materializer while
+   holding that state's mutex, installs it as `inner`, releases the mutex, and
+   only then publishes the task. `A{}` and the transfer into result storage
+   execute inside that task, under its exception policy. Therefore a slow,
+   re-entrant, or throwing constructor never runs in registration or under
+   state locks, while racing callers observe the installed task and cannot
+   create losing materializers or duplicate constructor side effects. If the
+   backend rejects publication, the installed materializer is executed
+   synchronously to a terminal graph state before the submission exception is
+   rethrown; concurrent waiters therefore cannot remain attached to an
+   unspawned task. If submission of an attached waiter (or another successor)
+   is rejected during that synchronous completion, the successor executes
+   inline and traversal continues from the already detached arc list. A
+   notification exception is never handled by restarting `notify_successors()`.
+   Recovery catches are compiled only when the compiler supports exceptions;
+   `-fno-exceptions` builds retain the direct publication path.
+4. All involved states are locked **in canonical (address-sorted) order** and
+   registrations are grouped by state and applied as one atomic unit. If
+   several arguments alias one state, one writer registration (or one reader
+   when no writer is present) represents that task in the graph; every alias
+   receives the same storage descriptor. A skipped mutable alias also closes
+   its compile-time output port with `next_writer_no_owner_marker()`, balancing
+   the port's lifetime hold instead of leaking the task.
    - writer category (`A&` or `A&&` functor arg): `inner.set_next_writer(port, self)`;
    - reader/copy category: `self->assign_prerequisite(inner.current_task,
-     inner.current_port())` and capture `inner.storage_ptr` into `my_ptr`.
-3. `unlock`. Task execution stays fully parallel.
+     inner.current_port())` and capture the current storage descriptor.
+5. Unlock all states before `oox::run` publishes the task. Task execution and
+   any synchronously triggered continuation therefore cannot re-enter a held
+   shared-state mutex.
+
+Argument setup is a synchronous graph-construction phase, outside the
+`CanThrow` execution policy. If setup itself throws, registration rollback and
+reclamation of the unpublished task are intentionally not guaranteed; callers
+must treat that boundary as fatal. This avoids adding a temporary atomic
+lifetime owner and rollback machinery to every successful `run()`.
 
 **Why atomic multi-state registration**: two threads registering writers on the
 same two vars in opposite orders (`run(f, sv1, sv2)` vs `run(g, sv2, sv1)`)
@@ -99,10 +134,19 @@ atomic unit — with the second run chaining onto the complete result of the
 first — makes the chains consistent and acyclic. The canonical lock order also
 prevents AB-BA lock-order deadlocks between two such runs.
 
-`consume()` (inside the worker task) needs **no lock**: it reads the value
-from the storage pointer captured at registration time; the graph orders the
-write before the read (flow dependency), and the slot stays alive while the
-result var of its producer lives (existing lifetime rules).
+`consume()` (inside the worker task) needs **no lock**. A direct descriptor is
+already a result-state pointer. For an adopted forwarded `var`, the descriptor
+instead points to the future `var` object inside the outer producer's result
+storage; the graph guarantees that producer completed before `consume()` runs,
+so the object's lifetime has begun and the full forwarding chain can safely be
+walked. The slot remains alive through the existing graph ownership rules.
+
+The captured descriptor stays pointer-sized. Its `forwarded` and
+`initialize-if-empty` states occupy the two low pointer bits, while an
+untagged direct `oox::var` descriptor retains the exact raw result-state
+pointer representation and fast path. Result-state storage therefore has an
+explicit minimum four-byte alignment; compile-time assertions and ordinary
+plus Twist countertests protect both the layout and tag round-trip.
 
 `oox::run` arguments are handled **per argument kind**: a single task may mix
 plain `oox::var` and `oox::shared_var` arguments (each kind matched by its own
@@ -112,13 +156,17 @@ semantics; the `shared_var` parts are registered atomically as one batch
 
 ### 4.2 `get()` / `wait()` — any thread, concurrently (A1: waiting is a graph edge)
 
-1. `lock(state->mtx)`.
-2. Materialize a default value first if `inner` is empty.
-3. If the inner var is **forwarded** (adopted from a producer that returned a
-   var), wait for the producer task first: the chain target is materialized
-   inside the producer's result storage during its execution, so the chain is
-   not walkable until the producer completes.
-4. Resolve the forwarding chain (walk `storage_ptr` while `is_forwarded`) and
+1. Materialize a default value if `inner` is empty by publishing the graph task
+   described in §4.1, locking only for the compare/install. A throwing
+   materialization is observed through the normal failure path.
+2. `lock(state->mtx)`.
+3. If the inner var is **forwarded** (an adopted producer-returned plain
+   `var`), attach a per-call waiter node to its current producer, unlock, and
+   block through the backend-native wait. Re-lock and revalidate the current
+   producer; repeat if a writer switched the slot. Check failure before
+   dereferencing the producer's result storage.
+4. Resolve the complete forwarding chain (walk `storage_ptr` while
+   `is_forwarded`) and
    snapshot `task`, `storage`, `port` from the final var.
 5. If the slot is already produced (`head` is the done marker) — read under
    the lock.
@@ -131,8 +179,8 @@ semantics; the `shared_var` parts are registered atomically as one batch
    graph notifies the waiter at the task's completion (`do_notify_arcs` →
    `remove_prerequisite` → spawn → `execute` → `wakeup`). If the slot was
    switched while we waited, re-snapshot and retry.
-7. Re-lock and read the value copy from `storage` (failure check first when
-   `CanThrow`); release the getter's hold on the waiter.
+7. Re-lock, revalidate, and read the value copy from `storage` (failure check
+   first when `CanThrow`); release the getter's hold on the waiter.
 
 ### Why waiting is a graph edge (and not a CV, a spin, or a retain)
 
@@ -155,16 +203,49 @@ The A1 waiter solves it structurally: the getter registers the waiter into the
 graph's own lock-free arc queue and **never touches the current task after the
 registration**, so the task can be freed safely. The getter blocks on the
 waiter's completion through the pool's native wait — pool threads never wait
-on foreign primitives. The **deferred placeholder** is covered by the same
-path: the first writer's deferred redirect forwards the waiter's arc to the
-writer task, so no deferred-specific wait exists. No condition variables
-remain in the shared_var layer.
+on foreign primitives. This same helper is used while an adopted forwarded
+`var` is waiting for its outer producer, so that wait also releases `mtx`.
+The **deferred placeholder** is covered by the same path: the first writer's
+deferred redirect forwards the waiter's arc to the writer task, so no
+deferred-specific wait exists. No condition variables remain in the
+shared_var layer.
 
 ### 4.3 Assignment `sv = value` — any thread
 
-`lock(mtx)`; `inner = var<A>(value)` (this releases the previous current slot
-via `inner`'s own `release()` path and binds a fresh constant slot);
-`unlock`. Concurrent assignments serialize; the last one wins.
+Assignment calls `oox::run` with a small mutable writer on `*this`, using the
+same shared registration batch as an explicit writer task. The batch locks and
+updates the graph, unlocks, and only then publishes the assignment task. This
+publishes deferred states, remains ordered after existing readers/writers, and
+does not invoke synchronous continuations while `mtx` is held. Concurrent
+assignments are writer-chain ordered; the last registered assignment wins.
+
+The `const T&` overload requires copy construction plus copy assignment and
+executes the exact checked expression `target = std::as_const(payload)`. The
+`T&&` overload requires move construction plus move assignment. With a
+non-throwing policy (`CanThrow == false`), the selected assignment operation
+must additionally be `noexcept`; a potentially throwing assignment is accepted
+only by `CanThrow == true` and becomes graph failure instead of terminating the
+process. Deleted negative overloads prevent implicit conversion through
+`var(T)` or `shared_var(T)` from bypassing those constraints. Plain `oox::var`
+value assignment uses the analogous writer task when the var already has a
+slot. A copy-assignment payload has shared ownership so the task functor
+remains movable even when `T` itself is copy-only.
+
+The same policy applies before the callable body: `run<false>` checks every
+actual conversion from the value category returned by `consume()`, including
+cross-type conversions, not only the callable's declared parameter list. A
+deferred writer therefore requires nothrow materialization, and passing the
+stored `T&` to a by-value `T` parameter requires a nothrow copy. Omitted
+defaulted callable parameters are supported; only the supplied argument prefix
+is checked. With `run<true>`, a conversion or materialization failure is caught
+by the task and propagated normally.
+
+Materialization transfers `T{}` into graph storage by preferring a nothrow
+move, then a nothrow copy. A potentially throwing transfer is selected only
+inside a `CanThrow == true` task. For `run<false>`, the writer restriction is
+intentionally conservative at the type level even when a particular
+`shared_var` is already initialized: the runtime state may instead be lazy or
+forwarded, and a non-throwing graph has no failure channel for that case.
 
 ### 4.4 Destruction of the last handle
 
@@ -192,8 +273,8 @@ public:
     shared_var(shared_var&&) noexcept;
     shared_var& operator=(shared_var&&) noexcept;
 
-    shared_var& operator=(const T&);
-    shared_var& operator=(T&&);
+    shared_var& operator=(const T&);          // copy construct/assign; noexcept assign if !CanThrow
+    shared_var& operator=(T&&);               // move construct/assign; noexcept assign if !CanThrow
 
     [[nodiscard]] T get() const;             // copy; requires copyable T
     void wait() const;
@@ -220,43 +301,54 @@ Access categories through `oox::run` are the same as for `var`:
 
 ## 6. Semantics guarantees (v1)
 
-- A `shared_var` object may be used by any number of threads concurrently:
-  `run` registration, `get`, `wait`, `cancel`, assignment, copy.
+- The same `shared_var` handle object may be used concurrently for `run`
+  registration, `get`, `wait`, `cancel`, copy construction, and assignment of
+  a `T` value. Distinct handle copies may be used independently by any thread.
+  Copy/move assignment from another `shared_var` rebinds `state_`; rebinding
+  the same handle object concurrently with any operation on that object is a
+  data race and requires external synchronization, matching the
+  `std::shared_ptr` object contract.
+- `T` must be default-constructible and move- or copy-constructible, and cannot
+  itself be a `shared_var` specialization. A non-throwing policy requires
+  default construction and the selected move/copy materialization path to be
+  `noexcept`. Value assignment additionally requires the matching
+  constructible-and-assignable concept, with nothrow assignment under a
+  non-throwing policy.
+- Returning a populated `var<T>` from a task does not require `T` to be
+  default-constructible. If the returned var is empty, materializable types get
+  the policy-controlled default value; a non-materializable empty var becomes
+  `empty_forwarded_var` graph failure under `CanThrow == true` and is a contract
+  violation for a non-throwing task.
 - Writer chain order for concurrently registered writers is linearized by the
   mutex; every reader observes a value from the chain consistent with that
   order (same model as single-threaded `var`, now with a lock-defined total
   order).
 - `get()` returns the value of the slot that was current at the linearization
   point of the call.
-- Moving a `shared_var` from two threads simultaneously is a data race on the
-  user side (same contract as `std::shared_ptr`).
-- Folly backend: the ordinary `get`/`wait` uses a per-call waiter node and is
-  multi-waiter safe; the direct wait on a task (e.g. the forwarded-producer
-  wait) retains the single-waiter Baton limitation.
+- Moving from or rebinding one handle object concurrently with another access
+  to that object is a data race on the user side.
+- Every blocking `get`/`wait` path, including an adopted forwarded `var`, uses
+  a distinct waiter node and releases the shared-state mutex while blocked.
 
 ## 7. Out of scope / future work
 
-- **Forwarding of `shared_var` *as a producer*'s result**: a `shared_var`
-  cannot be *created* by a task returning one (there is no `shared_run`); a
-  `shared_var` value can still be an *input* to any task, including ones that
-  return `var` (and the adopted result may itself be a forwarded `var`, which
-  is resolved on `get()`/`wait()`, see Decision #3).
-- **Registration of a forwarded shared_var as a run argument** stays one
-  level deep (same limitation as `oox::var`'s own consume path).
+- **Task-produced/forwarded `shared_var`**: the supported forwarding case is a
+  `shared_var<T>` adopting a plain `var<T>` whose producer returns another
+  plain `var<T>`. A task-produced `shared_var` is not adopted or forwarded by
+  this API, and `shared_var<shared_var<U>>` is rejected.
 - **Lock-free handle** (variant 3): pack `{task*, port, flags}` into atomics,
   CAS-based writer chain, seqlock reads. Only if benchmarks show the mutex to
   be a bottleneck at the required concurrency level.
 - **`read(callback)` for `const T&` under the lock**: not needed yet; `get()`
   returns a copy.
-- **Folly multi-waiter on direct task waits**: the ordinary `get`/`wait` is
-  multi-waiter safe (per-call waiter node); only direct waits on a task (the
-  forwarded-producer wait) hit the single-waiter Baton.
 
 ## 8. Verification
 
-- Unit tests (`tests/test_shared_var.cpp`): API coverage, copy semantics,
-  deferred, multi-writer, exceptions, cross-thread smoke, the fast-writer +
-  reader race regression (`GetWhileFastWriters`).
+- Unit tests (`tests/test_shared_var.cpp`): API and constraint coverage, copy
+  semantics, deferred assignment, mutable aliases and their lifetime holds,
+  re-entrant/concurrent lazy materialization, adopted-forwarded registration
+  before producer execution, exception/cancellation propagation, forwarded
+  wait unlock, and the fast-writer + reader race regression.
 - Twist scenarios (`tests/twist/test_twist_shared_var.cpp`):
   - `ConcurrentReaderAndWriterRegistration` — concurrent `run` registration
     on one `shared_var` (reader + writer), deterministic result;
@@ -268,6 +360,15 @@ Access categories through `oox::run` are the same as for `var`:
   - `HandleCopyLifecycle` — copies used/destroyed in other threads;
   - `ConcurrentOppositeOrderMultiVarWritersComplete` — opposite-order
     multi-var writer registration (the anti-cycle guarantee);
+  - `MutableAliasesShareOneWriterRegistration` — aliased mutable arguments
+    share one graph registration and skipped output ports have no owner;
+  - `ConcurrentLazyMaterializationRunsInGraphTasks` — `T{}` runs in graph
+    tasks outside registration locks without corrupting TLS or deadlocking;
+  - `ReentrantPlainVarSetupUsesAnIndependentRegistrationBatch` — user code
+    reached from another argument's setup cannot join the enclosing TLS batch;
+  - forwarded-var countertests — registration before the producer constructs
+    its result object and writer registration while `get()` waits;
+  - exception/cancellation scenarios for both ordinary and forwarded producers;
   - `GetWhileFastWriters` — the waiter-based wait racing a fast writer chain
     (the UAF regression).
 - Twist runtimes: `twist-fault` (real threads + fault injection) and

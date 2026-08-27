@@ -88,6 +88,13 @@ Key properties of the model:
   handle and the graph's notifications keep nodes alive until all consumers
   are done. Raw `release(n)` accounting is what makes retains (bumping
   `life_count` as an external hold) invalid — see the shared_var design doc.
+- **Submission rejection** — when compiler exception handling is available,
+  an attached successor rejected by a backend is completed inline while the
+  producer continues traversing its detached arc list. Lazy `shared_var`
+  publication preserves its caller-visible submission exception after the
+  installed materializer and its waiters reach terminal states. With compiler
+  exceptions disabled (`-fno-exceptions`), these recovery catches are not
+  compiled and publication uses the direct backend path.
 - **Writer chain** — multiple writers on one handle are linked through
   `next_writer`; the last registered writer is the *current* one, and each
   writer runs after the previous completes (anti-dependency via `countdown`).
@@ -99,7 +106,9 @@ Key properties of the model:
   consumed by `oox::run` as an argument.
 - **`oox::shared_var<T>`** — thread-safe, copyable, reference-counted
   counterpart. Multiple threads may register readers/writers through
-  `oox::run`, call `get()`/`wait()`, copy, and assign. See
+  `oox::run`, call `get()`/`wait()`, copy the handle, and assign `T` values.
+  Copy/move assignment that rebinds the same handle object requires external
+  synchronization, as it does for one `std::shared_ptr` object. See
   `docs/design-shared-var.md`.
 - **`oox::node`** — `var<void>`; carries only dependency info.
 
@@ -216,10 +225,23 @@ void wait_for_all(const shared_var<T, CanThrow>&);
 
 `CanThrow` (with `OOX_EXCEPTIONS_ENABLED=ON`) adds exception-aware state
 machinery: failed tasks propagate through the graph and `get()` rethrows.
+This policy starts after a task has been published. Dependency registration in
+`run()` is synchronous and intentionally provides no exception-safety
+guarantee: if argument `setup()` throws, OOX does not roll back registrations
+or reclaim the unpublished task. Applications must treat graph-construction
+failures as fatal or prevent them at that boundary.
+For `CanThrow == false`, operations performed by argument consumption are also
+part of the non-throwing contract: deferred/forwarded materialization and a
+copy/move or cross-type conversion from the actual stored-value reference must
+be `noexcept`. Omitted defaulted callable parameters are allowed; checks cover
+only the supplied argument prefix. Lazy materialization prefers a nothrow move,
+then a nothrow copy, and runs in a graph task so exception-enabled failures are
+propagated asynchronously. Unsafe non-throwing combinations are rejected at
+compile time even when exception machinery is disabled.
 
 ## 4. Build
 
-Requirements: CMake ≥ 3.14, a C++17/20 compiler, GTest, Google Benchmark,
+Requirements: CMake ≥ 3.14, a C++20 compiler, GTest, Google Benchmark,
 optionally TBB / TaskFlow / Folly / OpenMP / Twist.
 
 ```sh
