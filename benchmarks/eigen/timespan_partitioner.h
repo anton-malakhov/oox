@@ -121,7 +121,7 @@ struct Task {
 
   bool IsDivisible() const {
     return (Current_ + Split_.GrainSize < End_) &&
-           !Eigen::internal::IsStackHalfConsumed();
+           !oox::detail::eigen_pool::internal::IsStackHalfConsumed();
   }
 
   void DistributeWork() {

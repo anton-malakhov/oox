@@ -6,24 +6,23 @@
 
 #define EIGEN_USE_THREADS
 #include "oox/eigen/nonblocking_thread_pool.h"
-#include "oox/eigen/tracing.h"
 
-inline Eigen::ThreadPool& EigenPool() {
-  static auto pool = Eigen::ThreadPool(GetNumThreads(), true, true);
+inline oox::detail::eigen_pool::ThreadPool& EigenPool() {
+  static auto pool =
+      oox::detail::eigen_pool::ThreadPool(GetNumThreads(), true, true);
   return pool;
 }
 
 class EigenPoolWrapper {
 public:
   template <typename F> void run(F &&f) {
-    EigenPool().Schedule(Eigen::MakeTask(std::forward<F>(f)));
+    EigenPool().Schedule(
+        oox::detail::eigen_pool::MakeTask(std::forward<F>(f)));
   }
 
   template <typename F> void run_on_thread(F &&f, size_t hint) {
-    auto task = Eigen::MakeProxyTask(std::forward<F>(f));
-    Eigen::Tracing::TaskShared();
-    EigenPool().RunOnThread(task, hint);
-    EigenPool().Schedule(task); // might push twice to the same thread, OK for now
+    EigenPool().RunOnThread(
+        oox::detail::eigen_pool::MakeTask(std::forward<F>(f)), hint);
   }
 
   bool join_main_thread() { return EigenPool().JoinMainThread(); }
