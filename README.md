@@ -6,6 +6,19 @@ Out-of-Order Executor library. Yet another approach to efficient and scalable ta
 * **Build & run**: `make`
 * **Install**: `make install`
 
+## Backend selection
+
+`OOX::OOX` is the backend-neutral interface target. Link `OOX::eigen` to select
+the bundled Eigen-derived scheduler; it links `OOX::OOX` and `Threads::Threads`
+and defines `HAVE_EIGEN=1`. The serial-debug macro intentionally overrides an
+asynchronous backend, while enabling multiple asynchronous backend macros is a
+compile error.
+
+The Eigen worker count defaults to `std::thread::hardware_concurrency()` with a
+one-worker fallback. Set the CMake cache variable `OOX_EIGEN_THREADS` to a
+positive fixed count, or define `OOX_EIGEN_NUM_THREADS` for a direct header
+build.
+
 ## Continuation-focus design
 With nested parallelism, blocking style programming is deadlock-prone and has latency problems. OOX provides semantic way out of these issues.
 
@@ -83,4 +96,3 @@ Access types of `oox::var`'s stored value:
 ## More resources
 * Blog: https://habr.com/en/company/intel/blog/542908/
 * Slides: https://www.slideshare.net/secret/ifHWb6mqkpBOn2
-

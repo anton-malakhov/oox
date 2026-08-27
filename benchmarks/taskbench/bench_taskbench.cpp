@@ -33,6 +33,8 @@ const char* backend_name() {
   return "TF";
 #elif HAVE_FOLLY
   return "FOLLY";
+#elif HAVE_EIGEN
+  return "EIGEN";
 #elif OOX_SERIAL_DEBUG
   return "SERIAL";
 #else
