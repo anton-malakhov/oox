@@ -28,8 +28,8 @@ struct account {
 
     // shared_var writers/readers may lazily materialize a default value,
     // so account must be default-constructible (same requirement as oox::var).
-    account() : points(0) {}
-    explicit account(int p) : points(p) {}
+    account() noexcept : points(0) {}
+    explicit account(int p) noexcept : points(p) {}
 };
 
 // Deterministic LCG, reset per iteration so every iteration does the same work.
