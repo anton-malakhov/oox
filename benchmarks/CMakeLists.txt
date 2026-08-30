@@ -136,17 +136,17 @@ foreach(mode IN LISTS OOX_BACKENDS)
   endforeach()
 endforeach()
 
-if(TBB_FOUND OR Taskflow_FOUND)
+# Disable TF benchmarks while it has deadlock due to taskflow issues
+if(TBB_FOUND)
   add_executable(bench_taskbench_alt_failures bench_taskbench_alt_failures.cpp)
   target_compile_definitions(bench_taskbench_alt_failures PRIVATE
-    HAVE_TBB=$<BOOL:${TBB_FOUND}>
-    HAVE_TF=$<BOOL:${Taskflow_FOUND}>
+    HAVE_TBB=1
+    HAVE_TF=0
   )
   target_link_libraries(bench_taskbench_alt_failures PRIVATE
     ${PROJECT_NAME}
     benchmark::benchmark
     ${TBB_LIBS}
-    ${TF_LIBS}
   )
   target_include_directories(bench_taskbench_alt_failures PRIVATE
     ${PROJECT_NAME}
