@@ -275,11 +275,16 @@ public:
   }
 
   void Cancel() override {
-    // The SC handshake makes cancellation observe every publisher that passed
-    // its cancellation check, or makes that publisher observe cancellation.
-    cancelled_.store(true, std::memory_order_seq_cst);
-    while (rapid_publishers_.load(std::memory_order_seq_cst) != 0) {
-      std::this_thread::yield();
+    cancelled_.store(true, std::memory_order_release);
+    for (auto &data : thread_data_) {
+      // Admission and cancellation share one modification order per target:
+      // either this sets the stop bit first, or it observes the publisher.
+      data.rapid_publication_state.fetch_or(kRapidCancelled,
+                                           std::memory_order_acq_rel);
+      while ((data.rapid_publication_state.load(std::memory_order_acquire) &
+              kRapidPublisherMask) != 0) {
+        std::this_thread::yield();
+      }
     }
     CancelRapidQueues();
     done_.store(true, std::memory_order_release);
@@ -328,6 +333,8 @@ public:
     return pt->region_context;
   }
 
+  void NotifyRapidRegionStart() noexcept { UpdateRapidLinger(); }
+
   template <typename F>
   decltype(auto) ExecuteInRegion(RegionContext *context, F &&function) {
     PerThread *pt = GetPerThread();
@@ -349,25 +356,26 @@ public:
     if (rapid == nullptr) {
       return;
     }
-    struct PublicationGuard {
-      explicit PublicationGuard(std::atomic<size_t> &publishers)
-          : publishers(publishers) {
-        publishers.fetch_add(1, std::memory_order_seq_cst);
-      }
-      ~PublicationGuard() {
-        publishers.fetch_sub(1, std::memory_order_seq_cst);
-      }
-      std::atomic<size_t> &publishers;
-    } publication(rapid_publishers_);
     target %= static_cast<size_t>(num_threads_);
-    if (cancelled_.load(std::memory_order_seq_cst)) {
+    struct PublicationGuard {
+      explicit PublicationGuard(std::atomic<size_t> &state)
+          : state(state), admitted((state.fetch_add(1, std::memory_order_acquire) &
+                                    kRapidCancelled) == 0) {}
+      ~PublicationGuard() { state.fetch_sub(1, std::memory_order_release); }
+      std::atomic<size_t> &state;
+      bool admitted;
+    } publication(thread_data_[target].rapid_publication_state);
+    if (!publication.admitted) {
+      rapid->Cancel();
+      return;
+    }
+    if (cancelled_.load(std::memory_order_acquire)) {
       rapid->Cancel();
       return;
     }
     rapid->AddTickets(1);
-    UpdateRapidLinger();
     if (thread_data_[target].PushRapid(rapid)) {
-      if (cancelled_.load(std::memory_order_seq_cst)) {
+      if (cancelled_.load(std::memory_order_acquire)) {
         rapid->Cancel();
       }
       WakeOneWorker();
@@ -422,6 +430,10 @@ public:
     }
   }
 
+  void NotifyTaskCompletion(bool worker_waiter) {
+    (worker_waiter ? worker_event_ : waiter_event_).NotifyAll();
+  }
+
   void NotifyTaskCompletion() {
     worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
@@ -439,6 +451,9 @@ private:
   static const int kMaxThreads = 1 << kMaxPartitionBits;
   static const int kSpinCount = 64;
   static const unsigned kRapidFairness = 8;
+  static constexpr size_t kRapidCancelled =
+      size_t{1} << (sizeof(size_t) * 8 - 1);
+  static constexpr size_t kRapidPublisherMask = kRapidCancelled - 1;
 
   class EventCount {
   public:
@@ -561,12 +576,15 @@ private:
   struct ThreadData {
     ThreadData()
         : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
-          mailbox(1024), rapid_slot(nullptr), rapid_overflow(1024) {}
+          mailbox(1024), rapid_publication_state(0), rapid_slot(nullptr),
+          rapid_overflow(1024) {}
     std::unique_ptr<Thread> thread;
     std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+    // High bit rejects new publishers; the remaining bits count active ones.
+    std::atomic<size_t> rapid_publication_state;
     std::atomic<RapidTask *> rapid_slot;
     rigtorp::mpmc::Queue<RapidTask *> rapid_overflow;
 
@@ -637,10 +655,9 @@ private:
   EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
-  std::atomic<size_t> rapid_publishers_{0};
   std::atomic<size_t> registrations_started_{0};
   std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
-  std::atomic<uint64_t> last_rapid_publication_ns_{0};
+  std::atomic<uint64_t> last_rapid_region_ns_{0};
 
   bool creator_registered_ = false;
   std::thread::id creator_thread_id_;
@@ -710,7 +727,7 @@ private:
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
     const uint64_t previous =
-        last_rapid_publication_ns_.exchange(now, std::memory_order_relaxed);
+        last_rapid_region_ns_.exchange(now, std::memory_order_relaxed);
     if (previous == 0) {
       return;
     }

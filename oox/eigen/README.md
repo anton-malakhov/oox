@@ -22,9 +22,10 @@ trees split both workers and iterations proportionally, and TLS region contexts
 propagate subdomains into nested loops. A per-worker atomic inbox with a bounded
 lock-free overflow is checked with a fairness budget before ordinary work. If
 that bounded rapid path fills, the activation's embedded ticket falls back to
-the ordinary queue. Descriptors come from a preallocated,
-generation-stamped slab. A completion ticket makes the transition to zero the
-unique descriptor-recycling claim, and completion follows the activation tree.
+the ordinary queue. Descriptors come from a preallocated slab with an
+ABA-stamped free-list head. A completion ticket makes the transition to zero
+the unique descriptor-recycling claim, and completion follows the activation
+tree.
 Optional elastic lending leases one balanced topology subtree with one stamped
 CAS.
 

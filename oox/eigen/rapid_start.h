@@ -45,10 +45,10 @@ public:
   using Invoke = void (*)(void *, size_t, size_t);
 
   RapidRegion(RapidDomainState &state, RegionContext *parent, DomainId domain,
-              void *function, Invoke invoke)
+              bool worker_waiter, void *function, Invoke invoke)
       : RapidRegionBase(parent ? parent->region : nullptr, domain),
-        state_(state), parent_context_(parent), function_(function),
-        invoke_(invoke) {}
+        state_(state), parent_context_(parent), worker_waiter_(worker_waiter),
+        function_(function), invoke_(invoke) {}
 
   void Run(size_t begin, size_t end) noexcept {
     if (cancelled_.load(std::memory_order_acquire)) {
@@ -78,6 +78,7 @@ public:
 private:
   RapidDomainState &state_;
   RegionContext *parent_context_;
+  bool worker_waiter_;
   void *function_;
   Invoke invoke_;
   std::atomic<bool> cancelled_{false};
@@ -118,7 +119,6 @@ private:
   std::atomic<State> state_{State::Free};
   std::atomic<uint32_t> next_free_{0};
   RapidFallbackTask fallback_;
-  uint64_t generation_ = 0;
 };
 
 class RapidDomainState {
@@ -144,12 +144,7 @@ public:
   void Publish(Activation &activation) {
     pool_.ScheduleRapid(&activation, activation.context_.domain.start);
   }
-  uint64_t BeginRegion() noexcept {
-    return group_generation_.fetch_add(1, std::memory_order_release) + 1;
-  }
-  uint64_t GroupGeneration() const noexcept {
-    return group_generation_.load(std::memory_order_acquire);
-  }
+  void BeginRegion() noexcept { pool_.NotifyRapidRegionStart(); }
   SubtreeLease TryLeaseSubtree(DomainId domain) noexcept;
 
 private:
@@ -189,8 +184,6 @@ private:
   std::vector<Activation> activations_;
   std::vector<LeaseRecord> leases_;
   std::atomic<uint64_t> free_head_{EncodeHead(0, 0)};
-  std::atomic<uint64_t> next_generation_{1};
-  std::atomic<uint64_t> group_generation_{0};
   std::atomic<uint64_t> next_lease_generation_{1};
 };
 
@@ -272,7 +265,7 @@ struct RapidStartGroup {
 inline void RapidRegion::Finish() noexcept {
   ThreadPool *pool = &state_.Pool();
   complete_.store(true, std::memory_order_release);
-  pool->NotifyTaskCompletion();
+  pool->NotifyTaskCompletion(worker_waiter_);
 }
 
 inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
@@ -309,8 +302,6 @@ inline Activation *RapidDomainState::Acquire() {
     if (free_head_.compare_exchange_weak(head, replacement,
                                          std::memory_order_acq_rel,
                                          std::memory_order_acquire)) {
-      activation.generation_ =
-          next_generation_.fetch_add(1, std::memory_order_relaxed);
       return &activation;
     }
   }
@@ -425,7 +416,9 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
   ThreadPool &pool = group.state->Pool();
   RegionContext *parent = pool.CurrentRegionContext();
   DomainId domain = parent ? parent->domain : group.domain;
-  RapidRegion region(*group.state, parent, domain, function_ptr, invoke);
+  RapidRegion region(*group.state, parent, domain,
+                     pool.CurrentThreadId() < pool.NumThreads(), function_ptr,
+                     invoke);
   group.state->BeginRegion();
   Activation *root = group.state->Acquire();
   root->Initialize(*group.state, region, nullptr, parent, domain, begin, end);
