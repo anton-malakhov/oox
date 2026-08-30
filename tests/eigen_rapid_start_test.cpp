@@ -21,8 +21,10 @@ using oox::detail::eigen_pool::rapid::RapidStartGroup;
 using namespace std::chrono_literals;
 
 struct RapidHarness {
-  explicit RapidHarness(unsigned workers, bool spinning = false)
-      : pool(static_cast<int>(workers), spinning, false), state(pool),
+  explicit RapidHarness(unsigned workers, bool spinning = false,
+                        size_t slots_per_worker = 128)
+      : pool(static_cast<int>(workers), spinning, false),
+        state(pool, slots_per_worker),
         group{&state, {0, workers}} {}
 
   void AwaitRegistrations() {
@@ -136,6 +138,15 @@ TEST(EigenRapidStart, PropagatesExceptionsAndReusesDescriptors) {
     std::atomic<int> count{0};
     ParallelFor(harness.group, 0, 8, [&](size_t) { count.fetch_add(1); });
     ASSERT_EQ(count.load(), 8);
+  }
+}
+
+TEST(EigenRapidStart, DirectActivationsStayAliveUntilTryRunReturns) {
+  RapidHarness harness(8, false, 2);
+  for (int iteration = 0; iteration < 5000; ++iteration) {
+    std::atomic<int> count{0};
+    ParallelFor(harness.group, 0, 64, [&](size_t) { count.fetch_add(1); });
+    ASSERT_EQ(count.load(), 64) << "iteration " << iteration;
   }
 }
 

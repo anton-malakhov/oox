@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -104,7 +105,6 @@ public:
 private:
   friend class RapidDomainState;
   void Complete() noexcept;
-  void TryRecycle() noexcept;
 
   RapidDomainState *owner_ = nullptr;
   RapidRegion *region_ = nullptr;
@@ -286,7 +286,8 @@ inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
   context_ = {&region, domain, parent_context};
   begin_ = begin;
   end_ = end;
-  tickets_.store(0, std::memory_order_relaxed);
+  // The initial ticket keeps the descriptor alive until completion.
+  tickets_.store(1, std::memory_order_relaxed);
   children_.store(0, std::memory_order_relaxed);
   state_.store(State::Pending, std::memory_order_release);
 }
@@ -337,8 +338,19 @@ inline bool Activation::TryRun() {
 
 inline void Activation::ReleaseTicket() {
   const size_t previous = tickets_.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous > 0);
   if (previous == 1) {
-    TryRecycle();
+    assert(state_.load(std::memory_order_acquire) == State::Complete);
+    RapidDomainState *owner = owner_;
+    Activation *parent = parent_;
+    RapidRegion *region = region_;
+    state_.store(State::Free, std::memory_order_release);
+    owner->Release(*this);
+    if (parent) {
+      parent->ChildComplete();
+    } else {
+      region->Finish();
+    }
   }
 }
 
@@ -358,24 +370,8 @@ inline void Activation::ChildComplete() noexcept {
 }
 
 inline void Activation::Complete() noexcept {
-  // Keep the activation non-recyclable while completion propagation uses it.
-  if (parent_) {
-    parent_->ChildComplete();
-  } else {
-    region_->Finish();
-  }
   state_.store(State::Complete, std::memory_order_release);
-  TryRecycle();
-}
-
-inline void Activation::TryRecycle() noexcept {
-  State expected = State::Complete;
-  if (tickets_.load(std::memory_order_acquire) == 0 &&
-      state_.compare_exchange_strong(expected, State::Free,
-                                     std::memory_order_acq_rel,
-                                     std::memory_order_acquire)) {
-    owner_->Release(*this);
-  }
+  ReleaseTicket();
 }
 
 inline void RapidDomainState::Execute(Activation &activation) noexcept {
@@ -407,7 +403,9 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
                     {middle_worker, activation.context_.domain.limit},
                     middle_work, activation.end_);
   Publish(*right);
+  left->AddTickets(1);
   left->TryRun();
+  left->ReleaseTicket();
 }
 
 template <typename F>
@@ -431,7 +429,9 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
   group.state->BeginRegion();
   Activation *root = group.state->Acquire();
   root->Initialize(*group.state, region, nullptr, parent, domain, begin, end);
+  root->AddTickets(1);
   root->TryRun();
+  root->ReleaseTicket();
   pool.HelpUntil(region);
   region.Rethrow();
 }

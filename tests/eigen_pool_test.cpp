@@ -15,8 +15,42 @@
 namespace {
 
 using oox::detail::eigen_pool::MakeTask;
+using oox::detail::eigen_pool::RapidFallbackTask;
+using oox::detail::eigen_pool::RapidTask;
+using oox::detail::eigen_pool::RegionContext;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
+
+struct CountingRapidTask final : RapidTask {
+  CountingRapidTask(std::atomic<int> &count, int total,
+                    std::promise<void> &completed)
+      : count(count), total(total), completed(completed) {}
+
+  void AddTickets(size_t count) final { tickets.fetch_add(count); }
+  bool TryRun() final {
+    if (claimed.exchange(true)) {
+      return false;
+    }
+    if (count.fetch_add(1) + 1 == total) {
+      completed.set_value();
+    }
+    return true;
+  }
+  void Cancel() noexcept final { claimed.store(true); }
+  void ReleaseTicket() final { tickets.fetch_sub(1); }
+  RegionContext *Context() noexcept final { return &context; }
+  oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
+    return &fallback;
+  }
+
+  std::atomic<int> &count;
+  int total;
+  std::promise<void> &completed;
+  std::atomic<bool> claimed{false};
+  std::atomic<size_t> tickets{0};
+  RegionContext context;
+  RapidFallbackTask fallback;
+};
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
@@ -100,6 +134,34 @@ TEST(EigenPool, QueueOverflowDoesNotRecurseInline) {
 
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(completed_count.load(), task_count);
+}
+
+TEST(EigenPool, RapidOverflowUsesOrdinaryQueueFallback) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> entered, release, completed;
+  auto entered_result = entered.get_future();
+  auto release_result = release.get_future().share();
+  auto completed_result = completed.get_future();
+  pool.Schedule(MakeTask([&] {
+    entered.set_value();
+    release_result.wait();
+  }));
+  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
+
+  constexpr int task_count = 1026;
+  std::atomic<int> count{0};
+  std::vector<std::unique_ptr<CountingRapidTask>> tasks;
+  for (int i = 0; i < task_count; ++i) {
+    tasks.push_back(
+        std::make_unique<CountingRapidTask>(count, task_count, completed));
+    pool.ScheduleRapid(tasks.back().get(), 0);
+  }
+  release.set_value();
+  EXPECT_EQ(completed_result.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(count.load(), task_count);
+  for (const auto &task : tasks) {
+    EXPECT_EQ(task->tickets.load(), 0u);
+  }
 }
 
 TEST(EigenPool, AcceptsConcurrentExternalProducers) {

@@ -33,10 +33,11 @@ contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
 `RAPID_START` uses the Eigen pool's lifetime worker registrations. Each
 invocation creates an independent stack region and publishes a hierarchical
-activation tree through per-worker inboxes with exactly-once ordinary-queue
-fallback tickets. Nested calls inherit contiguous worker domains, so nested
-matrix multiplication and transpose are enabled. The implementation supports
-the pool's full 65535-worker limit rather than the historical 64-bit mask.
+activation tree through per-worker inboxes, falling back to the ordinary queue
+when a bounded rapid inbox fills. Nested calls inherit contiguous worker
+domains, so nested matrix multiplication and transpose are enabled. The
+implementation supports the pool's full 65535-worker limit rather than the
+historical 64-bit mask.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

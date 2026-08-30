@@ -349,22 +349,18 @@ public:
       rapid->Cancel();
       return;
     }
-    rapid->AddTickets(2);
+    rapid->AddTickets(1);
     UpdateRapidLinger();
-    TaskPtr fallback = rapid->FallbackTicket();
-    try {
-      static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
-      if (!thread_data_[target].PushRapid(rapid)) {
-        rapid->ReleaseTicket();
-      }
+    if (thread_data_[target].PushRapid(rapid)) {
       if (cancelled_.load(std::memory_order_acquire)) {
         rapid->Cancel();
       }
-    } catch (...) {
-      fallback->Discard();
-      rapid->ReleaseTicket();
-      throw;
+      WakeOneWorker();
+      return;
     }
+
+    TaskPtr fallback = rapid->FallbackTicket();
+    static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
     try {
       PublishTask(fallback, static_cast<int>(target), false);
     } catch (...) {
