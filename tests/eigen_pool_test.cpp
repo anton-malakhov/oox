@@ -23,10 +23,19 @@ using namespace std::chrono_literals;
 
 struct CountingRapidTask final : RapidTask {
   CountingRapidTask(std::atomic<int> &count, int total,
-                    std::promise<void> &completed)
-      : count(count), total(total), completed(completed) {}
+                    std::promise<void> &completed,
+                    std::promise<void> *publishing = nullptr,
+                    std::shared_future<void> published = {})
+      : count(count), total(total), completed(completed), publishing(publishing),
+        published(published) {}
 
-  void AddTickets(size_t count) final { tickets.fetch_add(count); }
+  void AddTickets(size_t count) final {
+    tickets.fetch_add(count);
+    if (publishing) {
+      publishing->set_value();
+      published.wait();
+    }
+  }
   bool TryRun() final {
     if (claimed.exchange(true)) {
       return false;
@@ -50,6 +59,8 @@ struct CountingRapidTask final : RapidTask {
   std::atomic<size_t> tickets{0};
   RegionContext context;
   RapidFallbackTask fallback;
+  std::promise<void> *publishing;
+  std::shared_future<void> published;
 };
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
@@ -162,6 +173,25 @@ TEST(EigenPool, RapidOverflowUsesOrdinaryQueueFallback) {
   for (const auto &task : tasks) {
     EXPECT_EQ(task->tickets.load(), 0u);
   }
+}
+
+TEST(EigenPool, CancellationWaitsForRapidPublication) {
+  ThreadPool pool(1, false, false);
+  std::atomic<int> count{0};
+  std::promise<void> completed, publishing, release;
+  auto publishing_result = publishing.get_future();
+  CountingRapidTask task(count, 1, completed, &publishing,
+                         release.get_future().share());
+  auto schedule = std::async(std::launch::async,
+                             [&] { pool.ScheduleRapid(&task, 0); });
+  ASSERT_EQ(publishing_result.wait_for(2s), std::future_status::ready);
+  auto cancel = std::async(std::launch::async, [&] { pool.Cancel(); });
+  EXPECT_EQ(cancel.wait_for(10ms), std::future_status::timeout);
+  release.set_value();
+  EXPECT_EQ(schedule.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(cancel.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(task.tickets.load(), 0u);
+  EXPECT_EQ(count.load(), 0);
 }
 
 TEST(EigenPool, AcceptsConcurrentExternalProducers) {

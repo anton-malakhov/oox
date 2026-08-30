@@ -275,7 +275,12 @@ public:
   }
 
   void Cancel() override {
-    cancelled_.store(true, std::memory_order_release);
+    // The SC handshake makes cancellation observe every publisher that passed
+    // its cancellation check, or makes that publisher observe cancellation.
+    cancelled_.store(true, std::memory_order_seq_cst);
+    while (rapid_publishers_.load(std::memory_order_seq_cst) != 0) {
+      std::this_thread::yield();
+    }
     CancelRapidQueues();
     done_.store(true, std::memory_order_release);
 
@@ -344,15 +349,25 @@ public:
     if (rapid == nullptr) {
       return;
     }
+    struct PublicationGuard {
+      explicit PublicationGuard(std::atomic<size_t> &publishers)
+          : publishers(publishers) {
+        publishers.fetch_add(1, std::memory_order_seq_cst);
+      }
+      ~PublicationGuard() {
+        publishers.fetch_sub(1, std::memory_order_seq_cst);
+      }
+      std::atomic<size_t> &publishers;
+    } publication(rapid_publishers_);
     target %= static_cast<size_t>(num_threads_);
-    if (cancelled_.load(std::memory_order_acquire)) {
+    if (cancelled_.load(std::memory_order_seq_cst)) {
       rapid->Cancel();
       return;
     }
     rapid->AddTickets(1);
     UpdateRapidLinger();
     if (thread_data_[target].PushRapid(rapid)) {
-      if (cancelled_.load(std::memory_order_acquire)) {
+      if (cancelled_.load(std::memory_order_seq_cst)) {
         rapid->Cancel();
       }
       WakeOneWorker();
@@ -622,6 +637,7 @@ private:
   EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
+  std::atomic<size_t> rapid_publishers_{0};
   std::atomic<size_t> registrations_started_{0};
   std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
   std::atomic<uint64_t> last_rapid_publication_ns_{0};
