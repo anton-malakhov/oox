@@ -270,8 +270,9 @@ struct RapidStartGroup {
 };
 
 inline void RapidRegion::Finish() noexcept {
+  ThreadPool *pool = &state_.Pool();
   complete_.store(true, std::memory_order_release);
-  state_.Pool().NotifyTaskCompletion();
+  pool->NotifyTaskCompletion();
 }
 
 inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
@@ -343,15 +344,10 @@ inline void Activation::ReleaseTicket() {
 
 inline void Activation::Cancel() noexcept {
   State expected = State::Pending;
-  if (state_.compare_exchange_strong(expected, State::Complete,
+  if (state_.compare_exchange_strong(expected, State::Running,
                                      std::memory_order_acq_rel,
                                      std::memory_order_acquire)) {
-    if (parent_) {
-      parent_->ChildComplete();
-    } else {
-      region_->Finish();
-    }
-    TryRecycle();
+    Complete();
   }
 }
 
@@ -362,12 +358,13 @@ inline void Activation::ChildComplete() noexcept {
 }
 
 inline void Activation::Complete() noexcept {
-  state_.store(State::Complete, std::memory_order_release);
+  // Keep the activation non-recyclable while completion propagation uses it.
   if (parent_) {
     parent_->ChildComplete();
   } else {
     region_->Finish();
   }
+  state_.store(State::Complete, std::memory_order_release);
   TryRecycle();
 }
 
