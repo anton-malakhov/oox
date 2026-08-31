@@ -179,7 +179,9 @@ tf::Taskflow taskflow;
 #endif // __USE_TF__
 
 static int GetNumThreads() {
-#if HAVE_TBB
+#if __USE_EIGEN__
+    return ::GetNumThreads();
+#elif HAVE_TBB
     return ::tbb::info::default_concurrency(); //tbb::this_task_arena::max_concurrency();
 #elif HAVE_OMP
     return omp_get_max_threads();
