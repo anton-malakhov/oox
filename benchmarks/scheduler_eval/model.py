@@ -22,7 +22,38 @@ COLORS = {
     "RAPID_LAZY_STEALING": "#7570b3",
     "EIGEN_STEALING": "#d95f02",
     "EIGEN_SHARING": "#2a9d50",
+    "EIGEN_STEALING_GRAINSIZE": "#e6ab02",
     "EIGEN_SHARING_STEALING": "#8e5bb7",
+}
+POLICY_MODELS = {
+    "EIGEN_STEALING": {
+        "name": "fixed-grain work stealing",
+        "events": "N/g-1 binary splits, exposed through the local deque",
+    },
+    "EIGEN_SHARING": {
+        "name": "work sharing plus fixed-grain stealing",
+        "events": "min(P,N)-1 targeted tree publications, then fixed-grain splits",
+    },
+    "EIGEN_STEALING_GRAINSIZE": {
+        "name": "timespan-grain work stealing",
+        "events": "a serial g_hat prefix, then splits of the residual range",
+    },
+    "EIGEN_SHARING_STEALING": {
+        "name": "work sharing plus timespan-grain stealing",
+        "events": "targeted tree publications, then locally measured effective grains",
+    },
+    "RAPID_START": {
+        "name": "static Rapid Start",
+        "events": "min(P,N)-1 rapid activations and one contiguous range per slot",
+    },
+    "RAPID_MAILBOX": {
+        "name": "Rapid Start to stealable mailboxes",
+        "events": "rapid activations followed by B(N,P) ordinary range tasks",
+    },
+    "RAPID_LAZY_STEALING": {
+        "name": "lazy Rapid Start stealing",
+        "events": "rapid activations, P first reservations, then B(N,P)-P claims",
+    },
 }
 
 
@@ -74,29 +105,46 @@ def nonnegative_line_fit(xs, ys):
                                    for x, y in zip(xs, ys)))
 
 
+def holdout_values(values):
+    """Deterministic interpolation plus largest-size holdout."""
+    ordered = sorted(set(values))
+    held_out = {value for index, value in enumerate(ordered) if index % 3 == 2}
+    held_out.add(ordered[-1])
+    return held_out
+
+
 def fit_launch(points):
     """Fit H(N)=a+b*(N/scale)^gamma by a bounded grid search."""
     points = sorted(points)
-    scale = float(max(x for x, _ in points))
+    held_out = holdout_values(x for x, _ in points)
+    training = [(x, y) for x, y in points if x not in held_out]
+    scale = float(max(x for x, _ in training))
     best = None
     for step in range(20, 161):
         gamma = step / 100.0
-        xs = [(x / scale) ** gamma for x, _ in points]
-        ys = [y for _, y in points]
+        xs = [(x / scale) ** gamma for x, _ in training]
+        ys = [y for _, y in training]
         a, b = nonnegative_line_fit(xs, ys)
-        error = sum((y - a - b * x) ** 2 for x, y in zip(xs, ys))
+        error = sum(((y - a - b * x) / y) ** 2
+                    for x, y in zip(xs, ys))
         candidate = (error, a, b, gamma)
         if best is None or candidate < best:
             best = candidate
     _, a, b, gamma = best
-    predictions = [a + b * (x / scale) ** gamma for x, _ in points]
+    predictions = {x: a + b * (x / scale) ** gamma for x, _ in points}
     return {
         "intercept_us": a,
         "scale_us": b,
         "task_scale": scale,
         "exponent": gamma,
+        "training_mape_percent": mean_absolute_percentage(
+            [y for x, y in points if x not in held_out],
+            [predictions[x] for x, _ in points if x not in held_out]),
+        "holdout_mape_percent": mean_absolute_percentage(
+            [y for x, y in points if x in held_out],
+            [predictions[x] for x, _ in points if x in held_out]),
         "mape_percent": mean_absolute_percentage(
-            [y for _, y in points], predictions),
+            [y for _, y in points], [predictions[x] for x, _ in points]),
     }
 
 
@@ -136,7 +184,7 @@ def solve_linear(matrix, vector):
 
 
 def nonnegative_least_squares(columns, targets):
-    """Small active-set NNLS; this model uses at most three coefficients."""
+    """Small exhaustive active-set NNLS."""
     width = len(columns[0])
     candidates = [tuple(0.0 for _ in range(width))]
     for mask in range(1, 1 << width):
@@ -156,6 +204,133 @@ def nonnegative_least_squares(columns, targets):
                key=lambda values: sum((target - sum(value * x for value, x
                                                      in zip(values, row))) ** 2
                                       for row, target in zip(columns, targets)))
+
+
+def hybrid_block_size(work, workers, divisor=1):
+    work_per_worker = (work + workers - 1) // workers
+    if work_per_worker <= 8:
+        blocks_per_worker = 2
+    elif work_per_worker <= 64:
+        blocks_per_worker = 8
+    elif work_per_worker <= 4096:
+        blocks_per_worker = 32
+    else:
+        blocks_per_worker = 64
+    blocks = workers * max(blocks_per_worker // divisor, 1)
+    return max((work + blocks - 1) // blocks, 1)
+
+
+def partitioned_block_count(work, slots, block):
+    quotient, remainder = divmod(work, slots)
+    return sum((quotient + (slot < remainder) + block - 1) // block
+               for slot in range(slots))
+
+
+def policy_events(mode, tasks, threads, effective_grain=1):
+    slots = min(tasks, threads)
+    depth = math.ceil(math.log2(slots)) if slots > 1 else 0
+    callbacks = (tasks + slots - 1) // slots
+    fixed_indicator = 1
+    rapid, targeted, ordinary, reservations, claims, block = 0, 0, 0, 0, 0, 0
+    if mode.startswith("RAPID"):
+        rapid = max(0, slots - 1)
+    if mode == "RAPID_START":
+        critical = depth
+    elif mode in ("RAPID_MAILBOX", "RAPID_LAZY_STEALING"):
+        density_workers = threads if mode == "RAPID_MAILBOX" else slots
+        work_per_worker = (tasks + density_workers - 1) // density_workers
+        divisor = (2 if mode == "RAPID_MAILBOX" and
+                   work_per_worker <= 512 else 1)
+        block = hybrid_block_size(tasks, density_workers, divisor)
+        blocks = partitioned_block_count(tasks, slots, block)
+        if mode == "RAPID_MAILBOX":
+            ordinary = blocks
+        else:
+            reservations = slots
+            claims = max(0, blocks - slots)
+        critical = depth + (blocks + slots - 1) // slots
+    else:
+        if mode == "EIGEN_STEALING_GRAINSIZE":
+            prefix = min(tasks, effective_grain)
+            remainder = tasks - prefix
+            callbacks = prefix + (remainder + slots - 1) // slots
+            fixed_indicator = int(remainder != 0)
+            leaves = (remainder + effective_grain - 1) // effective_grain
+            ordinary = max(0, leaves - 1)
+        elif mode == "EIGEN_SHARING_STEALING":
+            quotient, remainder = divmod(tasks, slots)
+            targeted = max(0, slots - 1)
+            for slot in range(slots):
+                length = quotient + (slot < remainder)
+                rest = max(0, length - effective_grain)
+                ordinary += max(0, (rest + effective_grain - 1) //
+                                effective_grain - 1)
+        else:
+            leaves = (tasks + effective_grain - 1) // effective_grain
+            generated = max(0, leaves - 1)
+            if "SHARING" in mode:
+                targeted = min(generated, max(0, slots - 1))
+            ordinary = generated - targeted
+        critical = depth + (ordinary + slots - 1) // slots
+    return {
+        "slots": slots, "fixed_indicator": fixed_indicator,
+        "callbacks_on_critical_worker": callbacks,
+        "critical_scheduler_events": critical, "rapid_activations": rapid,
+        "targeted_publications": targeted, "ordinary_tasks": ordinary,
+        "first_reservations": reservations, "later_block_claims": claims,
+        "block_size": block,
+    }
+
+
+def fit_structural_launch(points, mode, threads, shared_effective_grain=None):
+    held_out = holdout_values(x for x, _ in points)
+    training = [(x, y) for x, y in points if x not in held_out]
+    maximum = max(x for x, _ in points)
+    grains = [1]
+    if mode in ("EIGEN_STEALING_GRAINSIZE", "EIGEN_SHARING_STEALING"):
+        grains = ([shared_effective_grain] if shared_effective_grain else
+                  [1 << power for power in range(int(math.log2(maximum)) + 1)])
+    best = None
+    for grain in grains:
+        features = []
+        for tasks, observed in training:
+            events = policy_events(mode, tasks, threads, grain)
+            features.append((events["fixed_indicator"] / observed,
+                             events["callbacks_on_critical_worker"] / observed,
+                             events["critical_scheduler_events"] / observed))
+        coefficients = nonnegative_least_squares(features,
+                                                  [1.0] * len(training))
+        error = sum((1.0 - sum(value * feature for value, feature in
+                               zip(coefficients, row))) ** 2
+                    for row in features)
+        candidate = (error, grain, coefficients)
+        if best is None or candidate < best:
+            best = candidate
+    _, grain, coefficients = best
+    rows = []
+    for tasks, observed in sorted(points):
+        events = policy_events(mode, tasks, threads, grain)
+        predicted = (coefficients[0] * events["fixed_indicator"] +
+                     coefficients[1] * events["callbacks_on_critical_worker"] +
+                     coefficients[2] * events["critical_scheduler_events"])
+        rows.append({
+            "family": "launch", "case": f"launch/{tasks}",
+            "parameter": tasks, "mode": mode, "observed_us": observed,
+            "predicted_us": predicted,
+            "error_percent": 100.0 * (predicted - observed) / observed,
+            "split": "holdout" if tasks in held_out else "training", **events,
+        })
+    parameter = {
+        "effective_grain": grain, "fixed_us": coefficients[0],
+        "callback_us": coefficients[1],
+        "critical_scheduler_event_us": coefficients[2],
+    }
+    for split in ("training", "holdout"):
+        selected = [row for row in rows if row["split"] == split]
+        parameter[f"{split}_mape_percent"] = mean_absolute_percentage(
+            [row["observed_us"] for row in selected],
+            [row["predicted_us"] for row in selected])
+    return parameter, rows
 
 
 def sparse_weights(rows, columns, kind):
@@ -208,6 +383,13 @@ def spmv_cases(medians, threads):
             "ideal_work": total / threads, "static_max_work": maximum,
             "static_excess": maximum - total / threads,
         })
+    for family in {case["family"] for case in cases}:
+        held_out = holdout_values(case["parameter"] for case in cases
+                                  if case["family"] == family)
+        for case in cases:
+            if case["family"] == family:
+                case["split"] = ("holdout" if case["parameter"] in held_out
+                                 else "training")
     return cases
 
 
@@ -216,7 +398,8 @@ def fit_spmv(cases, launch_fits, modes):
     work_unit = {}
     for family in sorted({case["family"] for case in cases}):
         selected = [case for case in cases
-                    if case["family"] == family and case["mode"] == rapid]
+                    if case["family"] == family and case["mode"] == rapid and
+                    case["split"] == "training"]
         xs = [case["static_max_work"] for case in selected]
         ys = [max(0.0, case["observed_us"] -
                   launch_time(launch_fits[rapid], case["tasks"]))
@@ -227,7 +410,8 @@ def fit_spmv(cases, launch_fits, modes):
                             "work_inflation": 1.0,
                             "residual_static_imbalance": 1.0}}
     for mode in sorted(modes - {rapid}):
-        selected = [case for case in cases if case["mode"] == mode]
+        selected = [case for case in cases if case["mode"] == mode and
+                    case["split"] == "training"]
         columns, targets = [], []
         for case in selected:
             rate = work_unit[case["family"]]
@@ -265,6 +449,12 @@ def fit_spmv(cases, launch_fits, modes):
                                        case["ideal_work"]),
         })
     for mode, coefficient in coefficients.items():
+        for split in ("training", "holdout"):
+            selected = [row for row in predictions if row["mode"] == mode and
+                        row["split"] == split]
+            coefficient[f"{split}_mape_percent"] = mean_absolute_percentage(
+                [row["observed_us"] for row in selected],
+                [row["predicted_us"] for row in selected])
         selected = [row for row in predictions if row["mode"] == mode]
         coefficient["mape_percent"] = mean_absolute_percentage(
             [row["observed_us"] for row in selected],
@@ -297,9 +487,14 @@ def fit_scan(medians, launch_fits, modes, threads):
                       "within_launch_range": within_launch_range})
     if not cases:
         return {}, []
+    held_out = holdout_values(case["parameter"] for case in cases)
+    for case in cases:
+        case["split"] = ("holdout" if case["parameter"] in held_out
+                         else "training")
     coefficients = {}
     for mode in sorted(modes):
-        selected = [case for case in cases if case["mode"] == mode]
+        selected = [case for case in cases if case["mode"] == mode and
+                    case["split"] == "training"]
         call_us, wave_us = nonnegative_least_squares(
             [(case["calls"] / case["observed_us"],
               case["waves"] / case["observed_us"]) for case in selected],
@@ -322,6 +517,12 @@ def fit_scan(medians, launch_fits, modes, threads):
             "static_imbalance_ratio": "",
         })
     for mode, coefficient in coefficients.items():
+        for split in ("training", "holdout"):
+            selected = [row for row in predictions if row["mode"] == mode and
+                        row["split"] == split]
+            coefficient[f"{split}_mape_percent"] = mean_absolute_percentage(
+                [row["observed_us"] for row in selected],
+                [row["predicted_us"] for row in selected])
         selected = [row for row in predictions if row["mode"] == mode]
         coefficient["mape_percent"] = mean_absolute_percentage(
             [row["observed_us"] for row in selected],
@@ -358,11 +559,46 @@ def startup_parameters(result, modes):
     return values
 
 
+def policy_selection(predictions):
+    grouped = {}
+    for row in predictions:
+        grouped.setdefault((row["family"], row["case"], row["split"]), []).append(row)
+    selections = []
+    for (family, case, split), rows in sorted(grouped.items()):
+        observed_best = min(rows, key=lambda row: row["observed_us"])
+        predicted_best = min(rows, key=lambda row: row["predicted_us"])
+        regret = (100.0 * (predicted_best["observed_us"] -
+                           observed_best["observed_us"]) /
+                  observed_best["observed_us"])
+        selections.append({
+            "family": family, "case": case, "split": split,
+            "observed_best": observed_best["mode"],
+            "predicted_best": predicted_best["mode"],
+            "observed_best_us": observed_best["observed_us"],
+            "selected_observed_us": predicted_best["observed_us"],
+            "regret_percent": regret,
+            "correct": observed_best["mode"] == predicted_best["mode"],
+        })
+    summary = {}
+    for split in ("training", "holdout"):
+        selected = [row for row in selections if row["split"] == split]
+        summary[split] = {
+            "cases": len(selected),
+            "accuracy_percent": (100.0 * sum(row["correct"] for row in selected) /
+                                 len(selected) if selected else math.nan),
+            "mean_regret_percent": (sum(row["regret_percent"] for row in selected) /
+                                    len(selected) if selected else math.nan),
+            "max_regret_percent": (max((row["regret_percent"] for row in selected),
+                                       default=math.nan)),
+        }
+    return selections, summary
+
+
 def write_spmv_chart(path, predictions):
     families = ["balanced", "hyperbolic", "triangle"]
     modes = sorted({row["mode"] for row in predictions})
     width, height = 1280, 500
-    left, right, top, bottom, gap = 95, 25, 50, 95, 38
+    left, right, top, bottom, gap = 95, 25, 50, 115, 38
     panel_width = (width - left - right - gap * 2) / 3
     panel_height = height - top - bottom
     all_x = [float(row["parameter"]) for row in predictions]
@@ -421,11 +657,12 @@ def write_spmv_chart(path, predictions):
                                 f'font-size="11">{value:g}</text>')
     legend_x = left
     for index, mode in enumerate(modes):
-        x = legend_x + index * 240
+        x = legend_x + (index % 4) * 290
+        y = height - 34 + (index // 4) * 18
         color = COLORS.get(mode, "#666666")
-        elements.append(f'<line x1="{x}" y1="{height - 17}" x2="{x + 26}" '
-                        f'y2="{height - 17}" stroke="{color}" stroke-width="3"/>')
-        elements.append(f'<text x="{x + 33}" y="{height - 12}" '
+        elements.append(f'<line x1="{x}" y1="{y}" x2="{x + 26}" '
+                        f'y2="{y}" stroke="{color}" stroke-width="3"/>')
+        elements.append(f'<text x="{x + 33}" y="{y + 5}" '
                         f'font-size="12">{html.escape(mode)}</text>')
     path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
                     f'height="{height}" viewBox="0 0 {width} {height}">'
@@ -453,30 +690,47 @@ def main():
                    for mode, points in launch_points.items()}
 
     threads = int(metadata["threads"])
+    structural_launch, launch_predictions = {}, []
+    ordered_modes = sorted(modes, key=lambda mode:
+                           mode != "EIGEN_STEALING_GRAINSIZE")
+    shared_effective_grain = None
+    for mode in ordered_modes:
+        parameter, rows = fit_structural_launch(
+            launch_points[mode], mode, threads,
+            shared_effective_grain if mode == "EIGEN_SHARING_STEALING" else None)
+        structural_launch[mode] = parameter
+        launch_predictions.extend(rows)
+        if mode == "EIGEN_STEALING_GRAINSIZE":
+            shared_effective_grain = parameter["effective_grain"]
     work_unit, spmv_parameters, spmv_predictions = fit_spmv(
         spmv_cases(medians, threads), launch_fits, modes)
     scan_parameters, scan_predictions = fit_scan(
         medians, launch_fits, modes, threads)
     startup = startup_parameters(result, modes)
+    selections, selection_summary = policy_selection(
+        launch_predictions + spmv_predictions + scan_predictions)
 
     summaries, plots = result / "summaries", result / "plots"
     summaries.mkdir(exist_ok=True)
     plots.mkdir(exist_ok=True)
     parameters = {
-        "schema": 1, "result": str(result), "threads": threads,
-        "model": ("T_warm = H_m(N) + rho_m*N + "
+        "schema": 2, "result": str(result), "threads": threads,
+        "model": ("T = I_m/q + A_m + u_m*C(N,P) + v_m*E_m(N,P) + "
                   "kappa_k*(phi_m*W/P + theta_m*Delta_static)"),
         "amortized_model": "T_amortized(q) = I_m/q + T_warm",
+        "policy_models": POLICY_MODELS,
+        "structural_launch": structural_launch,
         "launch": launch_fits,
         "spmv_work_unit_us": work_unit,
         "spmv_mode_parameters": spmv_parameters,
         "scan_mode_parameters": scan_parameters,
         "startup": startup,
+        "policy_selection": selection_summary,
     }
     (summaries / "model_parameters.json").write_text(
         json.dumps(parameters, indent=2, sort_keys=True) + "\n")
 
-    fields = ["family", "case", "parameter", "mode", "observed_us",
+    fields = ["family", "case", "parameter", "mode", "split", "observed_us",
               "predicted_us", "scheduler_us", "body_interaction_us",
               "ideal_work_us", "imbalance_us", "error_percent", "tasks",
               "total_work", "ideal_work", "within_launch_range",
@@ -484,6 +738,21 @@ def main():
     write_csv(summaries / "model_predictions.csv", fields,
               [{field: row.get(field, "") for field in fields}
                for row in spmv_predictions + scan_predictions])
+    launch_fields = ["family", "case", "parameter", "mode", "split",
+                     "observed_us", "predicted_us", "error_percent", "slots",
+                     "fixed_indicator", "callbacks_on_critical_worker",
+                     "critical_scheduler_events",
+                     "rapid_activations", "targeted_publications",
+                     "ordinary_tasks", "first_reservations",
+                     "later_block_claims", "block_size"]
+    write_csv(summaries / "model_launch_predictions.csv", launch_fields,
+              [{field: row.get(field, "") for field in launch_fields}
+               for row in launch_predictions])
+    selection_fields = ["family", "case", "split", "observed_best",
+                        "predicted_best", "observed_best_us",
+                        "selected_observed_us", "regret_percent", "correct"]
+    write_csv(summaries / "model_policy_selection.csv", selection_fields,
+              selections)
     amortization = []
     for mode, values in sorted(startup.items()):
         for calls in (1, 10, 100, 1000, 10000):
@@ -501,16 +770,44 @@ def main():
     with (summaries / "model.md").open("w") as stream:
         stream.write("# Explainable scheduler model\n\n")
         stream.write(f"Fit to `{result.name}` at P={threads}. Times are microseconds.\n\n")
-        stream.write("## SpMV coefficients\n\n")
+        stream.write("Every third ordered problem size and the largest sampled "
+                     "size are holdouts and are not used to tune coefficients.\n\n")
+        stream.write("## Unified model\n\n")
+        stream.write("`T = I/q + A + u C(N,P) + v E_m(N,P) + useful work + "
+                     "residual imbalance`. Here `C=ceil(N/min(P,N))` and `E_m` "
+                     "is the policy-specific critical-path event proxy below. "
+                     "For root timespan stealing, `C=min(N,g_hat) + "
+                     "ceil(max(N-g_hat,0)/P)` and `A` applies only when residual work "
+                     "is published.\n\n")
+        stream.write("| Mode | Policy | Counted events |\n| --- | --- | --- |\n")
+        for mode in sorted(modes):
+            policy = POLICY_MODELS.get(mode, {"name": mode, "events": "generic"})
+            stream.write(f'| {mode} | {policy["name"]} | {policy["events"]} |\n')
+        stream.write("\n## Structural empty-loop calibration\n\n")
+        stream.write("`H = A + u C + v E_m`. The empty-body effective grain is "
+                     "fitted on timespan stealing and shared with the "
+                     "sharing-timespan policy because both use the same gate and "
+                     "body. Other event counts follow the implementation.\n\n")
+        stream.write("| Mode | Effective grain | A (us) | u/callback (us) | "
+                     "v/event (us) | Train MAPE | Holdout MAPE |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        for mode, values in sorted(structural_launch.items()):
+            stream.write(f'| {mode} | {values["effective_grain"]} | '
+                         f'{values["fixed_us"]:.3f} | {values["callback_us"]:.6f} | '
+                         f'{values["critical_scheduler_event_us"]:.6f} | '
+                         f'{values["training_mape_percent"]:.1f}% | '
+                         f'{values["holdout_mape_percent"]:.1f}% |\n')
+        stream.write("\n## SpMV coefficients\n\n")
         stream.write("| Mode | Body interaction/row (us) | Work inflation phi | "
-                     "Residual imbalance theta | MAPE |\n")
-        stream.write("| --- | ---: | ---: | ---: | ---: |\n")
+                     "Residual imbalance theta | Train MAPE | Holdout MAPE |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: | ---: |\n")
         for mode, values in sorted(spmv_parameters.items()):
             stream.write(f'| {mode} | '
                          f'{values["body_interaction_us_per_iteration"]:.3f} | '
                          f'{values["work_inflation"]:.3f} | '
                          f'{values["residual_static_imbalance"]:.3f} | '
-                         f'{values["mape_percent"]:.1f}% |\n')
+                         f'{values["training_mape_percent"]:.1f}% | '
+                         f'{values["holdout_mape_percent"]:.1f}% |\n')
         stream.write("\nThe body-interaction term captures per-row costs that an "
                      "empty `Launch` cannot see (task/body overlap, migration, and "
                      "cache effects). `phi` is extra effective work relative to Rapid Start's "
@@ -520,12 +817,14 @@ def main():
         stream.write("## Launch model\n\n")
         stream.write("`H(N) = a + b (N/Nmax)^gamma`. The exponent describes this "
                      "measurement range; it is not an asymptotic complexity claim.\n\n")
-        stream.write("| Mode | a (us) | b (us) | gamma | MAPE |\n")
-        stream.write("| --- | ---: | ---: | ---: | ---: |\n")
+        stream.write("| Mode | a (us) | b (us) | gamma | Train MAPE | "
+                     "Holdout MAPE |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: | ---: |\n")
         for mode, values in sorted(launch_fits.items()):
             stream.write(f'| {mode} | {values["intercept_us"]:.2f} | '
                          f'{values["scale_us"]:.2f} | {values["exponent"]:.2f} | '
-                         f'{values["mape_percent"]:.1f}% |\n')
+                         f'{values["training_mape_percent"]:.1f}% | '
+                         f'{values["holdout_mape_percent"]:.1f}% |\n')
         stream.write("\n## Cold worker cost\n\n")
         stream.write("Initialization is kept separate: for q calls, add `I/q` to "
                      "each predicted warm call.\n\n")
@@ -541,13 +840,27 @@ def main():
                          "`waves = 2 sum ceil((N/2^j)/P)`. `alpha` is the effective "
                          "hot parallel-call/barrier cost and `beta` combines one wave of "
                          "scan work with body-dependent scheduling.\n\n")
-            stream.write("| Mode | alpha/call (us) | beta/wave (us) | MAPE |\n")
-            stream.write("| --- | ---: | ---: | ---: |\n")
+            stream.write("| Mode | alpha/call (us) | beta/wave (us) | "
+                         "Train MAPE | Holdout MAPE |\n")
+            stream.write("| --- | ---: | ---: | ---: | ---: |\n")
             for mode, values in sorted(scan_parameters.items()):
                 stream.write(f'| {mode} | {values["effective_call_us"]:.3f} | '
                              f'{values["effective_wave_us"]:.6f} | '
-                             f'{values["mape_percent"]:.1f}% |\n')
-        stream.write("\nSee `model_predictions.csv` for every fitted case and "
+                             f'{values["training_mape_percent"]:.1f}% | '
+                             f'{values["holdout_mape_percent"]:.1f}% |\n')
+        stream.write("\n## Policy selection validation\n\n")
+        stream.write("A selector chooses the mode with the smallest prediction. "
+                     "Regret is measured using the observed time of that choice.\n\n")
+        stream.write("| Split | Cases | Exact winner | Mean regret | Max regret |\n")
+        stream.write("| --- | ---: | ---: | ---: | ---: |\n")
+        for split, values in selection_summary.items():
+            stream.write(f'| {split} | {values["cases"]} | '
+                         f'{values["accuracy_percent"]:.1f}% | '
+                         f'{values["mean_regret_percent"]:.1f}% | '
+                         f'{values["max_regret_percent"]:.1f}% |\n')
+        stream.write("\nSee `model_predictions.csv` for every fitted case, "
+                     "`model_launch_predictions.csv` for structural event counts, "
+                     "`model_policy_selection.csv` for choices and regret, and "
                      "`../plots/model_spmv_observed_vs_predicted.svg` for residuals.\n")
 
     print(summaries / "model.md")

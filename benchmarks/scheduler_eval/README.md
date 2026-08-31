@@ -151,16 +151,19 @@ backend, see [Rapid Start versus the normal Eigen backend](RAPID_START_VS_EIGEN.
 
 ## Fit the explanatory model
 
-For a complete full result containing Rapid Start, `Launch`, and all three SpMV
-families, fit the warm task-publication, useful-work, and residual-load-imbalance
-terms, and report separately observed cold initialization with:
+For a complete result containing Rapid Start, `Launch`, and all three SpMV
+families, fit the policy-specific scheduling-event, useful-work, and
+residual-load-imbalance terms, and report separately observed cold initialization
+with:
 
 ```sh
 python3 benchmarks/scheduler_eval/model.py results/scheduler_eval/<result>
 ```
 
-The command adds model parameters, per-case predictions, initialization
-amortization, and an observed-versus-predicted SpMV plot to that result. The
+The command adds fitted parameters, structural launch-event counts, per-case
+predictions, deterministic size-holdout errors, policy-selection regret,
+initialization amortization, and an observed-versus-predicted SpMV plot to that
+result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](PERFORMANCE_MODEL.md).

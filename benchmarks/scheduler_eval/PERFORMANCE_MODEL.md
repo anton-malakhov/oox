@@ -613,6 +613,67 @@ objective, workload distribution, and machine configuration.
 
 ## 7. The executable first-order OOX model
 
+The executable model now starts from one policy-independent decomposition:
+
+$$
+\boxed{
+\widehat T_m(N,W,P,q)=
+\frac{I_m(P)}q+A_m+u_m C(N,P)+v_m E_m(N,P)
++T_{\text{work},m}(W,P)+T_{\text{imbalance},m}
+}
+$$
+
+Here $C=\lceil N/\min(P,N)\rceil$ is the number of callbacks on an ideally
+balanced critical worker. $E_m$ is a policy-specific scheduling-event proxy.
+The fitted $u_m$ and $v_m$ are machine costs, while the event definitions come
+from the implementation:
+
+| Policy | $E_m(N,P)$ used for empty-loop calibration |
+| --- | --- |
+| Fixed-grain work stealing | $\lceil\log_2s\rceil+\lceil(\lceil N/g\rceil-1)/s\rceil$ |
+| Work sharing | $\lceil\log_2s\rceil+\lceil(\lceil N/g\rceil-s)/s\rceil_+$; the first $s-1$ generated nodes are targeted publications |
+| Timespan work stealing | A serial $\widehat g$ prefix, then the fixed-grain expression on $(N-\widehat g)_+$ |
+| Sharing plus timespan stealing | The sharing expression with a fitted effective $\widehat g$ |
+| Static Rapid Start | $\lceil\log_2s\rceil$ activation depth |
+| Rapid mailbox | $\lceil\log_2s\rceil+\lceil B/s\rceil$ |
+| Lazy Rapid stealing | $\lceil\log_2s\rceil+\lceil B/s\rceil$; $s$ first reservations and $B-s$ later claims are reported separately |
+
+In this table $s=\min(P,N)$, $g=1$ in the benchmark, and
+
+$$
+B=\sum_{j=0}^{s-1}\left\lceil\frac{n_j}{b}\right\rceil,
+\qquad
+b=\max\left(g,1,
+\left\lceil\frac{N}{P\,d(N/P)}\right\rceil\right).
+$$
+
+The block-density function $d$ exactly mirrors `HybridBlockSize`: 2, 8, 32,
+or 64 blocks per worker at work-per-worker boundaries 8, 64, and 4096. The
+mailbox policy halves that density through 512 iterations per worker. These
+counts are deterministic opportunities, not observed steal counts. In
+particular, lazy failed probes and cache migration require counters before they
+can become separately identifiable model terms.
+
+Root timespan stealing also replaces the ordinary critical-worker callback count
+with
+
+$$
+C_{\text{timespan}}=min(N,\widehat g)
++\left\lceil\frac{(N-\widehat g)_+}{s}\right\rceil.
+$$
+
+The fixed term $A_m$ is enabled only if that root has residual work to publish.
+This piecewise term is essential: a short empty loop can finish wholly inside
+the calibration prefix without launching parallel work.
+
+The empty-body effective grain is selected over powers of two from timespan
+stealing's training sizes and reused by sharing-timespan, since both execute the
+same body under the same elapsed-time gate. All nonnegative time coefficients
+minimize relative squared error.
+Every third ordered size and the largest sampled size are held out from fitting.
+The report gives training and holdout MAPE separately and validates a
+policy selector by its exact-winner accuracy and observed regret.
+
 For SpMV family $k$ and mode $m$, `model.py` fits the warm-call quantity
 
 $$
@@ -706,7 +767,7 @@ This model is intentionally
 not obtained by blindly summing empty-body `Launch` values: doing that already
 overpredicts some Eigen scan cases.
 
-## 8. What the current full run says
+## 8. What the 2026-07-29 reference run said
 
 The local run `20260729T201647Z_Kirills-MacBook-Pro-3.local` used 16 workers,
 Release Clang 19, and ten repetitions. It is a development snapshot under the
@@ -762,6 +823,40 @@ workers exactly once, whereas median distinct workers are only 7 for stealing,
 requires origin-to-maximum timing plus required-slot coverage, as in the blocking
 tuner probe.
 
+### 8.1 Seven-policy calibration on 2026-08-31
+
+A fresh local calibration at commit `b051105`, Release Apple Clang 16, 16
+workers, seven repetitions, and 0.1 seconds minimum time per case included all
+seven Eigen/Rapid policies. `Launch`, Scan, and the three SpMV shapes were
+measured. Every third ordered size and every family's largest size were excluded
+from fitting.
+
+| Mode | Fitted empty-body grain | Launch holdout MAPE | SpMV holdout MAPE | Scan holdout MAPE |
+| --- | ---: | ---: | ---: | ---: |
+| Eigen stealing | 1 | 8.8% | 12.1% | 6.0% |
+| Eigen sharing | 1 | 7.1% | 12.0% | 5.7% |
+| Eigen timespan stealing | 4096 | 33.4% | 6.9% | 28.1% |
+| Eigen sharing-timespan | 4096 shared | 57.2% | 13.1% | 3.5% |
+| Static Rapid | 1 | 10.6% | 3.3% | 13.5% |
+| Rapid mailbox | 1 | 9.1% | 12.2% | 40.1% |
+| Lazy Rapid stealing | 1 | 9.3% | 17.0% | 8.9% |
+
+The fitted `4096` is an effective callback grain for this empty body on this
+host. It is not a replacement value for `INIT_TIME`: changing the body changes
+how many callbacks fit inside the same elapsed-time gate.
+
+Selecting the lowest predicted mode gave 91.7% exact winners on 12 held-out
+cases, 0.2% mean observed regret, and 2.8% maximum regret. That result is useful
+for a candidate selector, but it does not rescue the poor absolute-time fits in
+the table. The winners often have wide margins. Sharing-timespan's sublinear
+large-loop curve, timespan stealing's piecewise serial prefix, and mailbox Scan's
+repeated synchronization need observed grain, split, claim, failed-probe, and
+worker-coverage counters before their costs can be separated.
+
+The ignored local result is
+`results/scheduler_eval/20260831_model_all_policies`. As with the older run, raw
+JSON must be archived with checksums before these values are used in a paper.
+
 ## 9. Why these coefficients are not publishable yet
 
 1. The host has 12 performance and 4 efficiency cores. macOS pinning is currently
@@ -771,8 +866,9 @@ tuner probe.
 3. The two complete same-commit runs disagree materially. For the overlapping
    cases, Rapid is stable, but several Eigen medians change by much more than 20%.
    The mode order is fixed and recorded system load was very high.
-4. The full run omits `EIGEN_STEALING_GRAINSIZE`. Without it, initial sharing and
-   adaptive grain selection cannot be isolated.
+4. The older full run omitted `EIGEN_STEALING_GRAINSIZE`. The new calibration
+   includes it, but does not record the actual derived grain, so the fitted
+   effective grain still cannot isolate gate timing from body and worker speed.
 5. `Launch` is not a universally transferable scheduler term. In a timespan mode,
    the body determines the measured grain and hence the number of generated tasks.
 6. The three SpMV families need different $\kappa_k$ values. One nonzero is not
@@ -817,7 +913,7 @@ not an invitation to add arbitrary polynomial terms.
 
 The next evaluation should add, in this order:
 
-1. Run all four Eigen policies, especially `EIGEN_STEALING_GRAINSIZE`.
+1. Repeat all seven Eigen/Rapid policies in counterbalanced fresh processes.
 2. Randomize or counterbalance process/mode order and repeat complete runs in
    fresh processes.
 3. Sweep $P=1,2,4,8,12,16$, and compare performance cores only with all cores.
