@@ -186,6 +186,30 @@ TEST(EigenRapidStart, PoolCancellationCompletesPublishedRegions) {
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
 }
 
+TEST(EigenRapidStart, CancellationCompletesConcurrentRoots) {
+  RapidHarness harness(8);
+  constexpr int callers = 8;
+  std::atomic<int> entered{0};
+  std::vector<std::future<void>> results;
+  for (int caller = 0; caller < callers; ++caller) {
+    results.push_back(std::async(std::launch::async, [&] {
+      ParallelFor(harness.group, 0, 10000, [&](size_t index) {
+        if (index == 0) {
+          entered.fetch_add(1, std::memory_order_release);
+        }
+        std::this_thread::sleep_for(100us);
+      });
+    }));
+  }
+  while (entered.load(std::memory_order_acquire) != callers) {
+    std::this_thread::yield();
+  }
+  harness.pool.Cancel();
+  for (auto &result : results) {
+    EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
+  }
+}
+
 TEST(EigenRapidStart, SupportsMoreThanSixtyFourWorkers) {
   RapidHarness harness(65);
   harness.AwaitRegistrations();
