@@ -139,6 +139,7 @@ public:
 
   ThreadPool &Pool() noexcept { return pool_; }
   Activation *Acquire();
+  std::pair<Activation *, Activation *> TryAcquirePair();
   void Release(Activation &activation) noexcept;
   void Execute(Activation &activation) noexcept;
   void Publish(Activation &activation) {
@@ -307,6 +308,31 @@ inline Activation *RapidDomainState::Acquire() {
   }
 }
 
+inline std::pair<Activation *, Activation *>
+RapidDomainState::TryAcquirePair() {
+  uint64_t head = free_head_.load(std::memory_order_acquire);
+  while (true) {
+    const uint32_t first_index = HeadIndex(head);
+    if (first_index == kEmpty) {
+      return {};
+    }
+    Activation &first = activations_[first_index];
+    const uint32_t second_index =
+        first.next_free_.load(std::memory_order_relaxed);
+    if (second_index == kEmpty) {
+      return {};
+    }
+    Activation &second = activations_[second_index];
+    const uint32_t next = second.next_free_.load(std::memory_order_relaxed);
+    const uint64_t replacement = EncodeHead(next, HeadStamp(head) + 1);
+    if (free_head_.compare_exchange_weak(head, replacement,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+      return {&first, &second};
+    }
+  }
+}
+
 inline void RapidDomainState::Release(Activation &activation) noexcept {
   uint64_t head = free_head_.load(std::memory_order_relaxed);
   do {
@@ -382,8 +408,12 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
       activation.context_.domain.start + static_cast<unsigned>(left_workers);
   const size_t middle_work = activation.begin_ + left_work;
 
-  Activation *left = Acquire();
-  Activation *right = Acquire();
+  auto [left, right] = TryAcquirePair();
+  if (!left) {
+    activation.region_->Run(activation.begin_, activation.end_);
+    activation.Complete();
+    return;
+  }
   activation.children_.store(2, std::memory_order_relaxed);
   left->Initialize(*this, *activation.region_, &activation,
                    &activation.context_,

@@ -150,6 +150,13 @@ TEST(EigenRapidStart, DirectActivationsStayAliveUntilTryRunReturns) {
   }
 }
 
+TEST(EigenRapidStart, DescriptorScarcityFallsBackWithoutDeadlock) {
+  RapidHarness harness(2, false, 1);
+  std::atomic<int> count{0};
+  ParallelFor(harness.group, 0, 256, [&](size_t) { count.fetch_add(1); });
+  EXPECT_EQ(count.load(), 256);
+}
+
 TEST(EigenRapidStart, PoolCancellationCompletesPublishedRegions) {
   RapidHarness harness(8);
   std::atomic<bool> entered{false};
