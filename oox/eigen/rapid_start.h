@@ -723,9 +723,9 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
   const size_t work = end - begin;
   const size_t work_per_worker =
       work / group.domain.Size() + (work % group.domain.Size() != 0);
-  // One task per worker is enough for very short slices. Preserve the finer
-  // density once iteration imbalance can dominate publication overhead.
-  const size_t task_density_divisor = work_per_worker <= 64 ? 2 : 1;
+  // Halve publication density through 512 iterations per worker. Preserve
+  // finer tasks beyond that point so irregular work remains stealable.
+  const size_t task_density_divisor = work_per_worker <= 512 ? 2 : 1;
   const size_t block =
       HybridBlockSize(end - begin, group.domain.Size(),
                       std::max<size_t>(grain, 1), task_density_divisor);
