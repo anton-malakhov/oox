@@ -608,6 +608,19 @@ private:
       return task;
     }
 
+    RapidTask *StealRapid() {
+      // Do not take write ownership of an empty remote inbox.
+      RapidTask *task = rapid_slot.load(std::memory_order_relaxed);
+      if (task && rapid_slot.compare_exchange_strong(
+                      task, nullptr, std::memory_order_acquire,
+                      std::memory_order_relaxed)) {
+        return task;
+      }
+      task = nullptr;
+      rapid_overflow.try_pop(task);
+      return task;
+    }
+
     void FlushRapid() {
       while (RapidTask *task = PopRapid()) {
         task->ReleaseTicket();
@@ -855,7 +868,7 @@ private:
       }
       for (unsigned worker = start; worker < limit && !rapid; ++worker) {
         if (worker != static_cast<unsigned>(pt->thread_id)) {
-          rapid = thread_data_[worker].PopRapid();
+          rapid = thread_data_[worker].StealRapid();
         }
       }
     }

@@ -231,17 +231,21 @@ TEST(EigenPool, OrdinaryTaskPreemptsSustainedRapidStream) {
   auto entered_result = entered.get_future();
   auto ordinary_result = ordinary_completed.get_future();
   std::atomic<bool> stop{false};
+  std::atomic<bool> measure_ready{false};
   std::atomic<int> ordinary_run_count{0};
   StreamingRapidTask rapid(pool, entered, stop);
 
   pool.ScheduleRapid(&rapid, 0);
   ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
   pool.Schedule(MakeTask([&] {
+    measure_ready.wait(false, std::memory_order_acquire);
     ordinary_run_count.store(rapid.runs.load());
     stop.store(true, std::memory_order_release);
     ordinary_completed.set_value();
   }));
   const int published_run_count = rapid.runs.load();
+  measure_ready.store(true, std::memory_order_release);
+  measure_ready.notify_one();
 
   EXPECT_EQ(ordinary_result.wait_for(2s), std::future_status::ready);
   while (rapid.tickets.load() != 0) {
