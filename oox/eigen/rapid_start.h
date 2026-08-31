@@ -519,7 +519,7 @@ inline size_t HybridBlockSize(size_t work, size_t workers, size_t grain,
   const size_t blocks_per_worker = work_per_worker <= 8      ? 2
                                    : work_per_worker <= 64   ? 8
                                    : work_per_worker <= 4096 ? 32
-                                                             : 128;
+                                                             : 64;
   const size_t blocks =
       workers *
       std::max<size_t>(blocks_per_worker / blocks_per_worker_divisor, 1);

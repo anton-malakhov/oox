@@ -24,6 +24,27 @@ void Launch(benchmark::State &state) {
 
 enum class SpinPayload { Relax, Atomic, DistributedRead, ThreadLocal };
 
+const SparseMatrix &CachedSparseMatrix(std::size_t rows, std::size_t columns,
+                                       SparseKind kind) {
+  struct Cache {
+    SparseMatrix matrix;
+    SparseKind kind{};
+    std::size_t rows{};
+    std::size_t columns{};
+  };
+  static Cache cache;
+  if (cache.rows != rows || cache.columns != columns || cache.kind != kind) {
+    cache.rows = 0;
+    cache.columns = 0;
+    cache.matrix = {};
+    cache.matrix = MakeSparseMatrix(rows, columns, kind);
+    cache.kind = kind;
+    cache.rows = rows;
+    cache.columns = columns;
+  }
+  return cache.matrix;
+}
+
 struct alignas(hardware_constructive_interference_size) IsolatedValue {
   std::uint64_t value{1};
 };
@@ -96,7 +117,7 @@ template <SparseKind Kind> void SpmvBenchmark(benchmark::State &state) {
                     (static_cast<std::size_t>(GetNumThreads()) << 4) + 7;
   const auto columns = static_cast<std::size_t>(state.range(0)) +
                        (static_cast<std::size_t>(GetNumThreads()) << 2) + 3;
-  const auto matrix = MakeSparseMatrix(rows, columns, Kind);
+  const auto &matrix = CachedSparseMatrix(rows, columns, Kind);
   std::vector<double> input(columns, 1.0), output;
   for (auto _ : state) {
     Spmv(matrix, input, output);

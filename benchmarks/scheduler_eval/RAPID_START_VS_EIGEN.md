@@ -44,7 +44,10 @@ The final implementation replaces that frontier with adaptive blocks. Mailbox
 mode creates at most a bounded oversubscription of flat tasks. Lazy mode creates
 no ordinary tasks: workers claim blocks through cache-line-separated atomic
 cursors and make a one-way transition to unrestricted stealing only when it is
-useful. Both policies honor the caller's grain as a minimum block size.
+useful. Both policies honor the caller's grain as a minimum block size. Large
+slices now stop at 64 blocks per worker instead of 128. Alternated old/new runs
+showed 1.75--1.79x faster 262K mailbox launch and 1.24--1.27x faster lazy launch,
+while retaining 1,024 independently stealable blocks at 16 workers.
 
 Lazy mode reserves all owner blocks before publishing its single execution
 tree. This closes a delayed-owner race: a fast peer can finish before another
@@ -74,37 +77,58 @@ work-stealing mode built from the same commit.
 
 | Iterations | Normal Eigen | Static Rapid | Speedup | Mailbox | Speedup | Lazy | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 14.80 | 7.45 | 1.99x | 14.90 | 0.99x | 9.86 | 1.50x |
-| 512 | 53.70 | 6.65 | 8.08x | 30.90 | 1.74x | 16.50 | 3.25x |
-| 4,096 | 249.00 | 7.17 | 34.73x | 126.00 | 1.98x | 33.40 | 7.46x |
-| 32,768 | 1,802.00 | 11.80 | 152.71x | 135.00 | 13.35x | 40.10 | 44.94x |
-| 262,144 | 14,230.00 | 43.50 | 327.13x | 467.00 | 30.47x | 106.00 | 134.25x |
+| 64 | 26.82 | 13.25 | 2.02x | 22.60 | 1.19x | 23.71 | 1.13x |
+| 512 | 61.08 | 13.49 | 4.53x | 36.89 | 1.66x | 23.84 | 2.56x |
+| 4,096 | 253.08 | 14.07 | 17.98x | 115.80 | 2.19x | 27.43 | 9.23x |
+| 32,768 | 1,728.45 | 14.91 | 115.89x | 124.63 | 13.87x | 31.56 | 54.77x |
+| 262,144 | 13,316.90 | 24.02 | 554.31x | 258.22 | 51.57x | 56.22 | 236.86x |
 
 The normal Eigen loop recursively splits to grain one, so scheduler work grows
 with the iteration count even when the body is almost empty. Static Rapid
 publishes a worker-sized activation tree and then runs contiguous ranges.
 Lazy Rapid adds only bounded atomic block claims, while mailbox mode pays for
-ordinary task allocation and queue publication. That is why mailbox loses the
-most ground at 64 items, where the short-loop density tuning brings it to an
-effective tie with normal Eigen.
+ordinary task allocation and queue publication. Mailbox therefore has the
+smallest advantage at 64 items, while the lower large-slice block cap nearly
+halves its 262K time relative to the preceding implementation.
+
+## Other backend-only scheduler families
+
+The same final run exercises scheduler behavior beyond empty loops. The table
+uses representative medians; units are shown per row.
+
+| Workload | Normal Eigen | Static Rapid | Mailbox | Lazy |
+| --- | ---: | ---: | ---: | ---: |
+| 262K launch (us) | 13,700.17 | 19.02 | 220.63 | 48.48 |
+| 1M one-relax iterations (us) | 55,991.69 | 81.09 | 276.53 | 92.04 |
+| Small blocked reduce (us) | 486.48 | 577.77 | 422.84 | 368.36 |
+| Exclusive scan, 2^22 items (ms) | 409.23 | 1.70 | 5.18 | 2.19 |
+| 1,024 repeated 16-item calls (ms) | 14.42 | 14.23 | 22.41 | 14.98 |
+
+Rapid's bounded activation tree is especially effective for scan, whose many
+phases amplify recursive grain-one scheduler overhead. Lazy is the fastest
+hybrid on the small reduction and stays close to static Rapid on the million
+item loop. The repeated-call row also records the boundary honestly: static
+Rapid ties normal Eigen, lazy is close, and mailbox pays ordinary allocation
+and publication on every tiny call.
 
 ## Balanced and irregular SpMV
 
 The scheduler suite also measures useful work, where low launch time alone is
-not enough. These are matched medians for 131,072-row deterministic CSR
-matrices from the same final run. Times are milliseconds.
+not enough. These are matched medians for deterministic CSR matrices with
+8,455 rows and a 131,139-column input at 16 workers; the benchmark argument is
+the nominal column count, not the row count. Times are milliseconds.
 
 | Distribution | Normal Eigen | Static Rapid | Mailbox | Lazy |
 | --- | ---: | ---: | ---: | ---: |
-| Balanced | 9.721 | 13.158 | 9.545 | 9.228 |
-| Hyperbolic | 5.488 | 29.832 | 5.982 | 5.289 |
-| Triangular | 7.455 | 11.467 | 7.247 | 7.063 |
+| Balanced | 9.087 | 12.782 | 8.847 | 8.831 |
+| Hyperbolic | 5.181 | 28.998 | 5.361 | 4.930 |
+| Triangular | 6.970 | 11.337 | 6.790 | 6.642 |
 
 Static Rapid is deliberately static, so the hyperbolic matrix exposes its
 failure mode: a few heavy leading rows make it about 5.44x slower than normal
-Eigen. Both hybrids remove that cliff. Mailbox ranges from 2.8% faster on the
-triangular input to 9.0% slower on the hyperbolic input. Lazy is 5.1% faster on
-balanced, 3.6% faster on hyperbolic, and 5.3% faster on triangular input. Thus
+Eigen. Both hybrids remove that cliff. Mailbox is 2.6% faster on balanced and
+triangular input and 3.5% slower on the hyperbolic input. Lazy is 2.8% faster on
+balanced, 4.8% faster on hyperbolic, and 4.7% faster on triangular input. Thus
 the lazy policy combines the direct-loop advantage with the load balance
 expected from the normal work-stealing backend.
 
@@ -118,13 +142,13 @@ matched medians are:
 
 | Workload | Normal Eigen | Static Rapid | Mailbox | Lazy |
 | --- | ---: | ---: | ---: | ---: |
-| Matrix multiply | 1.408 ms | 0.321 ms | 0.229 ms | 0.218 ms |
-| Matrix transpose | 55.71 us | 15.36 us | 20.49 us | 17.96 us |
+| Matrix multiply | 1.383 ms | 0.261 ms | 0.212 ms | 0.210 ms |
+| Matrix transpose | 55.17 us | 19.21 us | 24.22 us | 21.31 us |
 
-Mailbox is now 6.15x faster than normal Eigen on nested matrix multiply and
-2.72x faster on transpose. Relative to the untuned mailbox path measured in
-this pass, multiply fell from 3.60 ms to 0.22 ms and transpose from 298 us to
-20.1 us. With one worker, both hybrid modes now collapse to the same direct
+Mailbox is now 6.53x faster than normal Eigen on nested matrix multiply and
+2.28x faster on transpose. Relative to the untuned mailbox path measured in
+this pass, multiply fell from 3.60 ms to 0.21 ms and transpose from 298 us to
+24.2 us. With one worker, both hybrid modes now collapse to the same direct
 serial path as static Rapid; a 262K direct loop measured about 58 us instead of
 124 us for the previous lazy coordinator path.
 
@@ -141,7 +165,7 @@ The final local implementation passed:
 
 - 122/122 tests in both Clang Debug and Clang Release configurations;
 - 45/45 Release scheduler-evaluation oracle, nesting, runner, and smoke tests;
-- 20 complete Rapid-suite repetitions under UBSan on the final code;
+- 50 complete Rapid-suite repetitions under UBSan on the final code;
 - 200 repetitions of the mailbox nesting, cross-pool, one-worker, and
   cancellation edge cases;
 - 500 repetitions of the delayed-owner and forced descriptor-scarcity lazy
@@ -150,7 +174,10 @@ The final local implementation passed:
 - exception propagation and reuse, nested hybrid loops, exact-once visitation,
   concurrent roots, descriptor scarcity, queue saturation, and pool
   cancellation;
-- `clang-tidy` using the exact Release compilation database, with no findings.
+- `clang-tidy` using the exact Release compilation databases; the changed
+  Rapid path had no findings, while the benchmark translation unit retained
+  existing analyzer warnings in the baseline Eigen partitioner and benchmark
+  loop idiom.
 
 AddressSanitizer and ThreadSanitizer were also attempted earlier in the branch
 work, but both runtimes fail before test execution on this Apple host. They are

@@ -72,8 +72,11 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Matrix transpose | Nested tiled regions with short inner tasks |
 
 Inputs are deterministic and construction and validation stay outside measured
-regions. A full SpMV run intentionally has the same large scale as the research
-workload and can require several gigabytes; use `--smoke` before a full run.
+regions. The current SpMV input is reused across Google Benchmark calibration
+and repetition entries so setup does not repeatedly rebuild a multi-gigabyte
+matrix. A full SpMV run intentionally has the same large scale as the research
+workload and can still require several gigabytes; use `--smoke` before a full
+run.
 
 ## Startup and publication probes
 
