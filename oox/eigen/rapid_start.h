@@ -86,7 +86,7 @@ private:
   std::exception_ptr exception_;
 };
 
-class Activation final : public RapidTask {
+class alignas(128) Activation final : public RapidTask {
 public:
   enum class State : unsigned char { Free, Pending, Running, Complete };
 
@@ -113,11 +113,11 @@ private:
   RegionContext context_;
   size_t begin_ = 0;
   size_t end_ = 0;
-  uint32_t slot_ = 0;
   std::atomic<size_t> tickets_{0};
   std::atomic<unsigned> children_{0};
-  std::atomic<State> state_{State::Free};
+  uint32_t slot_ = 0;
   std::atomic<uint32_t> next_free_{0};
+  std::atomic<State> state_{State::Free};
   RapidFallbackTask fallback_;
 };
 
