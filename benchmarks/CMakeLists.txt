@@ -95,6 +95,7 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
+  list(APPEND EIGEN_LOOP_MODES EIGEN_STEALING_LOOP EIGEN_RAPID_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
