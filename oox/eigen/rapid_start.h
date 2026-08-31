@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -527,6 +529,35 @@ inline size_t HybridBlockSize(size_t work, size_t workers, size_t grain,
   return std::max<size_t>({target, grain, 1});
 }
 
+inline constexpr size_t kTimespanLazyTargetNs = 75'000;
+inline constexpr size_t kTimespanLazyMinWorkPerWorker = 512;
+
+inline size_t TimespanBlockSize(size_t current, size_t completed,
+                                size_t elapsed_ns, size_t remaining,
+                                size_t grain, size_t target_ns) noexcept {
+  if (remaining == 0) {
+    return grain;
+  }
+  const long double ratio = std::clamp(
+      static_cast<long double>(target_ns) / std::max<size_t>(elapsed_ns, 1),
+      0.25L, 8.0L);
+  const long double estimate = static_cast<long double>(completed) * ratio;
+  const size_t scaled = estimate >= std::numeric_limits<size_t>::max()
+                            ? std::numeric_limits<size_t>::max()
+                            : std::max<size_t>(static_cast<size_t>(estimate + 0.5L),
+                                               grain);
+  const size_t growth_limit =
+      current > std::numeric_limits<size_t>::max() / 8
+          ? std::numeric_limits<size_t>::max()
+          : current * 8;
+  const size_t balance_limit =
+      std::max(grain, remaining / 4 + (remaining % 4 != 0));
+  const size_t upper = std::max(grain, std::min(growth_limit, balance_limit));
+  const size_t lower = std::min(
+      upper, std::max(grain, current / 4 + (current % 4 != 0)));
+  return std::clamp(scaled, lower, upper);
+}
+
 template <typename F>
 void RunOrdinaryRange(OrdinaryRegion &region, F &function, size_t begin,
                       size_t end) noexcept {
@@ -575,18 +606,20 @@ private:
   size_t end_;
 };
 
-template <typename F> class LazyRangeCoordinator {
+template <typename F, bool Timespan> class LazyRangeCoordinator {
 public:
   LazyRangeCoordinator(ThreadPool &pool, F &function, size_t begin, size_t end,
-                       size_t slots, size_t grain)
+                       size_t slots, size_t grain, size_t target_block_ns = 0)
       : pool_(pool), function_(function), slots_(slots),
         ranges_(new Range[slots]), block_(HybridBlockSize(end - begin, slots,
-                                                         grain)) {
+                                                         grain)),
+        grain_(grain), target_block_ns_(target_block_ns) {
     const size_t quotient = (end - begin) / slots;
     const size_t remainder = (end - begin) % slots;
     size_t cursor = begin;
     for (size_t slot = 0; slot < slots; ++slot) {
       ranges_[slot].next.store(cursor, std::memory_order_relaxed);
+      ranges_[slot].adaptive_block.store(block_, std::memory_order_relaxed);
       cursor += quotient + (slot < remainder);
       ranges_[slot].end = cursor;
     }
@@ -594,13 +627,17 @@ public:
 
   void ReserveFirstBlock(size_t own_slot) noexcept {
     Range &range = ranges_[own_slot];
-    range.first = range.next.fetch_add(block_, std::memory_order_relaxed);
+    range.first = range.next.fetch_add(Block(range), std::memory_order_relaxed);
   }
 
   void Run(size_t own_slot) noexcept {
     Range &range = ranges_[own_slot];
-    RunClaimedBlock(range, range.first);
-    while (!IsCancelled() && RunBlock(own_slot)) {
+    if constexpr (Timespan) {
+      RunTimedBlock(range, range.first, Block(range));
+    } else {
+      RunClaimedBlock(range, range.first, block_);
+    }
+    while (!IsCancelled() && RunBlock(own_slot, true)) {
     }
     bool in_rapid_domain = true;
     while (!IsCancelled() && HasUnclaimedWork()) {
@@ -618,7 +655,7 @@ public:
       bool found = false;
       for (size_t offset = 1; offset < slots_ && !IsCancelled(); ++offset) {
         const size_t slot = (own_slot + offset) % slots_;
-        if (RunBlock(slot)) {
+        if (RunBlock(slot, false)) {
           found = true;
           break;
         }
@@ -638,9 +675,18 @@ public:
 private:
   struct alignas(OOX_EIGEN_CACHE_LINE_SIZE) Range {
     std::atomic<size_t> next{0};
+    std::atomic<size_t> adaptive_block{1};
     size_t first = 0;
     size_t end = 0;
+    size_t samples = 0;
   };
+
+  size_t Block(Range &range) const noexcept {
+    if constexpr (Timespan) {
+      return range.adaptive_block.load(std::memory_order_relaxed);
+    }
+    return block_;
+  }
 
   bool IsCancelled() const noexcept {
     return cancelled_.load(std::memory_order_acquire) || pool_.IsCancelled();
@@ -654,17 +700,47 @@ private:
     }
     return false;
   }
-  bool RunBlock(size_t slot) noexcept {
+  bool RunBlock(size_t slot, bool calibrate) noexcept {
     Range &range = ranges_[slot];
-    const size_t first =
-        range.next.fetch_add(block_, std::memory_order_relaxed);
-    return RunClaimedBlock(range, first);
+    const size_t block = Block(range);
+    const size_t first = range.next.fetch_add(block, std::memory_order_relaxed);
+    if constexpr (Timespan) {
+      if (calibrate) {
+        return RunTimedBlock(range, first, block);
+      }
+    }
+    return RunClaimedBlock(range, first, block);
   }
-  bool RunClaimedBlock(Range &range, size_t first) noexcept {
+  bool RunTimedBlock(Range &range, size_t first, size_t block) noexcept {
     if (first >= range.end) {
       return false;
     }
-    const size_t last = first + std::min(block_, range.end - first);
+    const size_t completed = std::min(block, range.end - first);
+    const auto origin = std::chrono::steady_clock::now();
+    const bool ran = RunClaimedBlock(range, first, block);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - origin)
+                             .count();
+    if (ran && !IsCancelled()) {
+      const size_t cursor = range.next.load(std::memory_order_relaxed);
+      const size_t remaining = cursor < range.end ? range.end - cursor : 0;
+      size_t next = TimespanBlockSize(
+          block, completed, static_cast<size_t>(std::max<decltype(elapsed)>(
+                                elapsed, 1)),
+          remaining, grain_, target_block_ns_);
+      if (range.samples++ != 0) {
+        next = next > block ? block + (next - block) / 4
+                            : block - (block - next) / 4;
+      }
+      range.adaptive_block.store(next, std::memory_order_relaxed);
+    }
+    return ran;
+  }
+  bool RunClaimedBlock(Range &range, size_t first, size_t block) noexcept {
+    if (first >= range.end) {
+      return false;
+    }
+    const size_t last = first + std::min(block, range.end - first);
     try {
       for (size_t index = first; index < last && !IsCancelled(); ++index) {
         std::invoke(function_, index);
@@ -684,6 +760,8 @@ private:
   size_t slots_;
   std::unique_ptr<Range[]> ranges_;
   size_t block_;
+  size_t grain_;
+  size_t target_block_ns_;
   std::atomic<bool> cancelled_{false};
   std::mutex exception_mutex_;
   std::exception_ptr exception_;
@@ -756,9 +834,10 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
   ordinary.Rethrow();
 }
 
-template <typename F>
-void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
-                             F &&function, size_t grain = 1) {
+template <bool Timespan, typename F>
+void ParallelForLazyStealingImpl(RapidStartGroup group, size_t begin,
+                                 size_t end, F &&function, size_t grain,
+                                 size_t target_block_ns) {
   if (!group.state || group.domain.Size() == 0 || begin >= end) {
     return;
   }
@@ -776,10 +855,21 @@ void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
     }
     return;
   }
+  if constexpr (Timespan) {
+    const size_t work = end - begin;
+    const size_t work_per_worker =
+        work / domain.Size() + (work % domain.Size() != 0);
+    if (work_per_worker <= kTimespanLazyMinWorkPerWorker) {
+      ParallelForLazyStealingImpl<false>(
+          group, begin, end, std::forward<F>(function), grain, 0);
+      return;
+    }
+  }
   group.domain = domain;
   const size_t slots = std::min(group.domain.Size(), end - begin);
-  LazyRangeCoordinator<Function> coordinator(pool, callable, begin, end, slots,
-                                             std::max<size_t>(grain, 1));
+  LazyRangeCoordinator<Function, Timespan> coordinator(
+      pool, callable, begin, end, slots, std::max<size_t>(grain, 1),
+      target_block_ns);
   // Protect one block for every proportional owner before work is published.
   // A worker can then steal later blocks without racing a delayed owner.
   for (size_t slot = 0; slot < slots; ++slot) {
@@ -794,6 +884,24 @@ void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
       },
       true);
   coordinator.Rethrow();
+}
+
+template <typename F>
+void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
+                             F &&function, size_t grain = 1) {
+  ParallelForLazyStealingImpl<false>(group, begin, end,
+                                     std::forward<F>(function), grain, 0);
+}
+
+template <typename F>
+void ParallelForTimespanLazyStealing(RapidStartGroup group, size_t begin,
+                                     size_t end, F &&function,
+                                     size_t grain = 1,
+                                     size_t target_block_ns =
+                                         kTimespanLazyTargetNs) {
+  ParallelForLazyStealingImpl<true>(group, begin, end,
+                                    std::forward<F>(function), grain,
+                                    target_block_ns);
 }
 
 } // namespace rapid

@@ -28,8 +28,8 @@ ctest --test-dir build-eval -R scheduler_eval --output-on-failure
 CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
 `EIGEN_SHARING_STEALING`, plus the pool-backed `RAPID_START`, `RAPID_MAILBOX`,
-and `RAPID_LAZY_STEALING` experiments. TBB contributes simple, automatic, and
-affinity partitioners. OpenMP
+`RAPID_LAZY_STEALING`, and `RAPID_TIMESPAN_LAZY_STEALING` experiments. TBB
+contributes simple, automatic, and affinity partitioners. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
 `RAPID_START` uses the Eigen pool's lifetime worker registrations. Each
@@ -50,6 +50,15 @@ Rapid domain once before claiming later blocks from peer ranges. Both modes run
 one-worker effective domains directly. These modes trade some uniform-loop
 launch cost for recovery from irregular static partitions without creating a
 task per item.
+
+`RAPID_TIMESPAN_LAZY_STEALING` retains the same protected first blocks and
+one-way Rapid-domain exit, but each proportional owner times its own blocks and
+smoothly adjusts toward 75 microseconds of useful work. Changes are bounded to
+one quarter through eight times the previous block and leave at least four
+later steal opportunities. Thieves use the owner's latest published block size
+without feeding migration or contention time back into the estimate. Calls at
+or below 512 iterations per effective worker use fixed lazy blocks because the
+clock cost is larger than the available adaptation benefit.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

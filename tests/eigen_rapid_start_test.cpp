@@ -18,8 +18,10 @@ using oox::detail::eigen_pool::ThreadPool;
 using oox::detail::eigen_pool::rapid::ParallelFor;
 using oox::detail::eigen_pool::rapid::ParallelForLazyStealing;
 using oox::detail::eigen_pool::rapid::ParallelForMailbox;
+using oox::detail::eigen_pool::rapid::ParallelForTimespanLazyStealing;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
+using oox::detail::eigen_pool::rapid::TimespanBlockSize;
 using namespace std::chrono_literals;
 
 struct RapidHarness {
@@ -235,16 +237,19 @@ TEST(EigenRapidStart, ElasticLendingLeasesWholeTopologySubtrees) {
   EXPECT_FALSE(harness.state.TryLeaseSubtree({1, 7}));
 }
 
-enum class HybridPolicy { Mailbox, LazyStealing };
+enum class HybridPolicy { Mailbox, LazyStealing, TimespanLazyStealing };
 
 template <typename F>
 void RunHybrid(HybridPolicy policy, RapidStartGroup group, size_t begin,
                size_t end, F &&function, size_t grain = 1) {
   if (policy == HybridPolicy::Mailbox) {
     ParallelForMailbox(group, begin, end, std::forward<F>(function), grain);
-  } else {
+  } else if (policy == HybridPolicy::LazyStealing) {
     ParallelForLazyStealing(group, begin, end, std::forward<F>(function),
                             grain);
+  } else {
+    ParallelForTimespanLazyStealing(group, begin, end,
+                                    std::forward<F>(function), grain);
   }
 }
 
@@ -370,6 +375,21 @@ TEST(EigenRapidLazyStealing, DoesNotDeregisterWithoutAStall) {
   EXPECT_EQ(harness.pool.RapidDeregistrationCount(), before);
 }
 
+TEST(EigenRapidTimespanLazyStealing, DoesNotDeregisterWithoutAStall) {
+  RapidHarness harness(8);
+  const size_t before = harness.pool.RapidDeregistrationCount();
+  ParallelForTimespanLazyStealing(harness.group, 0, 8, [](size_t) {}, 1024);
+  EXPECT_EQ(harness.pool.RapidDeregistrationCount(), before);
+}
+
+TEST(EigenRapidTimespanLazyStealing, BoundsAdaptiveBlockChanges) {
+  EXPECT_EQ(TimespanBlockSize(16, 16, 10'000, 1024, 1, 80'000),
+            128u);
+  EXPECT_EQ(TimespanBlockSize(16, 16, 320'000, 1024, 1, 80'000),
+            4u);
+  EXPECT_EQ(TimespanBlockSize(64, 64, 1, 10, 2, 80'000), 3u);
+}
+
 TEST(EigenRapidLazyStealing, NestedOneWorkerMakesProgress) {
   RapidHarness harness(1);
   std::atomic<unsigned> completed{0};
@@ -480,7 +500,8 @@ TEST(EigenRapidLazyStealing, DeregistersAtFirstGlobalSteal) {
 
 INSTANTIATE_TEST_SUITE_P(AllPolicies, EigenRapidHybridTest,
                          testing::Values(HybridPolicy::Mailbox,
-                                         HybridPolicy::LazyStealing));
+                                         HybridPolicy::LazyStealing,
+                                         HybridPolicy::TimespanLazyStealing));
 
 } // namespace
 

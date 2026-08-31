@@ -5,7 +5,7 @@ if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING RAPID_START
-    RAPID_MAILBOX RAPID_LAZY_STEALING)
+    RAPID_MAILBOX RAPID_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING)
 endif()
 if(TBB_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
@@ -28,6 +28,8 @@ function(oox_configure_scheduler_eval_target target mode)
       set(rapid_eigen_mode EIGEN_RAPID)
     elseif(mode STREQUAL "RAPID_MAILBOX")
       set(rapid_eigen_mode EIGEN_RAPID_MAILBOX)
+    elseif(mode STREQUAL "RAPID_TIMESPAN_LAZY_STEALING")
+      set(rapid_eigen_mode EIGEN_RAPID_TIMESPAN_LAZY_STEALING)
     else()
       set(rapid_eigen_mode EIGEN_RAPID_LAZY_STEALING)
     endif()

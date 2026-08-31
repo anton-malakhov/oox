@@ -20,6 +20,7 @@ COLORS = {
     "RAPID_START": "#3973ac",
     "RAPID_MAILBOX": "#1b9e77",
     "RAPID_LAZY_STEALING": "#7570b3",
+    "RAPID_TIMESPAN_LAZY_STEALING": "#e7298a",
     "EIGEN_STEALING": "#d95f02",
     "EIGEN_SHARING": "#2a9d50",
     "EIGEN_STEALING_GRAINSIZE": "#e6ab02",
@@ -53,6 +54,10 @@ POLICY_MODELS = {
     "RAPID_LAZY_STEALING": {
         "name": "lazy Rapid Start stealing",
         "events": "rapid activations, P first reservations, then B(N,P)-P claims",
+    },
+    "RAPID_TIMESPAN_LAZY_STEALING": {
+        "name": "timespan-adaptive lazy Rapid stealing",
+        "events": "rapid activation, timed owner blocks, then lazy peer claims",
     },
 }
 
@@ -236,7 +241,8 @@ def policy_events(mode, tasks, threads, effective_grain=1):
         rapid = max(0, slots - 1)
     if mode == "RAPID_START":
         critical = depth
-    elif mode in ("RAPID_MAILBOX", "RAPID_LAZY_STEALING"):
+    elif mode in ("RAPID_MAILBOX", "RAPID_LAZY_STEALING",
+                  "RAPID_TIMESPAN_LAZY_STEALING"):
         density_workers = threads if mode == "RAPID_MAILBOX" else slots
         work_per_worker = (tasks + density_workers - 1) // density_workers
         divisor = (2 if mode == "RAPID_MAILBOX" and

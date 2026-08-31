@@ -32,6 +32,9 @@ public:
 #elif EIGEN_MODE == EIGEN_RAPID_LAZY_STEALING
     oox::detail::eigen_pool::rapid::ParallelForLazyStealing(
         group_, from, to, std::forward<F>(func), grain);
+#elif EIGEN_MODE == EIGEN_RAPID_TIMESPAN_LAZY_STEALING
+    oox::detail::eigen_pool::rapid::ParallelForTimespanLazyStealing(
+        group_, from, to, std::forward<F>(func), grain);
 #else
 #error "Unsupported Rapid Start policy"
 #endif

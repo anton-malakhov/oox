@@ -4,7 +4,7 @@
 
 This branch turns the Eigen backend from a conventional recursive
 work-stealing pool into a scheduler with a second, composable fast-distribution
-path. The normal Eigen policy remains available as the baseline. Three Rapid
+path. The normal Eigen policy remains available as the baseline. Four Rapid
 policies cover different workload shapes:
 
 - `RAPID_START` assigns proportional ranges through a hierarchical activation
@@ -15,12 +15,16 @@ policies cover different workload shapes:
   for its owner before publishing execution. A worker deregisters from its
   Rapid domain only when it has exhausted local work and a peer has unclaimed
   later blocks.
+- `RAPID_TIMESPAN_LAZY_STEALING` keeps that lazy transition but continuously
+  sizes owner blocks from their measured useful-work duration. Thieves use the
+  latest estimate without feeding their migration cost back into it.
 
 The result is not one universally best policy. Static Rapid has the lowest
-uniform-loop overhead. Lazy Rapid is the best general-purpose compromise in
-these measurements: it retains most of the launch advantage while matching
-normal Eigen on balanced and irregular SpMV. Mailbox mode is useful when work
-must become ordinary pool work immediately.
+uniform-loop overhead. Fixed lazy Rapid minimizes the extra bookkeeping on
+short calls. Timespan-lazy Rapid is the best general-purpose compromise for
+longer variable-cost work in these measurements: it retains most of the launch
+advantage while improving balanced and irregular SpMV. Mailbox mode is useful
+when work must become ordinary pool work immediately.
 
 ## What changed relative to `main`
 
@@ -38,14 +42,17 @@ worker and external-waiter wakeups cannot consume one another's notifications;
 queue overflow preserves progress without recursive inline execution; and
 ordinary work receives a fairness opportunity during sustained Rapid traffic.
 
-The two hybrid policies originally exposed recursive grain-one task trees.
+The hybrid policies originally exposed recursive grain-one task trees.
 That recovered imbalance but made a 262K empty loop take roughly 40--43 ms.
 The final implementation replaces that frontier with adaptive blocks. Mailbox
 mode creates at most a bounded oversubscription of flat tasks. Lazy mode creates
 no ordinary tasks: workers claim blocks through cache-line-separated atomic
 cursors and make a one-way transition to unrestricted stealing only when it is
-useful. Both policies honor the caller's grain as a minimum block size. Large
-slices now stop at 64 blocks per worker instead of 128. Alternated old/new runs
+useful. All hybrid policies honor the caller's grain as a minimum block size. Large
+slices now stop at 64 blocks per worker instead of 128. Timespan-lazy mode
+starts from those blocks, times only the proportional owner's work, and adapts
+toward a 75 microsecond target. A 512-iteration-per-worker cutoff keeps clock
+reads out of short loops. Alternated old/new runs
 showed 1.75--1.79x faster 262K mailbox launch and 1.24--1.27x faster lazy launch,
 while retaining 1,024 independently stealable blocks at 16 workers.
 
@@ -78,25 +85,27 @@ those controls.
 
 The following medians come from `bench_loops`, which invokes the backend
 directly rather than going through OOX. The final run used Release mode, 16
-workers, nine repetitions, and a 100 ms minimum sample time on the local Apple
+workers, seven repetitions, and a 100 ms minimum sample time on the local Apple
 Silicon host. Times are microseconds; speedup is relative to the normal Eigen
 work-stealing mode built from the same commit.
 
-| Iterations | Normal Eigen | Static Rapid | Speedup | Mailbox | Speedup | Lazy | Speedup |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 28.00 | 13.60 | 2.06x | 22.20 | 1.26x | 21.60 | 1.30x |
-| 512 | 61.40 | 13.80 | 4.45x | 34.50 | 1.78x | 21.60 | 2.84x |
-| 4,096 | 267.00 | 14.10 | 18.94x | 62.90 | 4.24x | 26.70 | 10.00x |
-| 32,768 | 1,873.00 | 15.70 | 119.30x | 112.00 | 16.72x | 31.30 | 59.84x |
-| 262,144 | 13,981.00 | 24.60 | 568.33x | 227.00 | 61.59x | 58.40 | 239.40x |
+| Iterations | Normal Eigen | Static Rapid | Mailbox | Fixed lazy | Timespan lazy | Timespan speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 21.20 | 13.30 | 21.60 | 24.40 | 24.40 | 0.87x |
+| 512 | 55.70 | 13.20 | 36.20 | 24.60 | 25.70 | 2.17x |
+| 4,096 | 274.00 | 13.80 | 69.30 | 28.00 | 27.80 | 9.86x |
+| 32,768 | 1,932.00 | 13.10 | 123.00 | 32.70 | 31.90 | 60.56x |
+| 262,144 | 14,598.00 | 20.30 | 254.00 | 60.50 | 47.20 | 309.28x |
 
 The normal Eigen loop recursively splits to grain one, so scheduler work grows
 with the iteration count even when the body is almost empty. Static Rapid
 publishes a worker-sized activation tree and then runs contiguous ranges.
 Lazy Rapid adds only bounded atomic block claims, while mailbox mode pays for
 ordinary task allocation and queue publication. Mailbox therefore has the
-smallest advantage at 64 items, while the lower large-slice block cap nearly
-halves its 262K time relative to the preceding implementation.
+smallest advantage at 64 items, while timespan adaptation removes 22.0% of the
+fixed-lazy 262K time. The short-loop bypass intentionally makes its scheduling
+path identical to fixed lazy below the cutoff; the 64-item difference from
+normal Eigen is the fixed Rapid-coordinator cost.
 
 ## Other backend-only scheduler families
 
@@ -117,6 +126,31 @@ hybrid on the small reduction and stays close to static Rapid on the million
 item loop. The repeated-call row also records the boundary honestly: static
 Rapid ties normal Eigen, lazy is close, and mailbox pays ordinary allocation
 and publication on every tiny call.
+
+## Timespan-lazy follow-up
+
+The new policy was tuned independently at 25, 75, and 250 microsecond targets.
+The short target generated too many claims, most visibly on triangular SpMV;
+the long target gave up balancing and regressed Scan and hyperbolic SpMV. The
+75 microsecond target was the best mixed choice. A separate size sweep showed
+that timing did not repay its clock overhead below roughly 512 iterations per
+effective worker, which became the fixed-lazy bypass threshold.
+
+The final same-load follow-up used seven repetitions and 100 ms minimum sample
+time. Lower is better:
+
+| Workload | Fixed lazy | Timespan lazy | Change |
+| --- | ---: | ---: | ---: |
+| 262K launch (us) | 52.1 | 40.3 | -22.6% |
+| Exclusive scan, 2^22 items (us) | 2,386 | 2,365 | -0.9% |
+| Balanced SpMV (us) | 9,688 | 9,338 | -3.6% |
+| Hyperbolic SpMV (us) | 5,425 | 5,333 | -1.7% |
+| Triangular SpMV (us) | 7,740 | 7,063 | -8.7% |
+
+This is the intended merger of the two ideas: Rapid Start supplies immediate
+proportional ownership, the owner measures useful-work time while it has local
+work, and timespan sizing reduces claim traffic without removing the later
+escape to ordinary stealing.
 
 ## Balanced and irregular SpMV
 
@@ -170,8 +204,9 @@ checkouts and also includes the branch's shared pool correctness fixes.
 
 The final local implementation passed:
 
-- 122/122 tests in both Clang Debug and Clang Release configurations;
-- 45/45 Release scheduler-evaluation oracle, nesting, runner, and smoke tests;
+- 151/151 tests in the current Clang Debug configuration, including every new
+  timespan-lazy backend, trace, oracle, and nesting target;
+- 26/26 tests in the focused Release scheduler-evaluation matrix;
 - one complete 122/122 suite under UBSan on the final code;
 - a longer UBSan repetition exposed a pre-existing mailbox cancellation hang;
   isolated old- and new-density binaries both reproduce it, so the task-density
@@ -197,9 +232,11 @@ the authoritative portability check.
 ## Choosing a policy
 
 Use static `RAPID_START` for uniform loops when the proportional partition is
-known to be balanced. Use `RAPID_LAZY_STEALING` as the default candidate when
-row or iteration cost may vary: it starts on the fast path and pays the global
-stealing transition only when useful peer work exists. Use `RAPID_MAILBOX`
+known to be balanced. Use `RAPID_LAZY_STEALING` for short or extremely cheap
+variable work. Use `RAPID_TIMESPAN_LAZY_STEALING` as the default candidate for
+longer variable-cost loops: it starts on the fast path, adapts claim density to
+measured work, and pays the global stealing transition only when useful peer
+work exists. Use `RAPID_MAILBOX`
 when immediately converting the Rapid partition into ordinary queue work is
 valuable, or when interaction with other ordinary tasks is part of the desired
 scheduling behavior. Keep normal Eigen available for workloads whose behavior

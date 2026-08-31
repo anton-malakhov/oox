@@ -29,7 +29,7 @@ tree.
 Optional elastic lending leases one balanced topology subtree with one stamped
 CAS.
 
-Three parallel-for policies share that activation layer. `ParallelFor` keeps
+Four parallel-for policies share that activation layer. `ParallelFor` keeps
 each proportional range inside Rapid Start for its whole lifetime.
 `ParallelForMailbox` uses Rapid Start to publish a bounded set of adaptive
 range blocks to the ordinary mailboxes, then lets the ordinary deques steal
@@ -38,9 +38,14 @@ nested calls without remaining registered in a Rapid region.
 `ParallelForLazyStealing` claims adaptive blocks directly from a shared range
 coordinator: one first block is reserved for every proportional owner before
 execution is published. Each worker starts with its protected block and leaves
-the Rapid domain once before taking otherwise idle later blocks. Both hybrid
-policies run one-worker domains directly and preserve nested calls, exception
-propagation, pool cancellation, and caller-supplied minimum grain sizes.
+the Rapid domain once before taking otherwise idle later blocks.
+`ParallelForTimespanLazyStealing` adds a per-owner elapsed-time estimate to that
+lazy policy. Owner blocks adapt toward a 75 microsecond target while preserving
+at least four later steal opportunities; peer thieves consume the last published
+estimate without perturbing it. Loops with at most 512 iterations per effective
+worker use the fixed lazy policy to avoid clock overhead. All hybrid policies
+run one-worker domains directly and preserve nested calls, exception propagation,
+pool cancellation, and caller-supplied minimum grain sizes.
 
 ## File provenance and license
 

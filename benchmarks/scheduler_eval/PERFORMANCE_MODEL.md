@@ -357,6 +357,7 @@ gate is optimal. OOX must estimate those quantities from its own traces.
 | `RAPID_START` | Hierarchical region activation through rapid inboxes with ordinary-queue overflow fallback | Proportional contiguous worker/data subtrees with inherited nested domains |
 | `RAPID_MAILBOX` | Rapid activation publishes adaptive, bounded range blocks to targeted ordinary mailboxes, then exits | Unrestricted deque stealing without recursive grain-one task creation |
 | `RAPID_LAZY_STEALING` | Rapid activation starts a proportional range on each worker and exposes it after the first local claim | Atomic adaptive block claims; a worker leaves its Rapid domain once, only when a started peer range has unclaimed work |
+| `RAPID_TIMESPAN_LAZY_STEALING` | The same protected Rapid owner ranges as lazy stealing | Each owner times local blocks, smooths their size toward 75 us, and publishes the estimate to thieves; short ranges use fixed lazy blocks |
 | `EIGEN_STEALING` | One root range | Binary splitting to a caller-supplied fixed grain (1 in this benchmark), then deque stealing |
 | `EIGEN_SHARING` | `K_SPLIT=2` targeted mailbox tree | Binary splitting to a caller-supplied fixed grain (1 here), then stealing |
 | `EIGEN_STEALING_GRAINSIZE` | One root range | Root measures a timespan-derived grain, then chunk stealing |
@@ -637,6 +638,7 @@ from the implementation:
 | Static Rapid Start | $\lceil\log_2s\rceil$ activation depth |
 | Rapid mailbox | $\lceil\log_2s\rceil+\lceil B/s\rceil$ |
 | Lazy Rapid stealing | $\lceil\log_2s\rceil+\lceil B/s\rceil$; $s$ first reservations and $B-s$ later claims are reported separately |
+| Timespan-lazy Rapid stealing | $\lceil\log_2s\rceil+\lceil \widehat B/s\rceil$; $\widehat B$ is a deterministic initial-block proxy until adaptive block counters are recorded |
 
 In this table $s=\min(P,N)$, $g=1$ in the benchmark, and
 
@@ -653,6 +655,26 @@ mailbox policy halves that density through 512 iterations per worker. These
 counts are deterministic opportunities, not observed steal counts. In
 particular, lazy failed probes and cache migration require counters before they
 can become separately identifiable model terms.
+
+For the timespan-lazy policy, owner $j$ updates the next block after completing
+$c_{j,k}$ iterations in elapsed time $t_{j,k}$:
+
+$$
+r_{j,k}=\operatorname{clamp}\!\left(\frac{75\,000}{t_{j,k}},\frac14,8\right),
+\qquad
+q_{j,k}=\operatorname{clamp}\!\left(c_{j,k}r_{j,k},g,
+\left\lceil\frac{R_{j,k}}4\right\rceil\right).
+$$
+
+After the first sample, the published size is smoothed by
+$b_{j,k+1}=b_{j,k}+(q_{j,k}-b_{j,k})/4$, with integer rounding toward the old
+size. The implementation also bounds the unsmoothed change to
+$[b_{j,k}/4,8b_{j,k}]$. Only the owner updates $b_j$; thieves load it and claim
+work atomically, so migration and contention do not poison the estimator. If
+$\lceil N/s\rceil\le512$, $b_j$ remains the fixed lazy block and no clock is
+read. Consequently, the actual $\widehat B=\sum_j B_j$ depends on measured body
+time and cannot be inferred from $N$ alone; `model.py` uses the initial
+`HybridBlockSize` count solely as a structural proxy.
 
 Root timespan stealing also replaces the ordinary critical-worker callback count
 with
@@ -913,7 +935,7 @@ not an invitation to add arbitrary polynomial terms.
 
 The next evaluation should add, in this order:
 
-1. Repeat all seven Eigen/Rapid policies in counterbalanced fresh processes.
+1. Repeat all eight Eigen/Rapid policies in counterbalanced fresh processes.
 2. Randomize or counterbalance process/mode order and repeat complete runs in
    fresh processes.
 3. Sweep $P=1,2,4,8,12,16$, and compare performance cores only with all cores.
