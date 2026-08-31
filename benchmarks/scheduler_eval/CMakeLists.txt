@@ -4,7 +4,8 @@ set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES)
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     EIGEN_STEALING EIGEN_SHARING
-    EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING RAPID_START)
+    EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING RAPID_START
+    RAPID_MAILBOX RAPID_LAZY_STEALING)
 endif()
 if(TBB_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
@@ -22,9 +23,16 @@ function(oox_configure_scheduler_eval_target target mode)
   if(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE EIGEN_MODE=${mode})
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
-  elseif(mode STREQUAL "RAPID_START")
+  elseif(mode MATCHES "^RAPID")
+    if(mode STREQUAL "RAPID_START")
+      set(rapid_eigen_mode EIGEN_RAPID)
+    elseif(mode STREQUAL "RAPID_MAILBOX")
+      set(rapid_eigen_mode EIGEN_RAPID_MAILBOX)
+    else()
+      set(rapid_eigen_mode EIGEN_RAPID_LAZY_STEALING)
+    endif()
     target_compile_definitions(${target} PRIVATE
-      RAPID_START_MODE=1 EIGEN_MODE=EIGEN_RAPID)
+      RAPID_START_MODE=1 EIGEN_MODE=${rapid_eigen_mode})
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^TBB")
     target_compile_definitions(${target} PRIVATE TBB_MODE=${mode})

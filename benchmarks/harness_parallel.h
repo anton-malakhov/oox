@@ -45,6 +45,8 @@
 #define FOLLY_FOR_EACH 40
 #define EIGEN_STEALING_LOOP 50
 #define EIGEN_RAPID_LOOP 51
+#define EIGEN_RAPID_MAILBOX_LOOP 52
+#define EIGEN_RAPID_LAZY_STEALING_LOOP 53
 
 #ifndef PARALLEL
 #define PARALLEL TBB_SIMPLE
@@ -58,7 +60,8 @@
 #define __USE_TF__ 1
 #elif PARALLEL == FOLLY_FOR_EACH
 #define __USE_FOLLY__ 1
-#elif PARALLEL == EIGEN_STEALING_LOOP || PARALLEL == EIGEN_RAPID_LOOP
+#elif PARALLEL >= EIGEN_STEALING_LOOP && \
+    PARALLEL <= EIGEN_RAPID_LAZY_STEALING_LOOP
 #define __USE_EIGEN__ 1
 #else
 #error Unrecognized PARALLEL mode
@@ -118,7 +121,13 @@
 #define EIGEN_MODE EIGEN_STEALING
 #include "eigen/parallel_for.h"
 #else
+#if PARALLEL == EIGEN_RAPID_LOOP
 #define EIGEN_MODE EIGEN_RAPID
+#elif PARALLEL == EIGEN_RAPID_MAILBOX_LOOP
+#define EIGEN_MODE EIGEN_RAPID_MAILBOX
+#else
+#define EIGEN_MODE EIGEN_RAPID_LAZY_STEALING
+#endif
 #include "scheduler_eval/rapid_start_adapter.h"
 #endif
 #pragma pop_macro("TBB_RAPID")

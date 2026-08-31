@@ -16,6 +16,8 @@ namespace {
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
 using oox::detail::eigen_pool::rapid::ParallelFor;
+using oox::detail::eigen_pool::rapid::ParallelForLazyStealing;
+using oox::detail::eigen_pool::rapid::ParallelForMailbox;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
 using namespace std::chrono_literals;
@@ -232,6 +234,121 @@ TEST(EigenRapidStart, ElasticLendingLeasesWholeTopologySubtrees) {
   EXPECT_TRUE(harness.state.TryLeaseSubtree({0, 8}));
   EXPECT_FALSE(harness.state.TryLeaseSubtree({1, 7}));
 }
+
+enum class HybridPolicy { Mailbox, LazyStealing };
+
+template <typename F>
+void RunHybrid(HybridPolicy policy, RapidStartGroup group, size_t begin,
+               size_t end, F &&function, size_t grain = 1) {
+  if (policy == HybridPolicy::Mailbox) {
+    ParallelForMailbox(group, begin, end, std::forward<F>(function), grain);
+  } else {
+    ParallelForLazyStealing(group, begin, end, std::forward<F>(function),
+                            grain);
+  }
+}
+
+class EigenRapidHybridTest : public testing::TestWithParam<HybridPolicy> {};
+
+TEST_P(EigenRapidHybridTest, ExecutesEveryIterationExactlyOnceAndNests) {
+  RapidHarness harness(8);
+  std::vector<std::atomic<unsigned>> visits(4096);
+  RunHybrid(GetParam(), harness.group, 0, visits.size(), [&](size_t index) {
+    visits[index].fetch_add(1, std::memory_order_relaxed);
+    if (index < 8) {
+      std::atomic<unsigned> nested{0};
+      RunHybrid(GetParam(), harness.group, 0, 16,
+                [&](size_t) { nested.fetch_add(1, std::memory_order_relaxed); });
+      EXPECT_EQ(nested.load(), 16u);
+    }
+  });
+  for (const auto &visit : visits) {
+    EXPECT_EQ(visit.load(), 1u);
+  }
+}
+
+TEST_P(EigenRapidHybridTest, PropagatesExceptionsAndCanBeReused) {
+  RapidHarness harness(8);
+  EXPECT_THROW(RunHybrid(GetParam(), harness.group, 0, 1024,
+                         [](size_t index) {
+                           if (index == 127) {
+                             throw std::runtime_error("hybrid failure");
+                           }
+                         }),
+               std::runtime_error);
+  std::atomic<unsigned> completed{0};
+  RunHybrid(GetParam(), harness.group, 0, 1024,
+            [&](size_t) { completed.fetch_add(1, std::memory_order_relaxed); });
+  EXPECT_EQ(completed.load(), 1024u);
+}
+
+TEST_P(EigenRapidHybridTest, CancellationCompletesPublishedWork) {
+  RapidHarness harness(8);
+  std::atomic<bool> entered{false};
+  auto result = std::async(std::launch::async, [&] {
+    RunHybrid(GetParam(), harness.group, 0, 10000, [&](size_t) {
+      entered.store(true, std::memory_order_release);
+      std::this_thread::sleep_for(100us);
+    });
+  });
+  while (!entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  harness.pool.Cancel();
+  EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
+}
+
+TEST(EigenRapidMailbox, RunsOrdinaryTasksOutsideRapidDomains) {
+  RapidHarness harness(8);
+  std::atomic<bool> outside{true};
+  ParallelForMailbox(harness.group, 0, 1024, [&](size_t) {
+    if (harness.pool.CurrentRegionContext() != nullptr) {
+      outside.store(false, std::memory_order_relaxed);
+    }
+  });
+  EXPECT_TRUE(outside.load());
+}
+
+TEST(EigenRapidLazyStealing, DoesNotDeregisterWithoutAStall) {
+  RapidHarness harness(8);
+  const size_t before = harness.pool.RapidDeregistrationCount();
+  ParallelForLazyStealing(harness.group, 0, 8, [](size_t) {}, 1024);
+  EXPECT_EQ(harness.pool.RapidDeregistrationCount(), before);
+}
+
+TEST(EigenRapidLazyStealing, DeregistersAtFirstGlobalSteal) {
+  auto pool = std::make_unique<ThreadPool>(2, false, true);
+  std::promise<void> blocker_entered;
+  std::promise<void> release_blocker;
+  auto release = release_blocker.get_future().share();
+  pool->RunOnThread(MakeTask([&blocker_entered, release] {
+                              blocker_entered.set_value();
+                              release.wait();
+                            }),
+                            1);
+  if (blocker_entered.get_future().wait_for(5s) !=
+      std::future_status::ready) {
+    release_blocker.set_value();
+    FAIL() << "blocking worker did not start";
+    return;
+  }
+
+  std::atomic<unsigned> stolen{0};
+  pool->RunOnThread(
+      MakeTask([&] { stolen.fetch_add(1, std::memory_order_relaxed); }), 1);
+  oox::detail::eigen_pool::RegionContext context{
+      nullptr, {0, 1}, nullptr, true};
+  const size_t before = pool->RapidDeregistrationCount();
+  EXPECT_TRUE(pool->ExecuteInRegion(
+      &context, [&] { return pool->TryExecuteSomething(); }));
+  EXPECT_EQ(stolen.load(), 1u);
+  EXPECT_EQ(pool->RapidDeregistrationCount(), before + 1);
+  release_blocker.set_value();
+}
+
+INSTANTIATE_TEST_SUITE_P(AllPolicies, EigenRapidHybridTest,
+                         testing::Values(HybridPolicy::Mailbox,
+                                         HybridPolicy::LazyStealing));
 
 } // namespace
 

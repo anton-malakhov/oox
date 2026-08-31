@@ -20,9 +20,21 @@ public:
     Run(0, threads_, [](std::size_t) {});
   }
 
-  template <typename F> void Run(std::size_t from, std::size_t to, F &&func) {
+  template <typename F>
+  void Run(std::size_t from, std::size_t to, F &&func,
+           std::size_t grain = 1) {
+#if EIGEN_MODE == EIGEN_RAPID
     oox::detail::eigen_pool::rapid::ParallelFor(group_, from, to,
                                                 std::forward<F>(func));
+#elif EIGEN_MODE == EIGEN_RAPID_MAILBOX
+    oox::detail::eigen_pool::rapid::ParallelForMailbox(
+        group_, from, to, std::forward<F>(func), grain);
+#elif EIGEN_MODE == EIGEN_RAPID_LAZY_STEALING
+    oox::detail::eigen_pool::rapid::ParallelForLazyStealing(
+        group_, from, to, std::forward<F>(func), grain);
+#else
+#error "Unsupported Rapid Start policy"
+#endif
   }
 
 private:
@@ -46,8 +58,9 @@ inline Runtime &GetRuntime() {
 } // namespace rapid_start_eval
 
 template <typename F>
-void ParallelFor(std::size_t from, std::size_t to, F &&func, std::size_t = 1) {
-  rapid_start_eval::GetRuntime().Run(from, to, std::forward<F>(func));
+void ParallelFor(std::size_t from, std::size_t to, F &&func,
+                 std::size_t grain = 1) {
+  rapid_start_eval::GetRuntime().Run(from, to, std::forward<F>(func), grain);
 }
 
 inline void InitParallel(std::size_t threads) {

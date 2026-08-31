@@ -29,6 +29,15 @@ tree.
 Optional elastic lending leases one balanced topology subtree with one stamped
 CAS.
 
+Three parallel-for policies share that activation layer. `ParallelFor` keeps
+each proportional range inside Rapid Start for its whole lifetime.
+`ParallelForMailbox` uses Rapid Start only to publish one range root per worker,
+then executes recursively divisible tasks through the ordinary mailboxes and
+deques. `ParallelForLazyStealing` begins each range inside its Rapid domain and
+leaves that domain only when its local work is exhausted and a global steal is
+required. Both hybrid policies preserve nested calls, exception propagation,
+pool cancellation, and caller-supplied grain sizes.
+
 ## File provenance and license
 
 | File | Source | License retained |

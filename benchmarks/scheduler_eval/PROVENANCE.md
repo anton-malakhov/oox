@@ -28,6 +28,7 @@ backend abstraction. No runner clones the reference at execution time.
 | `timespan_tuner` | Warm baseline p99 publication-timespan estimator | Baseline JSON smoke test |
 | `trace_spin` | Chrome task-span trace across repeated publications | JSON smoke run per backend mode |
 | Bitmask `RapidStart` | Benchmark-only adapter with bounded worker registration and warm publication | Flat correctness, distribution, trace, and runner smoke tests |
+| Rapid/stealing hybrids | Native mailbox-first and lazy-deregistration policies over the OOX pool | Exact-once, nested, exception, cancellation, distribution, trace, and benchmark smoke tests |
 | Original runner/plotting intent | Offline metadata capture, schema checks, CSV, Markdown, and SVG reports | End-to-end CTest runner smoke |
 
 ## Intentional differences

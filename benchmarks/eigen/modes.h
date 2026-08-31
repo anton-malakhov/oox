@@ -40,6 +40,8 @@ inline std::string GetParallelMode() {
 #define EIGEN_STEALING_GRAINSIZE 3
 #define EIGEN_SHARING_STEALING 4
 #define EIGEN_RAPID 5
+#define EIGEN_RAPID_MAILBOX 6
+#define EIGEN_RAPID_LAZY_STEALING 7
 
 #define TASKFLOW_GUIDED 1
 #define TASKFLOW_DYNAMIC 2

@@ -53,6 +53,7 @@ struct RegionContext {
   RapidRegionBase *region = nullptr;
   DomainId domain;
   RegionContext *parent = nullptr;
+  bool leave_on_steal = false;
 };
 
 struct Task;
@@ -351,6 +352,10 @@ public:
 
   size_t WorkerRegistrationCount() const noexcept {
     return registrations_started_.load(std::memory_order_acquire);
+  }
+
+  size_t RapidDeregistrationCount() const noexcept {
+    return rapid_deregistrations_.load(std::memory_order_acquire);
   }
 
   void ScheduleRapid(RapidTask *rapid, size_t target) {
@@ -670,6 +675,7 @@ private:
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
   std::atomic<size_t> registrations_started_{0};
+  std::atomic<size_t> rapid_deregistrations_{0};
   std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
   std::atomic<uint64_t> last_rapid_region_ns_{0};
 
@@ -838,6 +844,10 @@ private:
     }
     if (!task) {
       task = LocalSteal(true);
+    }
+    if (!task && pt->region_context && pt->region_context->leave_on_steal) {
+      pt->region_context = pt->region_context->parent;
+      rapid_deregistrations_.fetch_add(1, std::memory_order_relaxed);
     }
     if (!task) {
       task = GlobalSteal(true);

@@ -27,8 +27,9 @@ ctest --test-dir build-eval -R scheduler_eval --output-on-failure
 
 CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
-`EIGEN_SHARING_STEALING`, plus the pool-backed `RAPID_START` experiment. TBB
-contributes simple, automatic, and affinity partitioners. OpenMP
+`EIGEN_SHARING_STEALING`, plus the pool-backed `RAPID_START`, `RAPID_MAILBOX`,
+and `RAPID_LAZY_STEALING` experiments. TBB contributes simple, automatic, and
+affinity partitioners. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
 `RAPID_START` uses the Eigen pool's lifetime worker registrations. Each
@@ -38,6 +39,13 @@ when a bounded rapid inbox fills. Nested calls inherit contiguous worker
 domains, so nested matrix multiplication and transpose are enabled. The
 implementation supports the pool's full 65535-worker limit rather than the
 historical 64-bit mask.
+
+`RAPID_MAILBOX` ends Rapid participation immediately after proportional range
+roots have been placed in targeted ordinary mailboxes; recursive range tasks
+then use unrestricted work stealing. `RAPID_LAZY_STEALING` starts each worker's
+recursive range inside its Rapid domain and changes to unrestricted stealing
+only when that worker has no local work. These modes deliberately trade higher
+uniform-loop launch cost for recovery from irregular static partitions.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

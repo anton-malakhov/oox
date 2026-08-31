@@ -45,10 +45,11 @@ public:
   using Invoke = void (*)(void *, size_t, size_t);
 
   RapidRegion(RapidDomainState &state, RegionContext *parent, DomainId domain,
-              bool worker_waiter, void *function, Invoke invoke)
+              bool worker_waiter, bool leave_on_steal, void *function,
+              Invoke invoke)
       : RapidRegionBase(parent ? parent->region : nullptr, domain),
         state_(state), parent_context_(parent), worker_waiter_(worker_waiter),
-        function_(function), invoke_(invoke) {}
+        leave_on_steal_(leave_on_steal), function_(function), invoke_(invoke) {}
 
   void Run(size_t begin, size_t end) noexcept {
     if (cancelled_.load(std::memory_order_acquire)) {
@@ -74,11 +75,13 @@ public:
   RapidDomainState &State() noexcept { return state_; }
   RegionContext *ParentContext() const noexcept { return parent_context_; }
   DomainId Domain() const noexcept { return domain_; }
+  bool LeaveOnSteal() const noexcept { return leave_on_steal_; }
 
 private:
   RapidDomainState &state_;
   RegionContext *parent_context_;
   bool worker_waiter_;
+  bool leave_on_steal_;
   void *function_;
   Invoke invoke_;
   std::atomic<bool> cancelled_{false};
@@ -279,7 +282,7 @@ inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
   owner_ = &owner;
   region_ = &region;
   parent_ = parent;
-  context_ = {&region, domain, parent_context};
+  context_ = {&region, domain, parent_context, region.LeaveOnSteal()};
   begin_ = begin;
   end_ = end;
   // The initial ticket keeps the descriptor alive until completion.
@@ -432,8 +435,8 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
 }
 
 template <typename F>
-void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
-                 F &&function) {
+void ParallelForRanges(RapidStartGroup group, size_t begin, size_t end,
+                       F &&function, bool leave_on_steal = false) {
   if (!group.state || group.domain.Size() == 0 || begin >= end) {
     return;
   }
@@ -441,22 +444,18 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
   Function *function_ptr = std::addressof(function);
   const auto invoke = [](void *opaque, size_t first, size_t last) {
     Function &callable = *static_cast<Function *>(opaque);
-    for (size_t i = first; i < last; ++i) {
-      std::invoke(callable, i);
-    }
+    std::invoke(callable, first, last);
   };
   ThreadPool &pool = group.state->Pool();
   RegionContext *parent = pool.CurrentRegionContext();
   DomainId domain = parent ? parent->domain : group.domain;
   if (domain.Size() == 1) {
-    for (size_t i = begin; i < end; ++i) {
-      std::invoke(function, i);
-    }
+    std::invoke(function, begin, end);
     return;
   }
   RapidRegion region(*group.state, parent, domain,
-                     pool.CurrentThreadId() < pool.NumThreads(), function_ptr,
-                     invoke);
+                     pool.CurrentThreadId() < pool.NumThreads(),
+                     leave_on_steal, function_ptr, invoke);
   group.state->BeginRegion();
   Activation *root = group.state->Acquire();
   root->Initialize(*group.state, region, nullptr, parent, domain, begin, end);
@@ -465,6 +464,170 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
   root->ReleaseTicket();
   pool.HelpUntil(region);
   region.Rethrow();
+}
+
+class OrdinaryRegion {
+public:
+  explicit OrdinaryRegion(ThreadPool &pool)
+      : pool_(pool), worker_waiter_(pool.CurrentThreadId() < pool.NumThreads()) {
+  }
+
+  bool IsComplete() const noexcept {
+    return complete_.load(std::memory_order_acquire);
+  }
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
+  void AddTask() noexcept { remaining_.fetch_add(1, std::memory_order_relaxed); }
+  void TaskComplete() noexcept {
+    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      complete_.store(true, std::memory_order_release);
+      pool_.NotifyTaskCompletion(worker_waiter_);
+    }
+  }
+  void Fail(std::exception_ptr exception) noexcept {
+    std::lock_guard<std::mutex> lock(exception_mutex_);
+    if (!exception_) {
+      exception_ = std::move(exception);
+      cancelled_.store(true, std::memory_order_release);
+    }
+  }
+  void Rethrow() {
+    if (exception_) {
+      std::rethrow_exception(exception_);
+    }
+  }
+
+private:
+  ThreadPool &pool_;
+  bool worker_waiter_;
+  std::atomic<size_t> remaining_{1};
+  std::atomic<bool> complete_{false};
+  std::atomic<bool> cancelled_{false};
+  std::mutex exception_mutex_;
+  std::exception_ptr exception_;
+};
+
+template <typename F> class RangeTask;
+
+template <typename F>
+void RunStealableRange(ThreadPool &pool, OrdinaryRegion &region,
+                       RegionContext *context, F &function, size_t begin,
+                       size_t end, size_t grain) noexcept {
+  try {
+    while (end - begin > grain && !region.IsCancelled()) {
+      const size_t middle = begin + (end - begin) / 2;
+      auto *task = new RangeTask<F>(pool, region, context, function, middle,
+                                    end, grain);
+      region.AddTask();
+      try {
+        pool.Schedule(task);
+      } catch (...) {
+        task->Discard();
+        throw;
+      }
+      end = middle;
+    }
+    for (size_t index = begin; index < end && !region.IsCancelled(); ++index) {
+      std::invoke(function, index);
+    }
+  } catch (...) {
+    region.Fail(std::current_exception());
+  }
+  region.TaskComplete();
+}
+
+template <typename F> class RangeTask final : public Task {
+public:
+  RangeTask(ThreadPool &pool, OrdinaryRegion &region, RegionContext *context,
+            F &function, size_t begin, size_t end, size_t grain)
+      : pool_(pool), region_(region), function_(function), begin_(begin),
+        end_(end), grain_(grain) {
+    region_context = context;
+  }
+
+  void operator()() final {
+    RunStealableRange(pool_, region_, region_context, function_, begin_, end_,
+                      grain_);
+    delete this;
+  }
+  void Discard() noexcept final {
+    region_.TaskComplete();
+    delete this;
+  }
+
+private:
+  ThreadPool &pool_;
+  OrdinaryRegion &region_;
+  F &function_;
+  size_t begin_;
+  size_t end_;
+  size_t grain_;
+};
+
+template <typename F>
+void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
+                 F &&function) {
+  auto ranges = [&](size_t first, size_t last) {
+    for (size_t i = first; i < last; ++i) {
+      std::invoke(function, i);
+    }
+  };
+  ParallelForRanges(group, begin, end, ranges);
+}
+
+template <typename F>
+void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
+                        F &&function, size_t grain = 1) {
+  if (!group.state || group.domain.Size() == 0 || begin >= end) {
+    return;
+  }
+  using Function = std::remove_reference_t<F>;
+  Function &callable = function;
+  ThreadPool &pool = group.state->Pool();
+  OrdinaryRegion ordinary(pool);
+  try {
+    ParallelForRanges(group, begin, end, [&](size_t first, size_t last) {
+      RegionContext *context = pool.CurrentRegionContext();
+      const size_t target = context ? context->domain.start : 0;
+      auto *task = new RangeTask<Function>(pool, ordinary, nullptr, callable,
+                                           first, last,
+                                           std::max<size_t>(grain, 1));
+      ordinary.AddTask();
+      try {
+        pool.RunOnThread(task, target);
+      } catch (...) {
+        task->Discard();
+        throw;
+      }
+    });
+  } catch (...) {
+    ordinary.Fail(std::current_exception());
+  }
+  ordinary.TaskComplete();
+  pool.HelpUntil(ordinary);
+  ordinary.Rethrow();
+}
+
+template <typename F>
+void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
+                             F &&function, size_t grain = 1) {
+  if (!group.state || group.domain.Size() == 0 || begin >= end) {
+    return;
+  }
+  using Function = std::remove_reference_t<F>;
+  Function &callable = function;
+  ThreadPool &pool = group.state->Pool();
+  ParallelForRanges(
+      group, begin, end,
+      [&](size_t first, size_t last) {
+        OrdinaryRegion ordinary(pool);
+        RunStealableRange(pool, ordinary, pool.CurrentRegionContext(), callable,
+                          first, last, std::max<size_t>(grain, 1));
+        pool.HelpUntil(ordinary);
+        ordinary.Rethrow();
+      },
+      true);
 }
 
 } // namespace rapid

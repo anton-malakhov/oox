@@ -18,6 +18,8 @@ SCAN_RE = re.compile(r"^Scan/(\d+)/real_time$")
 LAUNCH_RE = re.compile(r"^Launch/(\d+)/real_time$")
 COLORS = {
     "RAPID_START": "#3973ac",
+    "RAPID_MAILBOX": "#1b9e77",
+    "RAPID_LAZY_STEALING": "#7570b3",
     "EIGEN_STEALING": "#d95f02",
     "EIGEN_SHARING": "#2a9d50",
     "EIGEN_SHARING_STEALING": "#8e5bb7",
