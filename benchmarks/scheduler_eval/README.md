@@ -42,11 +42,14 @@ historical 64-bit mask.
 
 `RAPID_MAILBOX` ends Rapid participation after bounded adaptive range blocks
 have been placed in targeted ordinary mailboxes; the blocks then use
-unrestricted work stealing. `RAPID_LAZY_STEALING` starts each worker in its
-proportional Rapid range and exposes that range after its first local block is
-claimed. An idle worker leaves its Rapid domain once before claiming blocks
-from started peer ranges. These modes trade some uniform-loop launch cost for
-recovery from irregular static partitions without creating a task per item.
+unrestricted work stealing. A mailbox block retains its logical proportional
+domain for nested loops, avoiding whole-pool fan-out while remaining ordinary
+stealable work. `RAPID_LAZY_STEALING` reserves one first block for every
+proportional owner before publishing execution. An idle worker leaves its
+Rapid domain once before claiming later blocks from peer ranges. Both modes run
+one-worker effective domains directly. These modes trade some uniform-loop
+launch cost for recovery from irregular static partitions without creating a
+task per item.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

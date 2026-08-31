@@ -11,10 +11,10 @@ policies cover different workload shapes:
   tree and keeps them static.
 - `RAPID_MAILBOX` uses Rapid distribution to publish a bounded set of adaptive
   blocks into ordinary worker mailboxes, then uses unrestricted stealing.
-- `RAPID_LAZY_STEALING` begins in proportional Rapid ranges and exposes each
-  range only after its owner claims the first block. A worker deregisters from
-  its Rapid domain only when it has exhausted local work and a started peer has
-  unclaimed blocks.
+- `RAPID_LAZY_STEALING` reserves the first block of every proportional range
+  for its owner before publishing execution. A worker deregisters from its
+  Rapid domain only when it has exhausted local work and a peer has unclaimed
+  later blocks.
 
 The result is not one universally best policy. Static Rapid has the lowest
 uniform-loop overhead. Lazy Rapid is the best general-purpose compromise in
@@ -46,48 +46,87 @@ no ordinary tasks: workers claim blocks through cache-line-separated atomic
 cursors and make a one-way transition to unrestricted stealing only when it is
 useful. Both policies honor the caller's grain as a minimum block size.
 
+Lazy mode reserves all owner blocks before publishing its single execution
+tree. This closes a delayed-owner race: a fast peer can finish before another
+owner is scheduled, but it can still safely claim later blocks because the
+delayed owner's first block is already protected. Forced descriptor scarcity
+may group several ranges into one activation without changing that invariant.
+
+Mailbox tasks remain ordinary, globally stealable work, but now carry their
+logical proportional domain separately from the Rapid region context. This
+prevents an already-parallel outer task from expanding every nested loop back
+across the whole pool. The context is scoped to its owning pool, so a callback
+may still invoke a different pool independently. Rapid region contexts carry
+the same ownership tag, preventing static or lazy nested calls from inheriting
+a foreign pool's domain. Mailbox and lazy modes also run a one-worker effective
+domain directly, without task or coordinator allocation, and check
+cancellation between serial iterations. Finally, mailbox mode publishes half
+as many tasks when there are at most 64 iterations per worker; larger and
+irregular loops retain the finer balance-preserving density.
+
 ## Direct backend loop results
 
 The following medians come from `bench_loops`, which invokes the backend
-directly rather than going through OOX. The run used Release mode, 16 workers,
-seven repetitions, and a 50 ms minimum sample time on the local Apple Silicon
-host. Times are microseconds; speedup is relative to the normal Eigen
+directly rather than going through OOX. The final run used Release mode, 16
+workers, nine repetitions, and a 100 ms minimum sample time on the local Apple
+Silicon host. Times are microseconds; speedup is relative to the normal Eigen
 work-stealing mode built from the same commit.
 
 | Iterations | Normal Eigen | Static Rapid | Speedup | Mailbox | Speedup | Lazy | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 25.38 | 12.29 | 2.07x | 28.45 | 0.89x | 16.53 | 1.54x |
-| 512 | 59.46 | 12.72 | 4.67x | 47.38 | 1.25x | 19.79 | 3.00x |
-| 4,096 | 256.81 | 13.77 | 18.65x | 119.18 | 2.15x | 23.88 | 10.75x |
-| 32,768 | 1,855.03 | 15.89 | 116.73x | 127.92 | 14.50x | 30.99 | 59.85x |
-| 262,144 | 13,787.40 | 24.07 | 572.85x | 451.46 | 30.54x | 71.69 | 192.33x |
+| 64 | 14.80 | 7.45 | 1.99x | 14.90 | 0.99x | 9.86 | 1.50x |
+| 512 | 53.70 | 6.65 | 8.08x | 30.90 | 1.74x | 16.50 | 3.25x |
+| 4,096 | 249.00 | 7.17 | 34.73x | 126.00 | 1.98x | 33.40 | 7.46x |
+| 32,768 | 1,802.00 | 11.80 | 152.71x | 135.00 | 13.35x | 40.10 | 44.94x |
+| 262,144 | 14,230.00 | 43.50 | 327.13x | 467.00 | 30.47x | 106.00 | 134.25x |
 
 The normal Eigen loop recursively splits to grain one, so scheduler work grows
 with the iteration count even when the body is almost empty. Static Rapid
 publishes a worker-sized activation tree and then runs contiguous ranges.
 Lazy Rapid adds only bounded atomic block claims, while mailbox mode pays for
 ordinary task allocation and queue publication. That is why mailbox loses the
-64-item case but becomes substantially faster as the loop grows.
+most ground at 64 items, where the short-loop density tuning brings it to an
+effective tie with normal Eigen.
 
 ## Balanced and irregular SpMV
 
 The scheduler suite also measures useful work, where low launch time alone is
 not enough. These are matched medians for 131,072-row deterministic CSR
-matrices from the same seven-repetition run. Times are milliseconds.
+matrices from the same final run. Times are milliseconds.
 
 | Distribution | Normal Eigen | Static Rapid | Mailbox | Lazy |
 | --- | ---: | ---: | ---: | ---: |
-| Balanced | 9.685 | 13.025 | 9.346 | 9.678 |
-| Hyperbolic | 5.679 | 28.728 | 5.669 | 5.545 |
-| Triangular | 7.298 | 10.983 | 7.343 | 7.321 |
+| Balanced | 9.721 | 13.158 | 9.545 | 9.228 |
+| Hyperbolic | 5.488 | 29.832 | 5.982 | 5.289 |
+| Triangular | 7.455 | 11.467 | 7.247 | 7.063 |
 
 Static Rapid is deliberately static, so the hyperbolic matrix exposes its
-failure mode: a few heavy leading rows make it about 5.1x slower than normal
-Eigen. Both hybrids remove that cliff. Mailbox is within about one percent of
-normal Eigen on all three shapes. Lazy is effectively tied on balanced and
-triangular inputs and is about 2.4% faster on the hyperbolic input. Thus the
-lazy policy combines the direct-loop advantage with the load balance expected
-from the normal work-stealing backend.
+failure mode: a few heavy leading rows make it about 5.44x slower than normal
+Eigen. Both hybrids remove that cliff. Mailbox ranges from 2.8% faster on the
+triangular input to 9.0% slower on the hyperbolic input. Lazy is 5.1% faster on
+balanced, 3.6% faster on hyperbolic, and 5.3% faster on triangular input. Thus
+the lazy policy combines the direct-loop advantage with the load balance
+expected from the normal work-stealing backend.
+
+## Nested matrix work
+
+Nested loops exposed a separate mailbox failure mode before the final tuning.
+Ordinary mailbox tasks correctly had no Rapid region context, but that made
+each inner loop look like a new whole-pool root. Preserving the task's logical
+domain removes this fan-out without restricting ordinary stealing. Final
+matched medians are:
+
+| Workload | Normal Eigen | Static Rapid | Mailbox | Lazy |
+| --- | ---: | ---: | ---: | ---: |
+| Matrix multiply | 1.408 ms | 0.321 ms | 0.229 ms | 0.218 ms |
+| Matrix transpose | 55.71 us | 15.36 us | 20.49 us | 17.96 us |
+
+Mailbox is now 6.15x faster than normal Eigen on nested matrix multiply and
+2.72x faster on transpose. Relative to the untuned mailbox path measured in
+this pass, multiply fell from 3.60 ms to 0.22 ms and transpose from 298 us to
+20.1 us. With one worker, both hybrid modes now collapse to the same direct
+serial path as static Rapid; a 262K direct loop measured about 58 us instead of
+124 us for the previous lazy coordinator path.
 
 These macOS results are development evidence, not cross-machine constants.
 Affinity is a no-op on this host, background load and heterogeneous cores add
@@ -98,18 +137,20 @@ checkouts and also includes the branch's shared pool correctness fixes.
 
 ## Correctness and CI evidence
 
-The final implementation passed:
+The final local implementation passed:
 
-- 114/114 tests in both Clang Debug and Clang Release configurations;
-- 23/23 Release scheduler-evaluation oracle, nesting, runner, and smoke tests;
-- 20 complete Rapid-suite repetitions under UBSan during tuning, followed by
-  five repetitions on the final cache-aligned coordinator;
+- 122/122 tests in both Clang Debug and Clang Release configurations;
+- 45/45 Release scheduler-evaluation oracle, nesting, runner, and smoke tests;
+- 20 complete Rapid-suite repetitions under UBSan on the final code;
+- 200 repetitions of the mailbox nesting, cross-pool, one-worker, and
+  cancellation edge cases;
+- 500 repetitions of the delayed-owner and forced descriptor-scarcity lazy
+  stealing cases;
 - 200 repetitions of the no-stall/no-deregistration transition test;
-- 100 repetitions of a deterministic test that blocks a range owner and
-  verifies another worker steals only later, unclaimed blocks;
 - exception propagation and reuse, nested hybrid loops, exact-once visitation,
   concurrent roots, descriptor scarcity, queue saturation, and pool
-  cancellation.
+  cancellation;
+- `clang-tidy` using the exact Release compilation database, with no findings.
 
 AddressSanitizer and ThreadSanitizer were also attempted earlier in the branch
 work, but both runtimes fail before test execution on this Apple host. They are

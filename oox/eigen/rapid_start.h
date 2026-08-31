@@ -282,7 +282,7 @@ inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
   owner_ = &owner;
   region_ = &region;
   parent_ = parent;
-  context_ = {&region, domain, parent_context, region.LeaveOnSteal()};
+  context_ = {&region, domain, parent_context, region.LeaveOnSteal(), &owner};
   begin_ = begin;
   end_ = end;
   // The initial ticket keeps the descriptor alive until completion.
@@ -447,6 +447,9 @@ void ParallelForRanges(RapidStartGroup group, size_t begin, size_t end,
   };
   ThreadPool &pool = group.state->Pool();
   RegionContext *parent = pool.CurrentRegionContext();
+  if (parent && parent->rapid_state && parent->rapid_state != group.state) {
+    parent = nullptr;
+  }
   DomainId domain = parent ? parent->domain : group.domain;
   if (domain.Size() == 1) {
     std::invoke(function, begin, end);
@@ -507,8 +510,9 @@ private:
   std::exception_ptr exception_;
 };
 
-inline size_t HybridBlockSize(size_t work, size_t workers,
-                              size_t grain) noexcept {
+inline size_t HybridBlockSize(size_t work, size_t workers, size_t grain,
+                              size_t blocks_per_worker_divisor = 1) noexcept {
+  assert(blocks_per_worker_divisor != 0);
   const size_t work_per_worker = work / workers + (work % workers != 0);
   // Bound scheduler metadata for short loops, then expose finer blocks only
   // when each worker has enough useful work to amortize them.
@@ -516,7 +520,9 @@ inline size_t HybridBlockSize(size_t work, size_t workers,
                                    : work_per_worker <= 64   ? 8
                                    : work_per_worker <= 4096 ? 32
                                                              : 128;
-  const size_t blocks = workers * blocks_per_worker;
+  const size_t blocks =
+      workers *
+      std::max<size_t>(blocks_per_worker / blocks_per_worker_divisor, 1);
   const size_t target = work / blocks + (work % blocks != 0);
   return std::max<size_t>({target, grain, 1});
 }
@@ -531,16 +537,28 @@ void RunOrdinaryRange(OrdinaryRegion &region, F &function, size_t begin,
   } catch (...) {
     region.Fail(std::current_exception());
   }
-  region.TaskComplete();
 }
+
+struct MailboxDomainContext {
+  RapidDomainState *state = nullptr;
+  DomainId domain;
+};
+
+inline thread_local MailboxDomainContext current_mailbox_context;
 
 template <typename F> class RangeTask final : public Task {
 public:
-  RangeTask(OrdinaryRegion &region, F &function, size_t begin, size_t end)
-      : region_(region), function_(function), begin_(begin), end_(end) {}
+  RangeTask(OrdinaryRegion &region, RapidDomainState &state, F &function,
+            DomainId domain, size_t begin, size_t end)
+      : region_(region), state_(state), function_(function), domain_(domain),
+        begin_(begin), end_(end) {}
 
   void operator()() final {
+    const MailboxDomainContext previous_context = current_mailbox_context;
+    current_mailbox_context = {&state_, domain_};
     RunOrdinaryRange(region_, function_, begin_, end_);
+    current_mailbox_context = previous_context;
+    region_.TaskComplete();
     delete this;
   }
   void Discard() noexcept final {
@@ -550,7 +568,9 @@ public:
 
 private:
   OrdinaryRegion &region_;
+  RapidDomainState &state_;
   F &function_;
+  DomainId domain_;
   size_t begin_;
   size_t end_;
 };
@@ -572,8 +592,14 @@ public:
     }
   }
 
+  void ReserveFirstBlock(size_t own_slot) noexcept {
+    Range &range = ranges_[own_slot];
+    range.first = range.next.fetch_add(block_, std::memory_order_relaxed);
+  }
+
   void Run(size_t own_slot) noexcept {
-    RunBlock(own_slot, true);
+    Range &range = ranges_[own_slot];
+    RunClaimedBlock(range, range.first);
     while (!IsCancelled() && RunBlock(own_slot)) {
     }
     bool in_rapid_domain = true;
@@ -592,8 +618,7 @@ public:
       bool found = false;
       for (size_t offset = 1; offset < slots_ && !IsCancelled(); ++offset) {
         const size_t slot = (own_slot + offset) % slots_;
-        if (ranges_[slot].started.load(std::memory_order_acquire) &&
-            RunBlock(slot)) {
+        if (RunBlock(slot)) {
           found = true;
           break;
         }
@@ -613,8 +638,8 @@ public:
 private:
   struct alignas(OOX_EIGEN_CACHE_LINE_SIZE) Range {
     std::atomic<size_t> next{0};
+    size_t first = 0;
     size_t end = 0;
-    std::atomic<bool> started{false};
   };
 
   bool IsCancelled() const noexcept {
@@ -622,21 +647,20 @@ private:
   }
   bool HasUnclaimedWork() const noexcept {
     for (size_t slot = 0; slot < slots_; ++slot) {
-      if (ranges_[slot].started.load(std::memory_order_acquire) &&
-          ranges_[slot].next.load(std::memory_order_relaxed) <
-              ranges_[slot].end) {
+      if (ranges_[slot].next.load(std::memory_order_relaxed) <
+          ranges_[slot].end) {
         return true;
       }
     }
     return false;
   }
-  bool RunBlock(size_t slot, bool expose = false) noexcept {
+  bool RunBlock(size_t slot) noexcept {
     Range &range = ranges_[slot];
     const size_t first =
         range.next.fetch_add(block_, std::memory_order_relaxed);
-    if (expose) {
-      range.started.store(true, std::memory_order_release);
-    }
+    return RunClaimedBlock(range, first);
+  }
+  bool RunClaimedBlock(Range &range, size_t first) noexcept {
     if (first >= range.end) {
       return false;
     }
@@ -682,20 +706,38 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
   if (!group.state || group.domain.Size() == 0 || begin >= end) {
     return;
   }
+  ThreadPool &pool = group.state->Pool();
+  const DomainId domain = current_mailbox_context.state == group.state
+                              ? current_mailbox_context.domain
+                              : group.domain;
+  if (domain.Size() == 1) {
+    for (size_t index = begin; index < end && !pool.IsCancelled(); ++index) {
+      std::invoke(function, index);
+    }
+    return;
+  }
+  group.domain = domain;
   using Function = std::remove_reference_t<F>;
   Function &callable = function;
-  ThreadPool &pool = group.state->Pool();
   OrdinaryRegion ordinary(pool);
-  const size_t block = HybridBlockSize(end - begin, group.domain.Size(),
-                                       std::max<size_t>(grain, 1));
+  const size_t work = end - begin;
+  const size_t work_per_worker =
+      work / group.domain.Size() + (work % group.domain.Size() != 0);
+  // One task per worker is enough for very short slices. Preserve the finer
+  // density once iteration imbalance can dominate publication overhead.
+  const size_t task_density_divisor = work_per_worker <= 64 ? 2 : 1;
+  const size_t block =
+      HybridBlockSize(end - begin, group.domain.Size(),
+                      std::max<size_t>(grain, 1), task_density_divisor);
   try {
     ParallelForRanges(group, begin, end, [&](size_t first, size_t last) {
       RegionContext *context = pool.CurrentRegionContext();
-      const size_t target = context ? context->domain.start : 0;
+      const DomainId domain = context ? context->domain : group.domain;
+      const size_t target = domain.start;
       while (first < last) {
         const size_t task_end = first + std::min(block, last - first);
-        auto *task =
-            new RangeTask<Function>(ordinary, callable, first, task_end);
+        auto *task = new RangeTask<Function>(ordinary, *group.state, callable,
+                                             domain, first, task_end);
         ordinary.AddTask();
         try {
           pool.RunOnThread(task, target);
@@ -723,9 +765,26 @@ void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
   using Function = std::remove_reference_t<F>;
   Function &callable = function;
   ThreadPool &pool = group.state->Pool();
+  RegionContext *parent = pool.CurrentRegionContext();
+  if (parent && parent->rapid_state && parent->rapid_state != group.state) {
+    parent = nullptr;
+  }
+  const DomainId domain = parent ? parent->domain : group.domain;
+  if (domain.Size() == 1) {
+    for (size_t index = begin; index < end && !pool.IsCancelled(); ++index) {
+      std::invoke(callable, index);
+    }
+    return;
+  }
+  group.domain = domain;
   const size_t slots = std::min(group.domain.Size(), end - begin);
-  LazyRangeCoordinator<Function> coordinator(
-      pool, callable, begin, end, slots, std::max<size_t>(grain, 1));
+  LazyRangeCoordinator<Function> coordinator(pool, callable, begin, end, slots,
+                                             std::max<size_t>(grain, 1));
+  // Protect one block for every proportional owner before work is published.
+  // A worker can then steal later blocks without racing a delayed owner.
+  for (size_t slot = 0; slot < slots; ++slot) {
+    coordinator.ReserveFirstBlock(slot);
+  }
   ParallelForRanges(
       group, 0, slots,
       [&](size_t first_slot, size_t last_slot) {

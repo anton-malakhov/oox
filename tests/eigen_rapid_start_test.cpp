@@ -298,6 +298,15 @@ TEST_P(EigenRapidHybridTest, CancellationCompletesPublishedWork) {
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
 }
 
+TEST_P(EigenRapidHybridTest, OneWorkerHonorsCancellation) {
+  RapidHarness harness(1);
+  harness.pool.Cancel();
+  std::atomic<unsigned> completed{0};
+  RunHybrid(GetParam(), harness.group, 0, 1024,
+            [&](size_t) { completed.fetch_add(1, std::memory_order_relaxed); });
+  EXPECT_EQ(completed.load(), 0u);
+}
+
 TEST(EigenRapidMailbox, RunsOrdinaryTasksOutsideRapidDomains) {
   RapidHarness harness(8);
   std::atomic<bool> outside{true};
@@ -309,6 +318,51 @@ TEST(EigenRapidMailbox, RunsOrdinaryTasksOutsideRapidDomains) {
   EXPECT_TRUE(outside.load());
 }
 
+TEST(EigenRapidMailbox, KeepsNestedWorkInsideItsLogicalOwner) {
+  RapidHarness harness(8);
+  std::atomic<bool> nested_stayed_local{true};
+  ParallelForMailbox(harness.group, 0, 1024, [&](size_t index) {
+    if (index != 0) {
+      return;
+    }
+    const size_t outer_worker = harness.pool.CurrentThreadId();
+    ParallelForMailbox(harness.group, 0, 128, [&](size_t) {
+      if (harness.pool.CurrentThreadId() != outer_worker) {
+        nested_stayed_local.store(false, std::memory_order_relaxed);
+      }
+    });
+  });
+  EXPECT_TRUE(nested_stayed_local.load());
+}
+
+TEST(EigenRapidMailbox, NestedOneWorkerMakesProgress) {
+  RapidHarness harness(1);
+  std::atomic<unsigned> completed{0};
+  ParallelForMailbox(harness.group, 0, 16, [&](size_t) {
+    ParallelForMailbox(harness.group, 0, 16, [&](size_t) {
+      completed.fetch_add(1, std::memory_order_relaxed);
+    });
+  });
+  EXPECT_EQ(completed.load(), 256u);
+}
+
+TEST(EigenRapidMailbox, DifferentPoolDoesNotInheritLogicalDomain) {
+  RapidHarness outer(8);
+  RapidHarness inner(2);
+  std::atomic<bool> ran_on_inner_pool{true};
+  ParallelForMailbox(outer.group, 0, 1024, [&](size_t index) {
+    if (index != 0) {
+      return;
+    }
+    ParallelForMailbox(inner.group, 0, 128, [&](size_t) {
+      if (inner.pool.CurrentThreadId() == -1) {
+        ran_on_inner_pool.store(false, std::memory_order_relaxed);
+      }
+    });
+  });
+  EXPECT_TRUE(ran_on_inner_pool.load());
+}
+
 TEST(EigenRapidLazyStealing, DoesNotDeregisterWithoutAStall) {
   RapidHarness harness(8);
   const size_t before = harness.pool.RapidDeregistrationCount();
@@ -316,8 +370,49 @@ TEST(EigenRapidLazyStealing, DoesNotDeregisterWithoutAStall) {
   EXPECT_EQ(harness.pool.RapidDeregistrationCount(), before);
 }
 
-TEST(EigenRapidLazyStealing, ExposesOnlyUnclaimedBlocksWhileOwnerRuns) {
+TEST(EigenRapidLazyStealing, NestedOneWorkerMakesProgress) {
+  RapidHarness harness(1);
+  std::atomic<unsigned> completed{0};
+  ParallelForLazyStealing(harness.group, 0, 16, [&](size_t) {
+    ParallelForLazyStealing(harness.group, 0, 16, [&](size_t) {
+      completed.fetch_add(1, std::memory_order_relaxed);
+    });
+  });
+  EXPECT_EQ(completed.load(), 256u);
+}
+
+TEST(EigenRapidLazyStealing, DescriptorScarcityGroupsRangesWithoutDeadlock) {
+  RapidHarness harness(8, false, 0);
+  std::vector<std::atomic<unsigned>> visits(1024);
+  ParallelForLazyStealing(harness.group, 0, visits.size(), [&](size_t index) {
+    visits[index].fetch_add(1, std::memory_order_relaxed);
+  });
+  for (const auto &visit : visits) {
+    EXPECT_EQ(visit.load(), 1u);
+  }
+}
+
+TEST(EigenRapidLazyStealing, DifferentPoolDoesNotInheritRapidDomain) {
+  RapidHarness outer(8);
+  RapidHarness inner(2);
+  std::atomic<bool> used_inner_context{true};
+  ParallelForLazyStealing(outer.group, 0, 1024, [&](size_t index) {
+    if (index != 0) {
+      return;
+    }
+    ParallelForLazyStealing(inner.group, 0, 128, [&](size_t) {
+      const auto *context = inner.pool.CurrentRegionContext();
+      if (!context || context->rapid_state != &inner.state) {
+        used_inner_context.store(false, std::memory_order_relaxed);
+      }
+    });
+  });
+  EXPECT_TRUE(used_inner_context.load());
+}
+
+TEST(EigenRapidLazyStealing, ProtectsOwnerBlockWhilePeerStealsLaterBlocks) {
   RapidHarness harness(2);
+  harness.AwaitRegistrations();
   std::atomic<bool> owner_entered{false};
   std::atomic<unsigned> stolen{0};
   std::promise<void> release_owner;

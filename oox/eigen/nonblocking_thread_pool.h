@@ -38,6 +38,9 @@
 namespace oox::detail::eigen_pool {
 
 class RapidRegionBase;
+namespace rapid {
+class RapidDomainState;
+}
 
 struct DomainId {
   unsigned start = 0;
@@ -54,6 +57,7 @@ struct RegionContext {
   DomainId domain;
   RegionContext *parent = nullptr;
   bool leave_on_steal = false;
+  rapid::RapidDomainState *rapid_state = nullptr;
 };
 
 struct Task;
