@@ -287,6 +287,7 @@ public:
       }
     }
     CancelRapidQueues();
+    CancelOrdinaryQueues();
     done_.store(true, std::memory_order_release);
 
     // Let each thread know it's been cancelled.
@@ -927,6 +928,24 @@ private:
         rapid->Cancel();
         rapid->ReleaseTicket();
       }
+    }
+  }
+
+  void CancelOrdinaryQueues() {
+    for (auto &data : thread_data_) {
+      while (TaskPtr task = data.PopBack(true)) {
+        auto *outstanding = task->outstanding;
+        task->Discard();
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+    std::lock_guard<std::mutex> lock(overflow_mutex_);
+    while (!overflow_tasks_.empty()) {
+      TaskPtr task = overflow_tasks_.front();
+      overflow_tasks_.pop_front();
+      auto *outstanding = task->outstanding;
+      task->Discard();
+      outstanding->fetch_sub(1, std::memory_order_relaxed);
     }
   }
 

@@ -225,6 +225,36 @@ TEST(EigenPool, CancellationWaitsForRapidPublication) {
   EXPECT_EQ(count.load(), 0);
 }
 
+TEST(EigenPool, CancellationDrainsRapidOrdinaryFallbacks) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> entered, release, blocker_done, completed;
+  auto entered_result = entered.get_future();
+  auto release_result = release.get_future().share();
+  auto blocker_done_result = blocker_done.get_future();
+  pool.Schedule(MakeTask([&] {
+    entered.set_value();
+    release_result.wait();
+    blocker_done.set_value();
+  }));
+  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
+
+  constexpr int task_count = 1026;
+  std::atomic<int> count{0};
+  std::vector<std::unique_ptr<CountingRapidTask>> tasks;
+  for (int i = 0; i < task_count; ++i) {
+    tasks.push_back(
+        std::make_unique<CountingRapidTask>(count, task_count, completed));
+    pool.ScheduleRapid(tasks.back().get(), 0);
+  }
+  pool.Cancel();
+  for (const auto &task : tasks) {
+    EXPECT_EQ(task->tickets.load(), 0u);
+  }
+  EXPECT_EQ(count.load(), 0);
+  release.set_value();
+  EXPECT_EQ(blocker_done_result.wait_for(2s), std::future_status::ready);
+}
+
 TEST(EigenPool, OrdinaryTaskPreemptsSustainedRapidStream) {
   ThreadPool pool(1, false, false);
   std::promise<void> entered, ordinary_completed;
