@@ -53,12 +53,14 @@ task per item.
 
 `RAPID_TIMESPAN_LAZY_STEALING` retains the same protected first blocks and
 one-way Rapid-domain exit, but each proportional owner times its own blocks and
-smoothly adjusts toward 75 microseconds of useful work. Changes are bounded to
-one quarter through eight times the previous block and leave at least four
-later steal opportunities. Thieves use the owner's latest published block size
-without feeding migration or contention time back into the estimate. Calls at
-or below 512 iterations per effective worker use fixed lazy blocks because the
-clock cost is larger than the available adaptation benefit.
+smoothly adjusts toward a runtime-derived useful-work duration. A one-time probe
+measures the current CPU's clock and atomic-claim cost; the policy combines it
+with domain size, projected owner-range time, and the fraction of owners already
+looking for work. Changes are bounded to one quarter through eight times the
+previous block and leave at least four later steal opportunities. Thieves use
+the owner's latest published block size without feeding migration or contention
+time back into the estimate. Define `OOX_RAPID_TIMESPAN_TARGET_NS` to a nonzero
+value only when a fixed target is useful for a controlled comparison.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally

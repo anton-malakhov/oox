@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -529,8 +530,72 @@ inline size_t HybridBlockSize(size_t work, size_t workers, size_t grain,
   return std::max<size_t>({target, grain, 1});
 }
 
-inline constexpr size_t kTimespanLazyTargetNs = 75'000;
-inline constexpr size_t kTimespanLazyMinWorkPerWorker = 512;
+inline size_t CalibratedTimespanSchedulingOverheadNs() noexcept {
+  static const size_t overhead_ns = [] {
+    constexpr size_t samples = 128;
+    constexpr size_t rounds = 5;
+    std::atomic<size_t> cursor{0};
+    std::atomic<size_t> published_block{1};
+    size_t best = std::numeric_limits<size_t>::max();
+    // Use the best batch average so preemption changes neither the estimate nor
+    // every later block decision. This calibration runs once per process.
+    for (size_t round = 0; round < rounds; ++round) {
+      size_t total = 0;
+      for (size_t sample = 0; sample < samples; ++sample) {
+        const auto origin = std::chrono::steady_clock::now();
+        const size_t block = published_block.load(std::memory_order_relaxed);
+        cursor.fetch_add(block, std::memory_order_relaxed);
+        cursor.load(std::memory_order_relaxed);
+        published_block.store(block, std::memory_order_relaxed);
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - origin)
+                .count();
+        total += static_cast<size_t>(
+            std::max<decltype(elapsed)>(elapsed, 1));
+      }
+      best = std::min(best, total / samples + (total % samples != 0));
+    }
+    return std::max<size_t>(best, 1);
+  }();
+  return overhead_ns;
+}
+
+inline size_t TimespanDomainSchedulingOverheadNs(size_t local_overhead_ns,
+                                                 size_t workers) noexcept {
+  // A stolen block can be inspected by every worker in the domain, so account
+  // for the domain-wide cache/coherence opportunity rather than one claim.
+  if (local_overhead_ns >
+      std::numeric_limits<size_t>::max() / std::max<size_t>(workers, 1)) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return local_overhead_ns * std::max<size_t>(workers, 1);
+}
+
+inline size_t TimespanTargetNanoseconds(size_t scheduling_overhead_ns,
+                                        size_t completed, size_t elapsed_ns,
+                                        size_t range_work,
+                                        size_t stealing_workers,
+                                        size_t workers) noexcept {
+  if (range_work == 0 || completed == 0) {
+    return std::max<size_t>(scheduling_overhead_ns, 1);
+  }
+  const long double projected_range_ns =
+      static_cast<long double>(elapsed_ns) * range_work / completed;
+  const long double steal_pressure =
+      1.0L + static_cast<long double>(stealing_workers) /
+                   std::max<size_t>(workers, 1);
+  // Minimize H*T/tau scheduling work plus pressure*tau tail exposure.
+  const long double target = std::sqrt(
+      static_cast<long double>(std::max<size_t>(scheduling_overhead_ns, 1)) *
+      projected_range_ns / steal_pressure);
+  if (target >= std::numeric_limits<size_t>::max()) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return std::max<size_t>(
+      static_cast<size_t>(target + 0.5L),
+      std::max<size_t>(scheduling_overhead_ns, 1));
+}
 
 inline size_t TimespanBlockSize(size_t current, size_t completed,
                                 size_t elapsed_ns, size_t remaining,
@@ -614,14 +679,22 @@ public:
         ranges_(new Range[slots]), block_(HybridBlockSize(end - begin, slots,
                                                          grain)),
         grain_(grain), target_block_ns_(target_block_ns) {
+    if constexpr (Timespan) {
+      if (target_block_ns_ == 0) {
+        scheduling_overhead_ns_ = TimespanDomainSchedulingOverheadNs(
+            CalibratedTimespanSchedulingOverheadNs(), slots_);
+      }
+    }
     const size_t quotient = (end - begin) / slots;
     const size_t remainder = (end - begin) % slots;
     size_t cursor = begin;
     for (size_t slot = 0; slot < slots; ++slot) {
       ranges_[slot].next.store(cursor, std::memory_order_relaxed);
       ranges_[slot].adaptive_block.store(block_, std::memory_order_relaxed);
+      const size_t range_begin = cursor;
       cursor += quotient + (slot < remainder);
       ranges_[slot].end = cursor;
+      ranges_[slot].work = cursor - range_begin;
     }
   }
 
@@ -638,6 +711,9 @@ public:
       RunClaimedBlock(range, range.first, block_);
     }
     while (!IsCancelled() && RunBlock(own_slot, true)) {
+    }
+    if constexpr (Timespan) {
+      steal_pressure_.fetch_add(1, std::memory_order_relaxed);
     }
     bool in_rapid_domain = true;
     while (!IsCancelled() && HasUnclaimedWork()) {
@@ -664,6 +740,9 @@ public:
         break;
       }
     }
+    if constexpr (Timespan) {
+      steal_pressure_.fetch_sub(1, std::memory_order_relaxed);
+    }
   }
 
   void Rethrow() {
@@ -678,6 +757,7 @@ private:
     std::atomic<size_t> adaptive_block{1};
     size_t first = 0;
     size_t end = 0;
+    size_t work = 0;
     size_t samples = 0;
   };
 
@@ -724,10 +804,16 @@ private:
     if (ran && !IsCancelled()) {
       const size_t cursor = range.next.load(std::memory_order_relaxed);
       const size_t remaining = cursor < range.end ? range.end - cursor : 0;
+      const size_t elapsed_ns = static_cast<size_t>(
+          std::max<decltype(elapsed)>(elapsed, 1));
+      const size_t target_ns =
+          target_block_ns_ != 0
+              ? target_block_ns_
+              : TimespanTargetNanoseconds(
+                    scheduling_overhead_ns_, completed, elapsed_ns, range.work,
+                    steal_pressure_.load(std::memory_order_relaxed), slots_);
       size_t next = TimespanBlockSize(
-          block, completed, static_cast<size_t>(std::max<decltype(elapsed)>(
-                                elapsed, 1)),
-          remaining, grain_, target_block_ns_);
+          block, completed, elapsed_ns, remaining, grain_, target_ns);
       if (range.samples++ != 0) {
         next = next > block ? block + (next - block) / 4
                             : block - (block - next) / 4;
@@ -762,6 +848,8 @@ private:
   size_t block_;
   size_t grain_;
   size_t target_block_ns_;
+  size_t scheduling_overhead_ns_ = 0;
+  std::atomic<size_t> steal_pressure_{0};
   std::atomic<bool> cancelled_{false};
   std::mutex exception_mutex_;
   std::exception_ptr exception_;
@@ -855,16 +943,6 @@ void ParallelForLazyStealingImpl(RapidStartGroup group, size_t begin,
     }
     return;
   }
-  if constexpr (Timespan) {
-    const size_t work = end - begin;
-    const size_t work_per_worker =
-        work / domain.Size() + (work % domain.Size() != 0);
-    if (work_per_worker <= kTimespanLazyMinWorkPerWorker) {
-      ParallelForLazyStealingImpl<false>(
-          group, begin, end, std::forward<F>(function), grain, 0);
-      return;
-    }
-  }
   group.domain = domain;
   const size_t slots = std::min(group.domain.Size(), end - begin);
   LazyRangeCoordinator<Function, Timespan> coordinator(
@@ -897,8 +975,7 @@ template <typename F>
 void ParallelForTimespanLazyStealing(RapidStartGroup group, size_t begin,
                                      size_t end, F &&function,
                                      size_t grain = 1,
-                                     size_t target_block_ns =
-                                         kTimespanLazyTargetNs) {
+                                     size_t target_block_ns = 0) {
   ParallelForLazyStealingImpl<true>(group, begin, end,
                                     std::forward<F>(function), grain,
                                     target_block_ns);

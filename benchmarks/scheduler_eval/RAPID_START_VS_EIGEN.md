@@ -50,9 +50,10 @@ no ordinary tasks: workers claim blocks through cache-line-separated atomic
 cursors and make a one-way transition to unrestricted stealing only when it is
 useful. All hybrid policies honor the caller's grain as a minimum block size. Large
 slices now stop at 64 blocks per worker instead of 128. Timespan-lazy mode
-starts from those blocks, times only the proportional owner's work, and adapts
-toward a 75 microsecond target. A 512-iteration-per-worker cutoff keeps clock
-reads out of short loops. Alternated old/new runs
+starts from those blocks and times only the proportional owner's work. Its
+default target is now computed from a one-time platform overhead calibration,
+effective domain size, projected owner-range time, and live steal pressure; it
+contains no fixed duration or iteration-count cutoff. Alternated old/new runs
 showed 1.75--1.79x faster 262K mailbox launch and 1.24--1.27x faster lazy launch,
 while retaining 1,024 independently stealable blocks at 16 workers.
 
@@ -91,21 +92,21 @@ work-stealing mode built from the same commit.
 
 | Iterations | Normal Eigen | Static Rapid | Mailbox | Fixed lazy | Timespan lazy | Timespan speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 21.20 | 13.30 | 21.60 | 24.40 | 24.40 | 0.87x |
-| 512 | 55.70 | 13.20 | 36.20 | 24.60 | 25.70 | 2.17x |
-| 4,096 | 274.00 | 13.80 | 69.30 | 28.00 | 27.80 | 9.86x |
-| 32,768 | 1,932.00 | 13.10 | 123.00 | 32.70 | 31.90 | 60.56x |
-| 262,144 | 14,598.00 | 20.30 | 254.00 | 60.50 | 47.20 | 309.28x |
+| 64 | 28.60 | 13.20 | 22.00 | 21.50 | 22.90 | 1.25x |
+| 512 | 61.20 | 12.90 | 34.70 | 23.80 | 26.10 | 2.34x |
+| 4,096 | 256.00 | 14.20 | 67.90 | 28.10 | 28.60 | 8.95x |
+| 32,768 | 1,778.00 | 15.80 | 123.00 | 34.00 | 30.90 | 57.54x |
+| 262,144 | 14,263.00 | 25.50 | 258.00 | 60.50 | 51.80 | 275.35x |
 
 The normal Eigen loop recursively splits to grain one, so scheduler work grows
 with the iteration count even when the body is almost empty. Static Rapid
 publishes a worker-sized activation tree and then runs contiguous ranges.
 Lazy Rapid adds only bounded atomic block claims, while mailbox mode pays for
 ordinary task allocation and queue publication. Mailbox therefore has the
-smallest advantage at 64 items, while timespan adaptation removes 22.0% of the
-fixed-lazy 262K time. The short-loop bypass intentionally makes its scheduling
-path identical to fixed lazy below the cutoff; the 64-item difference from
-normal Eigen is the fixed Rapid-coordinator cost.
+smallest advantage at 64 items, while automatic timespan adaptation removes
+14.4% of the fixed-lazy 262K time. Unlike the former fixed-target version, the
+automatic policy also times short loops; the runtime formula grows or shrinks
+their blocks from observed cost instead of branching on an iteration threshold.
 
 ## Other backend-only scheduler families
 
@@ -127,30 +128,45 @@ item loop. The repeated-call row also records the boundary honestly: static
 Rapid ties normal Eigen, lazy is close, and mailbox pays ordinary allocation
 and publication on every tiny call.
 
-## Timespan-lazy follow-up
+## Timespan-lazy calibration follow-up
 
-The new policy was tuned independently at 25, 75, and 250 microsecond targets.
+The first version was tuned independently at 25, 75, and 250 microsecond targets.
 The short target generated too many claims, most visibly on triangular SpMV;
 the long target gave up balancing and regressed Scan and hyperbolic SpMV. The
-75 microsecond target was the best mixed choice. A separate size sweep showed
-that timing did not repay its clock overhead below roughly 512 iterations per
-effective worker, which became the fixed-lazy bypass threshold.
+75 microsecond target was the best fixed mixed choice. It remains available as
+an explicit experimental override, but it is no longer the default.
 
-The final same-load follow-up used seven repetitions and 100 ms minimum sample
+Automatic mode measures the current CPU's clock and atomic scheduling sequence
+once; this host measured 49 ns. For domain size $P$, projected full owner-range
+time $R$, and $s$ owners already looking for work, the target is
+$\sqrt{(49P)R/(1+s/P)}$ on this run. Other CPUs substitute their own measured
+overhead. Changes remain bounded and keep four later steal opportunities.
+
+The matched local follow-ups used seven repetitions and 100 ms minimum sample
 time. Lower is better:
 
-| Workload | Fixed lazy | Timespan lazy | Change |
-| --- | ---: | ---: | ---: |
-| 262K launch (us) | 52.1 | 40.3 | -22.6% |
-| Exclusive scan, 2^22 items (us) | 2,386 | 2,365 | -0.9% |
-| Balanced SpMV (us) | 9,688 | 9,338 | -3.6% |
-| Hyperbolic SpMV (us) | 5,425 | 5,333 | -1.7% |
-| Triangular SpMV (us) | 7,740 | 7,063 | -8.7% |
+| Workload | Fixed lazy | Fixed 75 us | Automatic | Automatic vs lazy |
+| --- | ---: | ---: | ---: | ---: |
+| 262K launch (us) | 52.1 | 41.1 | 38.9 | -25.3% |
+| Exclusive scan, 2^22 items (us) | 2,386 | 2,303 | 2,273 | -4.7% |
+| Balanced SpMV (us) | 9,688 | 9,412 | 9,640 | -0.5% |
+| Hyperbolic SpMV (us) | 5,425 | 5,230 | 5,594 | +3.1% |
+| Triangular SpMV (us) | 7,740 | 6,953 | 7,484 | -3.3% |
 
-This is the intended merger of the two ideas: Rapid Start supplies immediate
-proportional ownership, the owner measures useful-work time while it has local
-work, and timespan sizing reduces claim traffic without removing the later
-escape to ordinary stealing.
+The automatic 262K direct loop measured 128, 108, 58.4, 40.4, and 49.2 us at
+1, 2, 4, 8, and 16 workers. The reversal after eight workers reflects this
+host's 12 performance and 4 efficiency cores plus unavailable affinity, and is
+why the calibration uses measured costs instead of assuming a CPU-frequency or
+worker-count lookup table.
+
+The automatic result is 1.3--5.2% faster than fixed 75 us on launch and Scan,
+and 2.4--7.6% slower on the three SpMV shapes, while removing its
+machine-specific duration. Run-to-run variation is material on this host,
+where worker affinity is unavailable, so small differences should not be read
+as universal rankings. This is the intended merger of the two
+ideas: Rapid Start supplies immediate proportional ownership, the owner
+measures useful-work time while it has local work, and timespan sizing reduces
+claim traffic without removing the later escape to ordinary stealing.
 
 ## Balanced and irregular SpMV
 

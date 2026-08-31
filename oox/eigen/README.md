@@ -40,11 +40,13 @@ coordinator: one first block is reserved for every proportional owner before
 execution is published. Each worker starts with its protected block and leaves
 the Rapid domain once before taking otherwise idle later blocks.
 `ParallelForTimespanLazyStealing` adds a per-owner elapsed-time estimate to that
-lazy policy. Owner blocks adapt toward a 75 microsecond target while preserving
-at least four later steal opportunities; peer thieves consume the last published
-estimate without perturbing it. Loops with at most 512 iterations per effective
-worker use the fixed lazy policy to avoid clock overhead. All hybrid policies
-run one-worker domains directly and preserve nested calls, exception propagation,
+lazy policy. It calibrates clock and atomic-claim overhead once on the running
+CPU, scales that cost by the effective domain, and derives each target from
+the projected owner-range time and live steal pressure. Blocks preserve at least
+four later steal opportunities; peer thieves consume the last published
+estimate without perturbing it. A nonzero target can still be supplied
+explicitly for experiments, but the default contains no duration constant. All
+hybrid policies run one-worker domains directly and preserve nested calls, exception propagation,
 pool cancellation, and caller-supplied minimum grain sizes.
 
 ## File provenance and license

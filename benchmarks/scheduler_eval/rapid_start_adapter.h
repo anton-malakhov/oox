@@ -10,6 +10,10 @@
 #include <stdexcept>
 #include <utility>
 
+#ifndef OOX_RAPID_TIMESPAN_TARGET_NS
+#define OOX_RAPID_TIMESPAN_TARGET_NS 0
+#endif
+
 namespace rapid_start_eval {
 
 class Runtime {
@@ -34,7 +38,8 @@ public:
         group_, from, to, std::forward<F>(func), grain);
 #elif EIGEN_MODE == EIGEN_RAPID_TIMESPAN_LAZY_STEALING
     oox::detail::eigen_pool::rapid::ParallelForTimespanLazyStealing(
-        group_, from, to, std::forward<F>(func), grain);
+        group_, from, to, std::forward<F>(func), grain,
+        OOX_RAPID_TIMESPAN_TARGET_NS);
 #else
 #error "Unsupported Rapid Start policy"
 #endif

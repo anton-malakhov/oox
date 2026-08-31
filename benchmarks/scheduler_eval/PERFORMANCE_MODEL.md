@@ -357,7 +357,7 @@ gate is optimal. OOX must estimate those quantities from its own traces.
 | `RAPID_START` | Hierarchical region activation through rapid inboxes with ordinary-queue overflow fallback | Proportional contiguous worker/data subtrees with inherited nested domains |
 | `RAPID_MAILBOX` | Rapid activation publishes adaptive, bounded range blocks to targeted ordinary mailboxes, then exits | Unrestricted deque stealing without recursive grain-one task creation |
 | `RAPID_LAZY_STEALING` | Rapid activation starts a proportional range on each worker and exposes it after the first local claim | Atomic adaptive block claims; a worker leaves its Rapid domain once, only when a started peer range has unclaimed work |
-| `RAPID_TIMESPAN_LAZY_STEALING` | The same protected Rapid owner ranges as lazy stealing | Each owner times local blocks, smooths their size toward 75 us, and publishes the estimate to thieves; short ranges use fixed lazy blocks |
+| `RAPID_TIMESPAN_LAZY_STEALING` | The same protected Rapid owner ranges as lazy stealing | Each owner combines calibrated platform overhead, projected owner-range time, and live steal pressure, then publishes its smoothed block estimate to thieves |
 | `EIGEN_STEALING` | One root range | Binary splitting to a caller-supplied fixed grain (1 in this benchmark), then deque stealing |
 | `EIGEN_SHARING` | `K_SPLIT=2` targeted mailbox tree | Binary splitting to a caller-supplied fixed grain (1 here), then stealing |
 | `EIGEN_STEALING_GRAINSIZE` | One root range | Root measures a timespan-derived grain, then chunk stealing |
@@ -656,25 +656,51 @@ counts are deterministic opportunities, not observed steal counts. In
 particular, lazy failed probes and cache migration require counters before they
 can become separately identifiable model terms.
 
-For the timespan-lazy policy, owner $j$ updates the next block after completing
-$c_{j,k}$ iterations in elapsed time $t_{j,k}$:
+For the timespan-lazy policy, a one-time runtime probe measures the local cost
+$h$ of two steady-clock reads plus the atomic load, claim, load, and publication
+sequence. For effective domain size $s$, use $H=sh$. After owner $j$ completes
+$c_{j,k}$ iterations in elapsed time $t_{j,k}$ and owns a full proportional
+range of $n_j$ iterations, estimate
 
 $$
-r_{j,k}=\operatorname{clamp}\!\left(\frac{75\,000}{t_{j,k}},\frac14,8\right),
+\widehat T_{j,k}=t_{j,k}\frac{n_j}{c_{j,k}},
+\qquad
+\tau_{j,k}=\sqrt{\frac{H\widehat T_{j,k}}{1+p_k}},
+$$
+
+where $p_k=z_k/s$ is the fraction of the $s$ owners that have exhausted their
+local ranges and entered the stealing phase. Keeping $\widehat T$ based on the
+full owner range avoids shrinking the target twice near the tail; the separate
+balance cap below already preserves later stealing opportunities.
+
+The target minimizes the local cost model
+
+$$
+C(\tau)=\frac{H\widehat T}{\tau}+(1+p)\tau.
+$$
+
+The first term prices the approximate number of scheduling decisions and the
+second prices the exposed tail when another worker needs work. Setting
+$C'(\tau)=0$ gives the square-root target above. With $u_{j,k}$ iterations
+currently unclaimed, the next raw block uses
+
+$$
+r_{j,k}=\operatorname{clamp}\!\left(\frac{\tau_{j,k}}{t_{j,k}},\frac14,8\right),
 \qquad
 q_{j,k}=\operatorname{clamp}\!\left(c_{j,k}r_{j,k},g,
-\left\lceil\frac{R_{j,k}}4\right\rceil\right).
+\left\lceil\frac{u_{j,k}}4\right\rceil\right).
 $$
 
 After the first sample, the published size is smoothed by
 $b_{j,k+1}=b_{j,k}+(q_{j,k}-b_{j,k})/4$, with integer rounding toward the old
 size. The implementation also bounds the unsmoothed change to
 $[b_{j,k}/4,8b_{j,k}]$. Only the owner updates $b_j$; thieves load it and claim
-work atomically, so migration and contention do not poison the estimator. If
-$\lceil N/s\rceil\le512$, $b_j$ remains the fixed lazy block and no clock is
-read. Consequently, the actual $\widehat B=\sum_j B_j$ depends on measured body
-time and cannot be inferred from $N$ alone; `model.py` uses the initial
-`HybridBlockSize` count solely as a structural proxy.
+work atomically, so migration and contention do not poison the estimator. The
+unitless baseline $1$ represents the possibility of one tail worker before an
+idle owner is observed; no time duration or iteration-count cutoff is built
+into the default. Consequently, the actual $\widehat B=\sum_j B_j$ depends on
+measured platform and body time and cannot be inferred from $N$ alone;
+`model.py` uses the initial `HybridBlockSize` count solely as a structural proxy.
 
 Root timespan stealing also replaces the ordinary critical-worker callback count
 with

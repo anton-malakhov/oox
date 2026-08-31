@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -15,6 +16,7 @@ namespace {
 
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
+using oox::detail::eigen_pool::rapid::CalibratedTimespanSchedulingOverheadNs;
 using oox::detail::eigen_pool::rapid::ParallelFor;
 using oox::detail::eigen_pool::rapid::ParallelForLazyStealing;
 using oox::detail::eigen_pool::rapid::ParallelForMailbox;
@@ -22,6 +24,8 @@ using oox::detail::eigen_pool::rapid::ParallelForTimespanLazyStealing;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
 using oox::detail::eigen_pool::rapid::TimespanBlockSize;
+using oox::detail::eigen_pool::rapid::TimespanDomainSchedulingOverheadNs;
+using oox::detail::eigen_pool::rapid::TimespanTargetNanoseconds;
 using namespace std::chrono_literals;
 
 struct RapidHarness {
@@ -388,6 +392,19 @@ TEST(EigenRapidTimespanLazyStealing, BoundsAdaptiveBlockChanges) {
   EXPECT_EQ(TimespanBlockSize(16, 16, 320'000, 1024, 1, 80'000),
             4u);
   EXPECT_EQ(TimespanBlockSize(64, 64, 1, 10, 2, 80'000), 3u);
+}
+
+TEST(EigenRapidTimespanLazyStealing, DerivesTargetFromRuntimeInputs) {
+  EXPECT_EQ(TimespanDomainSchedulingOverheadNs(100, 8), 800u);
+  EXPECT_EQ(TimespanDomainSchedulingOverheadNs(
+                std::numeric_limits<size_t>::max(), 2),
+            std::numeric_limits<size_t>::max());
+  EXPECT_EQ(TimespanTargetNanoseconds(100, 10, 1'000, 10'000, 0, 4),
+            10'000u);
+  EXPECT_EQ(TimespanTargetNanoseconds(100, 10, 1'000, 10'000, 4, 4),
+            7'071u);
+  EXPECT_EQ(TimespanTargetNanoseconds(100, 10, 1'000, 0, 1, 4), 100u);
+  EXPECT_GT(CalibratedTimespanSchedulingOverheadNs(), 0u);
 }
 
 TEST(EigenRapidLazyStealing, NestedOneWorkerMakesProgress) {
