@@ -265,8 +265,10 @@ struct RapidStartGroup {
 
 inline void RapidRegion::Finish() noexcept {
   ThreadPool *pool = &state_.Pool();
+  const bool worker_waiter = worker_waiter_;
+  // Publishing completion may let the waiter destroy this stack region.
   complete_.store(true, std::memory_order_release);
-  pool->NotifyTaskCompletion(worker_waiter_);
+  pool->NotifyTaskCompletion(worker_waiter);
 }
 
 inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
