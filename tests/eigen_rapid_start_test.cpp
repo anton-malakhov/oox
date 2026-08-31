@@ -157,6 +157,19 @@ TEST(EigenRapidStart, DescriptorScarcityFallsBackWithoutDeadlock) {
   EXPECT_EQ(count.load(), 256);
 }
 
+TEST(EigenRapidStart, SerialSubdomainPropagatesExceptions) {
+  RapidHarness harness(8);
+  EXPECT_THROW(
+      ParallelFor(harness.group, 0, 8, [&](size_t outer) {
+        ParallelFor(harness.group, 0, 4, [&](size_t inner) {
+          if (outer == 3 && inner == 2) {
+            throw std::runtime_error("nested rapid failure");
+          }
+        });
+      }),
+      std::runtime_error);
+}
+
 TEST(EigenRapidStart, PoolCancellationCompletesPublishedRegions) {
   RapidHarness harness(8);
   std::atomic<bool> entered{false};

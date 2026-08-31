@@ -446,6 +446,12 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
   ThreadPool &pool = group.state->Pool();
   RegionContext *parent = pool.CurrentRegionContext();
   DomainId domain = parent ? parent->domain : group.domain;
+  if (domain.Size() == 1) {
+    for (size_t i = begin; i < end; ++i) {
+      std::invoke(function, i);
+    }
+    return;
+  }
   RapidRegion region(*group.state, parent, domain,
                      pool.CurrentThreadId() < pool.NumThreads(), function_ptr,
                      invoke);
