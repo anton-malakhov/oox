@@ -805,6 +805,11 @@ private:
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
+    // Preserve the fairness probe when ordinary work exists, but avoid its
+    // mutex-backed queues during Rapid-only regions.
+    if (pt->rapid_streak >= kRapidFairness && NoOutstandingTasks()) {
+      pt->rapid_streak = 0;
+    }
     if (pt->rapid_streak < kRapidFairness && TryExecuteRapid()) {
       ++pt->rapid_streak;
       return true;

@@ -63,6 +63,37 @@ struct CountingRapidTask final : RapidTask {
   std::shared_future<void> published;
 };
 
+struct StreamingRapidTask final : RapidTask {
+  StreamingRapidTask(ThreadPool &pool, std::promise<void> &entered,
+                     std::atomic<bool> &stop)
+      : pool(pool), entered(entered), stop(stop) {}
+
+  void AddTickets(size_t count) final { tickets.fetch_add(count); }
+  bool TryRun() final {
+    if (runs.fetch_add(1) == 0) {
+      entered.set_value();
+    }
+    if (!stop.load(std::memory_order_acquire)) {
+      pool.ScheduleRapid(this, 0);
+    }
+    return true;
+  }
+  void Cancel() noexcept final { stop.store(true, std::memory_order_release); }
+  void ReleaseTicket() final { tickets.fetch_sub(1); }
+  RegionContext *Context() noexcept final { return &context; }
+  oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
+    return &fallback;
+  }
+
+  ThreadPool &pool;
+  std::promise<void> &entered;
+  std::atomic<bool> &stop;
+  std::atomic<int> runs{0};
+  std::atomic<size_t> tickets{0};
+  RegionContext context;
+  RapidFallbackTask fallback;
+};
+
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
   EXPECT_THROW(ThreadPool(-1), std::invalid_argument);
@@ -192,6 +223,32 @@ TEST(EigenPool, CancellationWaitsForRapidPublication) {
   EXPECT_EQ(cancel.wait_for(2s), std::future_status::ready);
   EXPECT_EQ(task.tickets.load(), 0u);
   EXPECT_EQ(count.load(), 0);
+}
+
+TEST(EigenPool, OrdinaryTaskPreemptsSustainedRapidStream) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> entered, ordinary_completed;
+  auto entered_result = entered.get_future();
+  auto ordinary_result = ordinary_completed.get_future();
+  std::atomic<bool> stop{false};
+  std::atomic<int> ordinary_run_count{0};
+  StreamingRapidTask rapid(pool, entered, stop);
+
+  pool.ScheduleRapid(&rapid, 0);
+  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
+  pool.Schedule(MakeTask([&] {
+    ordinary_run_count.store(rapid.runs.load());
+    stop.store(true, std::memory_order_release);
+    ordinary_completed.set_value();
+  }));
+  const int published_run_count = rapid.runs.load();
+
+  EXPECT_EQ(ordinary_result.wait_for(2s), std::future_status::ready);
+  while (rapid.tickets.load() != 0) {
+    std::this_thread::yield();
+  }
+  EXPECT_GE(rapid.runs.load(), 1);
+  EXPECT_LE(ordinary_run_count.load() - published_run_count, 16);
 }
 
 TEST(EigenPool, AcceptsConcurrentExternalProducers) {
