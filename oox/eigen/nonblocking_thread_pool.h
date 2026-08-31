@@ -358,6 +358,10 @@ public:
     return rapid_deregistrations_.load(std::memory_order_acquire);
   }
 
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
+
   void ScheduleRapid(RapidTask *rapid, size_t target) {
     if (rapid == nullptr) {
       return;

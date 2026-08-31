@@ -40,12 +40,13 @@ domains, so nested matrix multiplication and transpose are enabled. The
 implementation supports the pool's full 65535-worker limit rather than the
 historical 64-bit mask.
 
-`RAPID_MAILBOX` ends Rapid participation immediately after proportional range
-roots have been placed in targeted ordinary mailboxes; recursive range tasks
-then use unrestricted work stealing. `RAPID_LAZY_STEALING` starts each worker's
-recursive range inside its Rapid domain and changes to unrestricted stealing
-only when that worker has no local work. These modes deliberately trade higher
-uniform-loop launch cost for recovery from irregular static partitions.
+`RAPID_MAILBOX` ends Rapid participation after bounded adaptive range blocks
+have been placed in targeted ordinary mailboxes; the blocks then use
+unrestricted work stealing. `RAPID_LAZY_STEALING` starts each worker in its
+proportional Rapid range and exposes that range after its first local block is
+claimed. An idle worker leaves its Rapid domain once before claiming blocks
+from started peer ranges. These modes trade some uniform-loop launch cost for
+recovery from irregular static partitions without creating a task per item.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, and all three
 sparse distributions for every built policy. Reentrant policies additionally
@@ -138,6 +139,9 @@ Do not combine numbers from different metadata files without checking them.
 
 PBBS application benchmarks remain in `benchmarks/pbbs`; they answer the
 end-to-end application question, while this suite isolates scheduler mechanics.
+
+For an implementation overview and a direct comparison with the normal Eigen
+backend, see [Rapid Start versus the normal Eigen backend](RAPID_START_VS_EIGEN.md).
 
 ## Fit the explanatory model
 

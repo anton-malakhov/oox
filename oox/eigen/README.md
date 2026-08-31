@@ -31,12 +31,14 @@ CAS.
 
 Three parallel-for policies share that activation layer. `ParallelFor` keeps
 each proportional range inside Rapid Start for its whole lifetime.
-`ParallelForMailbox` uses Rapid Start only to publish one range root per worker,
-then executes recursively divisible tasks through the ordinary mailboxes and
-deques. `ParallelForLazyStealing` begins each range inside its Rapid domain and
-leaves that domain only when its local work is exhausted and a global steal is
-required. Both hybrid policies preserve nested calls, exception propagation,
-pool cancellation, and caller-supplied grain sizes.
+`ParallelForMailbox` uses Rapid Start to publish a bounded set of adaptive
+range blocks to the ordinary mailboxes, then lets the ordinary deques steal
+them freely. `ParallelForLazyStealing` claims adaptive blocks directly from a
+shared range coordinator: each worker starts in its proportional Rapid range,
+exposes that range only after claiming its first block, and leaves the Rapid
+domain once before taking otherwise idle blocks. Both hybrid policies preserve
+nested calls, exception propagation, pool cancellation, and caller-supplied
+minimum grain sizes.
 
 ## File provenance and license
 

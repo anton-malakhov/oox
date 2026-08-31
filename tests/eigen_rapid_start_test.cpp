@@ -316,6 +316,43 @@ TEST(EigenRapidLazyStealing, DoesNotDeregisterWithoutAStall) {
   EXPECT_EQ(harness.pool.RapidDeregistrationCount(), before);
 }
 
+TEST(EigenRapidLazyStealing, ExposesOnlyUnclaimedBlocksWhileOwnerRuns) {
+  RapidHarness harness(2);
+  std::atomic<bool> owner_entered{false};
+  std::atomic<unsigned> stolen{0};
+  std::promise<void> release_owner;
+  auto release = release_owner.get_future().share();
+  auto watchdog = std::async(std::launch::async, [&] {
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!owner_entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    if (!owner_entered.load(std::memory_order_acquire)) {
+      release_owner.set_value();
+      return false;
+    }
+    deadline = std::chrono::steady_clock::now() + 5s;
+    while (stolen.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    release_owner.set_value();
+    return stolen.load(std::memory_order_acquire) != 0;
+  });
+  const size_t before = harness.pool.RapidDeregistrationCount();
+  ParallelForLazyStealing(harness.group, 0, 128, [&](size_t index) {
+    if (index == 0) {
+      owner_entered.store(true, std::memory_order_release);
+      release.wait();
+    } else if (index < 64) {
+      stolen.fetch_add(1, std::memory_order_release);
+    }
+  });
+  EXPECT_TRUE(watchdog.get());
+  EXPECT_GT(harness.pool.RapidDeregistrationCount(), before);
+}
+
 TEST(EigenRapidLazyStealing, DeregistersAtFirstGlobalSteal) {
   auto pool = std::make_unique<ThreadPool>(2, false, true);
   std::promise<void> blocker_entered;

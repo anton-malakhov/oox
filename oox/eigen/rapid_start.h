@@ -406,7 +406,6 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
   }
 
   const size_t left_workers = workers / 2;
-  const size_t right_workers = workers - left_workers;
   size_t left_work = (work * left_workers + workers / 2) / workers;
   left_work = std::clamp(left_work, size_t{1}, work - 1);
   const unsigned middle_worker =
@@ -476,7 +475,7 @@ public:
     return complete_.load(std::memory_order_acquire);
   }
   bool IsCancelled() const noexcept {
-    return cancelled_.load(std::memory_order_acquire);
+    return cancelled_.load(std::memory_order_acquire) || pool_.IsCancelled();
   }
   void AddTask() noexcept { remaining_.fetch_add(1, std::memory_order_relaxed); }
   void TaskComplete() noexcept {
@@ -508,26 +507,24 @@ private:
   std::exception_ptr exception_;
 };
 
-template <typename F> class RangeTask;
+inline size_t HybridBlockSize(size_t work, size_t workers,
+                              size_t grain) noexcept {
+  const size_t work_per_worker = work / workers + (work % workers != 0);
+  // Bound scheduler metadata for short loops, then expose finer blocks only
+  // when each worker has enough useful work to amortize them.
+  const size_t blocks_per_worker = work_per_worker <= 8      ? 2
+                                   : work_per_worker <= 64   ? 8
+                                   : work_per_worker <= 4096 ? 32
+                                                             : 128;
+  const size_t blocks = workers * blocks_per_worker;
+  const size_t target = work / blocks + (work % blocks != 0);
+  return std::max<size_t>({target, grain, 1});
+}
 
 template <typename F>
-void RunStealableRange(ThreadPool &pool, OrdinaryRegion &region,
-                       RegionContext *context, F &function, size_t begin,
-                       size_t end, size_t grain) noexcept {
+void RunOrdinaryRange(OrdinaryRegion &region, F &function, size_t begin,
+                      size_t end) noexcept {
   try {
-    while (end - begin > grain && !region.IsCancelled()) {
-      const size_t middle = begin + (end - begin) / 2;
-      auto *task = new RangeTask<F>(pool, region, context, function, middle,
-                                    end, grain);
-      region.AddTask();
-      try {
-        pool.Schedule(task);
-      } catch (...) {
-        task->Discard();
-        throw;
-      }
-      end = middle;
-    }
     for (size_t index = begin; index < end && !region.IsCancelled(); ++index) {
       std::invoke(function, index);
     }
@@ -539,16 +536,11 @@ void RunStealableRange(ThreadPool &pool, OrdinaryRegion &region,
 
 template <typename F> class RangeTask final : public Task {
 public:
-  RangeTask(ThreadPool &pool, OrdinaryRegion &region, RegionContext *context,
-            F &function, size_t begin, size_t end, size_t grain)
-      : pool_(pool), region_(region), function_(function), begin_(begin),
-        end_(end), grain_(grain) {
-    region_context = context;
-  }
+  RangeTask(OrdinaryRegion &region, F &function, size_t begin, size_t end)
+      : region_(region), function_(function), begin_(begin), end_(end) {}
 
   void operator()() final {
-    RunStealableRange(pool_, region_, region_context, function_, begin_, end_,
-                      grain_);
+    RunOrdinaryRange(region_, function_, begin_, end_);
     delete this;
   }
   void Discard() noexcept final {
@@ -557,12 +549,120 @@ public:
   }
 
 private:
-  ThreadPool &pool_;
   OrdinaryRegion &region_;
   F &function_;
   size_t begin_;
   size_t end_;
-  size_t grain_;
+};
+
+template <typename F> class LazyRangeCoordinator {
+public:
+  LazyRangeCoordinator(ThreadPool &pool, F &function, size_t begin, size_t end,
+                       size_t slots, size_t grain)
+      : pool_(pool), function_(function), slots_(slots),
+        ranges_(new Range[slots]), block_(HybridBlockSize(end - begin, slots,
+                                                         grain)) {
+    const size_t quotient = (end - begin) / slots;
+    const size_t remainder = (end - begin) % slots;
+    size_t cursor = begin;
+    for (size_t slot = 0; slot < slots; ++slot) {
+      ranges_[slot].next.store(cursor, std::memory_order_relaxed);
+      cursor += quotient + (slot < remainder);
+      ranges_[slot].end = cursor;
+    }
+  }
+
+  void Run(size_t own_slot) noexcept {
+    RunBlock(own_slot, true);
+    while (!IsCancelled() && RunBlock(own_slot)) {
+    }
+    bool in_rapid_domain = true;
+    while (!IsCancelled() && HasUnclaimedWork()) {
+      if (in_rapid_domain) {
+        RegionContext *context = pool_.CurrentRegionContext();
+        const bool executed = pool_.TryExecuteSomething();
+        if (pool_.CurrentRegionContext() != context) {
+          in_rapid_domain = false;
+        }
+        if (executed) {
+          continue;
+        }
+      }
+      in_rapid_domain = false;
+      bool found = false;
+      for (size_t offset = 1; offset < slots_ && !IsCancelled(); ++offset) {
+        const size_t slot = (own_slot + offset) % slots_;
+        if (ranges_[slot].started.load(std::memory_order_acquire) &&
+            RunBlock(slot)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        break;
+      }
+    }
+  }
+
+  void Rethrow() {
+    if (exception_) {
+      std::rethrow_exception(exception_);
+    }
+  }
+
+private:
+  struct alignas(OOX_EIGEN_CACHE_LINE_SIZE) Range {
+    std::atomic<size_t> next{0};
+    size_t end = 0;
+    std::atomic<bool> started{false};
+  };
+
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire) || pool_.IsCancelled();
+  }
+  bool HasUnclaimedWork() const noexcept {
+    for (size_t slot = 0; slot < slots_; ++slot) {
+      if (ranges_[slot].started.load(std::memory_order_acquire) &&
+          ranges_[slot].next.load(std::memory_order_relaxed) <
+              ranges_[slot].end) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool RunBlock(size_t slot, bool expose = false) noexcept {
+    Range &range = ranges_[slot];
+    const size_t first =
+        range.next.fetch_add(block_, std::memory_order_relaxed);
+    if (expose) {
+      range.started.store(true, std::memory_order_release);
+    }
+    if (first >= range.end) {
+      return false;
+    }
+    const size_t last = first + std::min(block_, range.end - first);
+    try {
+      for (size_t index = first; index < last && !IsCancelled(); ++index) {
+        std::invoke(function_, index);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(exception_mutex_);
+      if (!exception_) {
+        exception_ = std::current_exception();
+        cancelled_.store(true, std::memory_order_release);
+      }
+    }
+    return true;
+  }
+
+  ThreadPool &pool_;
+  F &function_;
+  size_t slots_;
+  std::unique_ptr<Range[]> ranges_;
+  size_t block_;
+  std::atomic<bool> cancelled_{false};
+  std::mutex exception_mutex_;
+  std::exception_ptr exception_;
 };
 
 template <typename F>
@@ -586,19 +686,24 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
   Function &callable = function;
   ThreadPool &pool = group.state->Pool();
   OrdinaryRegion ordinary(pool);
+  const size_t block = HybridBlockSize(end - begin, group.domain.Size(),
+                                       std::max<size_t>(grain, 1));
   try {
     ParallelForRanges(group, begin, end, [&](size_t first, size_t last) {
       RegionContext *context = pool.CurrentRegionContext();
       const size_t target = context ? context->domain.start : 0;
-      auto *task = new RangeTask<Function>(pool, ordinary, nullptr, callable,
-                                           first, last,
-                                           std::max<size_t>(grain, 1));
-      ordinary.AddTask();
-      try {
-        pool.RunOnThread(task, target);
-      } catch (...) {
-        task->Discard();
-        throw;
+      while (first < last) {
+        const size_t task_end = first + std::min(block, last - first);
+        auto *task =
+            new RangeTask<Function>(ordinary, callable, first, task_end);
+        ordinary.AddTask();
+        try {
+          pool.RunOnThread(task, target);
+        } catch (...) {
+          task->Discard();
+          throw;
+        }
+        first = task_end;
       }
     });
   } catch (...) {
@@ -618,16 +723,18 @@ void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
   using Function = std::remove_reference_t<F>;
   Function &callable = function;
   ThreadPool &pool = group.state->Pool();
+  const size_t slots = std::min(group.domain.Size(), end - begin);
+  LazyRangeCoordinator<Function> coordinator(
+      pool, callable, begin, end, slots, std::max<size_t>(grain, 1));
   ParallelForRanges(
-      group, begin, end,
-      [&](size_t first, size_t last) {
-        OrdinaryRegion ordinary(pool);
-        RunStealableRange(pool, ordinary, pool.CurrentRegionContext(), callable,
-                          first, last, std::max<size_t>(grain, 1));
-        pool.HelpUntil(ordinary);
-        ordinary.Rethrow();
+      group, 0, slots,
+      [&](size_t first_slot, size_t last_slot) {
+        for (size_t slot = first_slot; slot < last_slot; ++slot) {
+          coordinator.Run(slot);
+        }
       },
       true);
+  coordinator.Rethrow();
 }
 
 } // namespace rapid
