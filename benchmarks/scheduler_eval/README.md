@@ -158,7 +158,8 @@ PBBS application benchmarks remain in `benchmarks/pbbs`; they answer the
 end-to-end application question, while this suite isolates scheduler mechanics.
 
 For an implementation overview and a direct comparison with the normal Eigen
-backend, see [Rapid Start versus the normal Eigen backend](RAPID_START_VS_EIGEN.md).
+backend, see
+[Rapid Start for Eigen: fast launch without giving up work stealing](RAPID_START_VS_EIGEN.md).
 
 ## Fit the explanatory model
 
