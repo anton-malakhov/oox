@@ -25,20 +25,23 @@ void Launch(benchmark::State &state) {
 enum class SpinPayload { Relax, Atomic, DistributedRead, ThreadLocal };
 
 const SparseMatrix &CachedSparseMatrix(std::size_t rows, std::size_t columns,
-                                       SparseKind kind) {
+                                       SparseKind kind, RowOrder order) {
   struct Cache {
     SparseMatrix matrix;
     SparseKind kind{};
+    RowOrder order{};
     std::size_t rows{};
     std::size_t columns{};
   };
   static Cache cache;
-  if (cache.rows != rows || cache.columns != columns || cache.kind != kind) {
+  if (cache.rows != rows || cache.columns != columns || cache.kind != kind ||
+      cache.order != order) {
     cache.rows = 0;
     cache.columns = 0;
     cache.matrix = {};
-    cache.matrix = MakeSparseMatrix(rows, columns, kind);
+    cache.matrix = MakeSparseMatrix(rows, columns, kind, 1, order);
     cache.kind = kind;
+    cache.order = order;
     cache.rows = rows;
     cache.columns = columns;
   }
@@ -112,12 +115,13 @@ void Scan(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * size);
 }
 
-template <SparseKind Kind> void SpmvBenchmark(benchmark::State &state) {
+template <SparseKind Kind, RowOrder Order = RowOrder::Sorted>
+void SpmvBenchmark(benchmark::State &state) {
   const auto rows = (static_cast<std::size_t>(GetNumThreads()) << 9) +
                     (static_cast<std::size_t>(GetNumThreads()) << 4) + 7;
   const auto columns = static_cast<std::size_t>(state.range(0)) +
                        (static_cast<std::size_t>(GetNumThreads()) << 2) + 3;
-  const auto &matrix = CachedSparseMatrix(rows, columns, Kind);
+  const auto &matrix = CachedSparseMatrix(rows, columns, Kind, Order);
   std::vector<double> input(columns, 1.0), output;
   for (auto _ : state) {
     Spmv(matrix, input, output);
@@ -134,6 +138,9 @@ template <SparseKind Kind> void SpmvBenchmark(benchmark::State &state) {
       ->Args({1 << 16, (1 << 10) * scale, 1})                                  \
       ->Args({GetNumThreads(), 1, 1024})                                       \
       ->Args({1 << 20, 1, 1})
+
+#define SCHEDULER_SPMV_RANGE                                                   \
+  ->Setup(Setup)->RangeMultiplier(2)->Range(1 << 12, 1 << 17)->UseRealTime()
 
 BENCHMARK(Launch)
     ->Setup(Setup)
@@ -158,21 +165,20 @@ BENCHMARK(Reduce)
     ->Range(1 << 12, 1 << 19)
     ->UseRealTime();
 BENCHMARK(Scan)->Setup(Setup)->DenseRange(10, 24, 2)->UseRealTime();
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Balanced)
-    ->Setup(Setup)
-    ->RangeMultiplier(2)
-    ->Range(1 << 12, 1 << 17)
-    ->UseRealTime();
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic)
-    ->Setup(Setup)
-    ->RangeMultiplier(2)
-    ->Range(1 << 12, 1 << 17)
-    ->UseRealTime();
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle)
-    ->Setup(Setup)
-    ->RangeMultiplier(2)
-    ->Range(1 << 12, 1 << 17)
-    ->UseRealTime();
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Balanced) SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic) SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle) SCHEDULER_SPMV_RANGE;
+// Same per-row cost multiset, different contiguous structure. A scheduler whose
+// time changes across these three has a spatial (not purely statistical)
+// balancing story; one that does not is explained by mu/sigma alone.
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shuffled)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shifted)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shuffled)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shifted)
+SCHEDULER_SPMV_RANGE;
 } // namespace
 
 BENCHMARK_MAIN();

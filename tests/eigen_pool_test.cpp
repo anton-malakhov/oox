@@ -7,9 +7,11 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <functional>
 #include <future>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -18,6 +20,7 @@ using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::RapidFallbackTask;
 using oox::detail::eigen_pool::RapidTask;
 using oox::detail::eigen_pool::RegionContext;
+using oox::detail::eigen_pool::Task;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
 
@@ -27,9 +30,9 @@ struct CountingRapidTask final : RapidTask {
                     std::promise<void> *publishing = nullptr,
                     std::shared_future<void> published = {})
       : count(count), total(total), completed(completed), publishing(publishing),
-        published(published) {}
+        published(std::move(published)) {}
 
-  void AddTickets(size_t count) final {
+  void AddTickets(size_t count) noexcept final {
     tickets.fetch_add(count);
     if (publishing) {
       publishing->set_value();
@@ -46,7 +49,7 @@ struct CountingRapidTask final : RapidTask {
     return true;
   }
   void Cancel() noexcept final { claimed.store(true); }
-  void ReleaseTicket() final { tickets.fetch_sub(1); }
+  void ReleaseTicket() noexcept final { tickets.fetch_sub(1); }
   RegionContext *Context() noexcept final { return &context; }
   oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
     return &fallback;
@@ -68,7 +71,7 @@ struct StreamingRapidTask final : RapidTask {
                      std::atomic<bool> &stop)
       : pool(pool), entered(entered), stop(stop) {}
 
-  void AddTickets(size_t count) final { tickets.fetch_add(count); }
+  void AddTickets(size_t count) noexcept final { tickets.fetch_add(count); }
   bool TryRun() final {
     if (runs.fetch_add(1) == 0) {
       entered.set_value();
@@ -79,7 +82,7 @@ struct StreamingRapidTask final : RapidTask {
     return true;
   }
   void Cancel() noexcept final { stop.store(true, std::memory_order_release); }
-  void ReleaseTicket() final { tickets.fetch_sub(1); }
+  void ReleaseTicket() noexcept final { tickets.fetch_sub(1); }
   RegionContext *Context() noexcept final { return &context; }
   oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
     return &fallback;
@@ -92,6 +95,36 @@ struct StreamingRapidTask final : RapidTask {
   std::atomic<size_t> tickets{0};
   RegionContext context;
   RapidFallbackTask fallback;
+};
+
+struct FinalizingTask final : Task {
+  explicit FinalizingTask(std::atomic<size_t> &finalized)
+      : finalized(finalized) {}
+
+  void operator()() final { Finalize(); }
+  void Discard() noexcept final { Finalize(); }
+
+  void Finalize() noexcept {
+    finalized.fetch_add(1, std::memory_order_release);
+    delete this;
+  }
+
+  std::atomic<size_t> &finalized;
+};
+
+struct ReentrantCancelTask final : Task {
+  ReentrantCancelTask(ThreadPool &pool, std::atomic<bool> &discarded)
+      : pool(pool), discarded(discarded) {}
+
+  void operator()() final { delete this; }
+  void Discard() noexcept final {
+    pool.Cancel();
+    discarded.store(true, std::memory_order_release);
+    delete this;
+  }
+
+  ThreadPool &pool;
+  std::atomic<bool> &discarded;
 };
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
@@ -118,6 +151,21 @@ TEST(EigenPool, OneMainSlotHasFallbackWorker) {
       [&] { pool.Schedule(MakeTask([&] { completed.set_value(); })); });
   producer.join();
   EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
+}
+
+TEST(EigenPool, CopiesLvalueCallablesWithoutMovingFromTheCaller) {
+  ThreadPool pool(1, false, true);
+  std::atomic<unsigned> calls{0};
+  std::promise<void> completed;
+  auto result = completed.get_future();
+  std::function<void()> callable = [&] {
+    calls.fetch_add(1, std::memory_order_relaxed);
+    completed.set_value();
+  };
+  pool.Schedule(MakeTask(callable));
+  EXPECT_TRUE(callable);
+  EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(calls.load(), 1u);
 }
 
 TEST(EigenPool, SurvivesCreatorThreadExit) {
@@ -294,6 +342,7 @@ TEST(EigenPool, AcceptsConcurrentExternalProducers) {
   std::promise<void> completed;
   auto result = completed.get_future();
   std::vector<std::thread> producers;
+  producers.reserve(producer_count);
 
   for (int producer = 0; producer < producer_count; ++producer) {
     producers.emplace_back([&] {
@@ -313,6 +362,45 @@ TEST(EigenPool, AcceptsConcurrentExternalProducers) {
 
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(completed_count.load(), task_count);
+}
+
+TEST(EigenPool, CancellationAccountsForConcurrentPublications) {
+  constexpr size_t rounds = 25;
+  constexpr size_t producer_count = 4;
+  constexpr size_t tasks_per_producer = 256;
+  constexpr size_t task_count = producer_count * tasks_per_producer;
+  for (size_t round = 0; round < rounds; ++round) {
+    ThreadPool pool(4, false, false);
+    std::atomic<bool> start{false};
+    std::atomic<size_t> submitted{0};
+    std::atomic<size_t> finalized{0};
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+    for (size_t producer = 0; producer < producer_count; ++producer) {
+      producers.emplace_back([&] {
+        start.wait(false, std::memory_order_acquire);
+        for (size_t task = 0; task < tasks_per_producer; ++task) {
+          submitted.fetch_add(1, std::memory_order_release);
+          pool.Schedule(new FinalizingTask(finalized));
+        }
+      });
+    }
+    start.store(true, std::memory_order_release);
+    start.notify_all();
+    while (submitted.load(std::memory_order_acquire) < producer_count) {
+      std::this_thread::yield();
+    }
+    pool.Cancel();
+    for (auto &producer : producers) {
+      producer.join();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (finalized.load(std::memory_order_acquire) != task_count &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    ASSERT_EQ(finalized.load(), task_count) << "round " << round;
+  }
 }
 
 TEST(EigenPool, NonWorkerWaitParks) {
@@ -336,6 +424,7 @@ TEST(EigenPool, PublicationWakesWorkerInsteadOfExternalWaiter) {
   std::atomic<bool> done{false};
   std::atomic<int> waiting{0};
   std::vector<std::thread> waiters;
+  waiters.reserve(8);
   for (int i = 0; i < 8; ++i) {
     waiters.emplace_back([&] {
       waiting.fetch_add(1, std::memory_order_release);
@@ -419,6 +508,59 @@ TEST(EigenPool, DestructorDrainsPublishedTasks) {
 TEST(EigenPool, CancellationWakesParkedWorkers) {
   ThreadPool pool(4, false, false);
   pool.Cancel();
+}
+
+TEST(EigenPool, ConcurrentCancellationIsIdempotent) {
+  constexpr size_t caller_count = 8;
+  ThreadPool pool(4, false, false);
+  std::atomic<size_t> ready{0};
+  std::atomic<bool> cancel{false};
+  std::vector<std::thread> callers;
+  callers.reserve(caller_count);
+  for (size_t caller = 0; caller < caller_count; ++caller) {
+    callers.emplace_back([&] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!cancel.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      pool.Cancel();
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != caller_count) {
+    std::this_thread::yield();
+  }
+  cancel.store(true, std::memory_order_release);
+  for (auto &caller : callers) {
+    caller.join();
+  }
+
+  std::atomic<unsigned> executed{0};
+  pool.Schedule(MakeTask(
+      [&] { executed.fetch_add(1, std::memory_order_relaxed); }));
+  EXPECT_EQ(executed.load(), 0u);
+}
+
+TEST(EigenPool, DiscardedTaskCanReenterCancellation) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> blocker_entered;
+  std::promise<void> release_blocker;
+  auto release = release_blocker.get_future().share();
+  pool.RunOnThread(MakeTask([&blocker_entered, release] {
+                     blocker_entered.set_value();
+                     release.wait();
+                   }),
+                   0);
+  const auto blocker_status = blocker_entered.get_future().wait_for(2s);
+  if (blocker_status != std::future_status::ready) {
+    release_blocker.set_value();
+  }
+  ASSERT_EQ(blocker_status, std::future_status::ready);
+
+  std::atomic<bool> discarded{false};
+  pool.RunOnThread(new ReentrantCancelTask(pool, discarded), 0);
+  pool.Cancel();
+  EXPECT_TRUE(discarded.load(std::memory_order_acquire));
+  release_blocker.set_value();
 }
 
 } // namespace

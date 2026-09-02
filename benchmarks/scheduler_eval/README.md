@@ -160,6 +160,21 @@ end-to-end application question, while this suite isolates scheduler mechanics.
 For an implementation overview and a direct comparison with the normal Eigen
 backend, see
 [Rapid Start for Eigen: fast launch without giving up work stealing](RAPID_START_VS_EIGEN.md).
+A self-contained journal-style manuscript is also available as
+[LaTeX source](RAPID_START_EIGEN_PAPER.tex).
+Regenerate its measurement tables and build it from the repository root with:
+
+```sh
+python3 benchmarks/scheduler_eval/paper_figures.py \
+  results/scheduler_eval/20260901_journal_release \
+  benchmarks/scheduler_eval/paper_data \
+  --secondary results/scheduler_eval/20260831_model_all_policies
+latexmk -pdf -outdir=output/pdf \
+  benchmarks/scheduler_eval/RAPID_START_EIGEN_PAPER.tex
+```
+
+The manuscript compiles its plots as vector graphics; the generated CSV schema
+and provenance are documented in `paper_data/README.md`.
 
 ## Fit the explanatory model
 

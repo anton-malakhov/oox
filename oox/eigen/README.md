@@ -15,7 +15,16 @@ destructor draining and nested waits. Full local deques and mailboxes spill to a
 unbounded guarded queue, so nested spawning never falls back to recursive inline
 execution.
 
-`rapid_start.h` builds a reentrant rapid-region layer on this pool. Workers keep
+Cancellation closes generic publication before draining either queue family.
+Ordinary submission uses one pool-wide admission state, while Rapid submission
+uses one state per target inbox. Cancellation is idempotent for concurrent and
+re-entrant callers. Mailbox batches avoid a synchronization operation per range
+task: a batch overlapping cancellation performs a final, serialized drain so no
+task can be stranded after cancellation's first drain.
+
+`rapid_start.h` builds a reentrant rapid-region layer on this pool, while
+`rapid_start_model.h` isolates the block-size and timespan calculations so they
+can be reviewed and tested independently. Workers keep
 their pool-lifetime, generation-stamped registrations; loop invocations do not
 register or trap workers. Immutable groups name contiguous domains, activation
 trees split both workers and iterations proportionally, and TLS region contexts
@@ -46,8 +55,9 @@ the projected owner-range time and live steal pressure. Blocks preserve at least
 four later steal opportunities; peer thieves consume the last published
 estimate without perturbing it. A nonzero target can still be supplied
 explicitly for experiments, but the default contains no duration constant. All
-hybrid policies run one-worker domains directly and preserve nested calls, exception propagation,
-pool cancellation, and caller-supplied minimum grain sizes.
+hybrid policies run one-worker domains directly and preserve nested calls,
+exception propagation, pool cancellation, and caller-supplied minimum grain
+sizes.
 
 ## File provenance and license
 

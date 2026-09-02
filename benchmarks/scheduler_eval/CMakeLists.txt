@@ -5,7 +5,17 @@ if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING RAPID_START
-    RAPID_MAILBOX RAPID_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING)
+    RAPID_MAILBOX RAPID_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING
+    # Grain-law family on the lazy coordinator (rapid_start_model.h).
+    RAPID_SQRTCV_LAZY_STEALING RAPID_HEARTBEAT_LAZY_STEALING
+    RAPID_FSC_LAZY_STEALING RAPID_FACTORING_LAZY_STEALING
+    RAPID_GUIDED_LAZY_STEALING
+    # Sqrt law with cross-call loop profile warm start.
+    RAPID_TIMESPAN_LAZY_STEALING_PROFILED
+    # Fixed block with alternative victim selection.
+    RAPID_LAZY_STEALING_HIERARCHICAL RAPID_LAZY_STEALING_PRESSURE
+    # A/B control: mailbox mode with one wake notification per task.
+    RAPID_MAILBOX_PERTASK_WAKE)
 endif()
 if(TBB_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
@@ -16,6 +26,21 @@ if(OpenMP_FOUND)
     OMP_STATIC OMP_DYNAMIC_NONMONOTONIC OMP_GUIDED_NONMONOTONIC)
 endif()
 
+# Map each RAPID_* evaluation mode onto its EIGEN_MODE value from modes.h.
+set(oox_rapid_eigen_mode_RAPID_START EIGEN_RAPID)
+set(oox_rapid_eigen_mode_RAPID_MAILBOX EIGEN_RAPID_MAILBOX)
+set(oox_rapid_eigen_mode_RAPID_MAILBOX_PERTASK_WAKE EIGEN_RAPID_MAILBOX)
+set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING EIGEN_RAPID_LAZY_STEALING)
+set(oox_rapid_eigen_mode_RAPID_TIMESPAN_LAZY_STEALING EIGEN_RAPID_TIMESPAN_LAZY_STEALING)
+set(oox_rapid_eigen_mode_RAPID_SQRTCV_LAZY_STEALING EIGEN_RAPID_SQRTCV_LAZY)
+set(oox_rapid_eigen_mode_RAPID_HEARTBEAT_LAZY_STEALING EIGEN_RAPID_HEARTBEAT_LAZY)
+set(oox_rapid_eigen_mode_RAPID_FSC_LAZY_STEALING EIGEN_RAPID_FSC_LAZY)
+set(oox_rapid_eigen_mode_RAPID_FACTORING_LAZY_STEALING EIGEN_RAPID_FACTORING_LAZY)
+set(oox_rapid_eigen_mode_RAPID_GUIDED_LAZY_STEALING EIGEN_RAPID_GUIDED_LAZY)
+set(oox_rapid_eigen_mode_RAPID_TIMESPAN_LAZY_STEALING_PROFILED EIGEN_RAPID_TIMESPAN_LAZY_PROFILED)
+set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING_HIERARCHICAL EIGEN_RAPID_LAZY_HIERARCHICAL)
+set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING_PRESSURE EIGEN_RAPID_LAZY_PRESSURE)
+
 function(oox_configure_scheduler_eval_target target mode)
   target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
   target_compile_definitions(${target} PRIVATE
@@ -24,17 +49,15 @@ function(oox_configure_scheduler_eval_target target mode)
     target_compile_definitions(${target} PRIVATE EIGEN_MODE=${mode})
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^RAPID")
-    if(mode STREQUAL "RAPID_START")
-      set(rapid_eigen_mode EIGEN_RAPID)
-    elseif(mode STREQUAL "RAPID_MAILBOX")
-      set(rapid_eigen_mode EIGEN_RAPID_MAILBOX)
-    elseif(mode STREQUAL "RAPID_TIMESPAN_LAZY_STEALING")
-      set(rapid_eigen_mode EIGEN_RAPID_TIMESPAN_LAZY_STEALING)
-    else()
-      set(rapid_eigen_mode EIGEN_RAPID_LAZY_STEALING)
+    set(rapid_eigen_mode ${oox_rapid_eigen_mode_${mode}})
+    if(NOT rapid_eigen_mode)
+      message(FATAL_ERROR "No EIGEN_MODE mapping for scheduler eval mode ${mode}")
     endif()
     target_compile_definitions(${target} PRIVATE
       RAPID_START_MODE=1 EIGEN_MODE=${rapid_eigen_mode})
+    if(mode STREQUAL "RAPID_MAILBOX_PERTASK_WAKE")
+      target_compile_definitions(${target} PRIVATE OOX_EIGEN_BATCHED_WAKE=0)
+    endif()
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^TBB")
     target_compile_definitions(${target} PRIVATE TBB_MODE=${mode})
@@ -124,4 +147,16 @@ if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
       --timeout 120
       --smoke)
   set_tests_properties(scheduler_eval_rapid_runner_smoke PROPERTIES TIMEOUT 180)
+  # Exercise the fresh-process protocol end to end on one cheap policy.
+  add_test(NAME scheduler_eval_fresh_process_runner_smoke
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
+      --build ${PROJECT_BINARY_DIR}
+      --output ${CMAKE_CURRENT_BINARY_DIR}/fresh-runner-smoke
+      --mode RAPID_LAZY_STEALING
+      --threads 2
+      --fresh-process-repetitions 2
+      --shuffle-modes --seed 1
+      --timeout 120
+      --smoke)
+  set_tests_properties(scheduler_eval_fresh_process_runner_smoke PROPERTIES TIMEOUT 240)
 endif()

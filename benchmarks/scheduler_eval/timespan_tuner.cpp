@@ -2,6 +2,7 @@
 
 #include "common.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -44,7 +45,8 @@ int main(int argc, char **argv) {
     all_arrivals.insert(all_arrivals.end(), arrivals.begin(), arrivals.end());
   }
   const auto maximum_summary = Summarize(maxima);
-  std::cout << "{\"schema\":1,\"tool\":\"timespan_tuner\",\"mode\":\""
+  const auto p99_ns = static_cast<std::uint64_t>(maximum_summary.p99);
+  std::cout << "{\"schema\":2,\"tool\":\"timespan_tuner\",\"mode\":\""
             << JsonEscape(ModeName()) << "\",\"workers\":" << workers
             << ",\"initialization_ns\":" << initialization
             << ",\"warmup_iterations\":" << warmup_iterations
@@ -52,5 +54,10 @@ int main(int argc, char **argv) {
   PrintSummary(Summarize(all_arrivals));
   std::cout << ",\"iteration_maximum_ns\":";
   PrintSummary(maximum_summary);
-  std::cout << ",\"recommended_init_time_ns\":" << maximum_summary.p99 << "}\n";
+  // Both units are emitted so the INIT_TIME gate (which is in Now() ticks) can
+  // be set without a manual CNTFRQ_EL0 / TSC conversion.
+  std::cout << ",\"timer_frequency_hz\":" << TimerFrequencyHz()
+            << ",\"recommended_init_time_ns\":" << p99_ns
+            << ",\"recommended_init_time_ticks\":" << NanosecondsToTicks(p99_ns)
+            << "}\n";
 }

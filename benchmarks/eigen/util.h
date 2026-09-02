@@ -6,6 +6,7 @@
 #include "eigen_pool.h"
 #endif
 
+#include <chrono>
 #include <cstddef>
 #include <iostream>
 #if defined(__linux__)
@@ -47,6 +48,46 @@ inline Timestamp Now() {
   // return std::chrono::duration_cast<std::chrono::nanoseconds>(
   //            std::chrono::high_resolution_clock::now().time_since_epoch())
   //     .count();
+}
+
+// Frequency of the counter read by Now(), in Hz. On AArch64 this is CNTFRQ_EL0;
+// it varies by platform and generation, so Now() ticks are not assumed to be
+// nanoseconds. On x86_64 the TSC frequency is calibrated once against
+// steady_clock. Any comparison between Now() deltas and a nanosecond quantity
+// must go through TicksToNanoseconds / NanosecondsToTicks below.
+inline std::uint64_t TimerFrequencyHz() {
+  static const std::uint64_t frequency = [] {
+#if defined(__aarch64__)
+    std::uint64_t value;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(value));
+    return value ? value : std::uint64_t{24000000};
+#elif defined(__x86_64__)
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t c0 = __rdtsc();
+    while (std::chrono::steady_clock::now() - t0 <
+           std::chrono::milliseconds(50)) {
+    }
+    const std::uint64_t c1 = __rdtsc();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    return ns > 0 ? static_cast<std::uint64_t>((c1 - c0) * 1.0e9 / ns)
+                  : std::uint64_t{1000000000};
+#else
+    return std::uint64_t{1000000000};
+#endif
+  }();
+  return frequency;
+}
+
+inline std::uint64_t TicksToNanoseconds(std::uint64_t ticks) {
+  const long double hz = static_cast<long double>(TimerFrequencyHz());
+  return static_cast<std::uint64_t>(static_cast<long double>(ticks) * 1.0e9L / hz);
+}
+
+inline std::uint64_t NanosecondsToTicks(std::uint64_t ns) {
+  const long double hz = static_cast<long double>(TimerFrequencyHz());
+  return static_cast<std::uint64_t>(static_cast<long double>(ns) * hz / 1.0e9L);
 }
 
 inline void CpuRelax() {

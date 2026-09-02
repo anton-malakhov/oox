@@ -3,12 +3,14 @@
 #pragma once
 
 #include "nonblocking_thread_pool.h"
+#include "rapid_start_model.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
-#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -20,73 +22,46 @@
 #include <utility>
 #include <vector>
 
-namespace oox::detail::eigen_pool {
-
-class RapidRegionBase {
-public:
-  RapidRegionBase *ParentRegion() const noexcept { return parent_region_; }
-  bool IsComplete() const noexcept {
-    return complete_.load(std::memory_order_acquire);
-  }
-
-protected:
-  RapidRegionBase(RapidRegionBase *parent, DomainId domain)
-      : parent_region_(parent), domain_(domain) {}
-
-  RapidRegionBase *parent_region_;
-  DomainId domain_;
-  std::atomic<bool> complete_{false};
-};
-
-namespace rapid {
+namespace oox::detail::eigen_pool::rapid {
 
 class RapidDomainState;
 class SubtreeLease;
 
-class RapidRegion final : public RapidRegionBase {
+class RapidRegion final {
 public:
   using Invoke = void (*)(void *, size_t, size_t);
 
-  RapidRegion(RapidDomainState &state, RegionContext *parent, DomainId domain,
-              bool worker_waiter, bool leave_on_steal, void *function,
-              Invoke invoke)
-      : RapidRegionBase(parent ? parent->region : nullptr, domain),
-        state_(state), parent_context_(parent), worker_waiter_(worker_waiter),
+  RapidRegion(RapidDomainState &state, bool worker_waiter,
+              bool leave_on_steal, void *function, Invoke invoke)
+      : state_(state), worker_waiter_(worker_waiter),
         leave_on_steal_(leave_on_steal), function_(function), invoke_(invoke) {}
 
-  void Run(size_t begin, size_t end) noexcept {
-    if (cancelled_.load(std::memory_order_acquire)) {
-      return;
-    }
-    try {
-      invoke_(function_, begin, end);
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(exception_mutex_);
-      if (!exception_) {
-        exception_ = std::current_exception();
-        cancelled_.store(true, std::memory_order_release);
-      }
+  void Run(size_t begin, size_t end) noexcept;
+  void Finish() noexcept;
+  void Fail(const std::exception_ptr &exception) noexcept {
+    std::lock_guard<std::mutex> lock(exception_mutex_);
+    if (!exception_) {
+      exception_ = exception;
+      cancelled_.store(true, std::memory_order_release);
     }
   }
-
-  void Finish() noexcept;
+  bool IsComplete() const noexcept {
+    return complete_.load(std::memory_order_acquire);
+  }
   void Rethrow() {
     if (exception_) {
       std::rethrow_exception(exception_);
     }
   }
-  RapidDomainState &State() noexcept { return state_; }
-  RegionContext *ParentContext() const noexcept { return parent_context_; }
-  DomainId Domain() const noexcept { return domain_; }
   bool LeaveOnSteal() const noexcept { return leave_on_steal_; }
 
 private:
   RapidDomainState &state_;
-  RegionContext *parent_context_;
   bool worker_waiter_;
   bool leave_on_steal_;
   void *function_;
   Invoke invoke_;
+  std::atomic<bool> complete_{false};
   std::atomic<bool> cancelled_{false};
   std::mutex exception_mutex_;
   std::exception_ptr exception_;
@@ -99,12 +74,12 @@ public:
   void Initialize(RapidDomainState &owner, RapidRegion &region,
                   Activation *parent, RegionContext *parent_context,
                   DomainId domain, size_t begin, size_t end) noexcept;
-  void AddTickets(size_t count) final {
+  void AddTickets(size_t count) noexcept final {
     tickets_.fetch_add(count, std::memory_order_relaxed);
   }
-  bool TryRun() final;
+  bool TryRun() noexcept final;
   void Cancel() noexcept final;
-  void ReleaseTicket() final;
+  void ReleaseTicket() noexcept final;
   RegionContext *Context() noexcept final { return &context_; }
   Task *FallbackTicket() noexcept final { return &fallback_; }
   void ChildComplete() noexcept;
@@ -131,7 +106,7 @@ class RapidDomainState {
 public:
   explicit RapidDomainState(ThreadPool &pool, size_t slots_per_worker = 128)
       : pool_(pool),
-        activations_(std::max<size_t>(2, pool.NumThreads() * slots_per_worker)),
+        activations_(ActivationCapacity(pool.NumThreads(), slots_per_worker)),
         leases_(pool.NumThreads() * 2 - 1) {
     for (size_t i = 0; i < activations_.size(); ++i) {
       activations_[i].slot_ = static_cast<uint32_t>(i);
@@ -145,7 +120,7 @@ public:
 
   ThreadPool &Pool() noexcept { return pool_; }
   Activation *Acquire();
-  std::pair<Activation *, Activation *> TryAcquirePair();
+  std::pair<Activation *, Activation *> TryAcquirePair() noexcept;
   void Release(Activation &activation) noexcept;
   void Execute(Activation &activation) noexcept;
   void Publish(Activation &activation) {
@@ -160,7 +135,15 @@ private:
     std::atomic<uint64_t> generation{0};
   };
 
-  static constexpr uint32_t kEmpty = UINT32_MAX;
+  static constexpr uint32_t kEmpty =
+      std::numeric_limits<uint32_t>::max();
+  static size_t ActivationCapacity(size_t workers, size_t slots_per_worker) {
+    if (slots_per_worker != 0 &&
+        workers > static_cast<size_t>(kEmpty) / slots_per_worker) {
+      throw std::length_error("rapid activation capacity exceeds index range");
+    }
+    return std::max<size_t>(2, workers * slots_per_worker);
+  }
   static constexpr uint64_t EncodeHead(uint32_t index,
                                        uint32_t stamp) noexcept {
     return static_cast<uint64_t>(stamp) << 32 | index;
@@ -260,14 +243,36 @@ struct RapidStartGroup {
   RapidDomainState *state = nullptr;
   DomainId domain;
 
+  bool IsEmpty() const noexcept {
+    return state == nullptr || domain.IsEmpty();
+  }
+
+  void Validate() const {
+    if (state && !domain.IsValidFor(state->Pool().NumThreads())) {
+      throw std::invalid_argument("rapid domain is outside its thread pool");
+    }
+  }
+
   RapidStartGroup Subgroup(DomainId child) const {
-    if (!state || child.start < domain.start || child.limit > domain.limit ||
-        child.start >= child.limit) {
+    Validate();
+    if (!state || !child.IsValidFor(state->Pool().NumThreads()) ||
+        child.start < domain.start || child.limit > domain.limit) {
       throw std::invalid_argument("rapid subgroup is outside its parent");
     }
     return {state, child};
   }
 };
+
+inline void RapidRegion::Run(size_t begin, size_t end) noexcept {
+  if (cancelled_.load(std::memory_order_acquire)) {
+    return;
+  }
+  try {
+    invoke_(function_, begin, end);
+  } catch (...) {
+    Fail(std::current_exception());
+  }
+}
 
 inline void RapidRegion::Finish() noexcept {
   ThreadPool *pool = &state_.Pool();
@@ -285,7 +290,7 @@ inline void Activation::Initialize(RapidDomainState &owner, RapidRegion &region,
   owner_ = &owner;
   region_ = &region;
   parent_ = parent;
-  context_ = {&region, domain, parent_context, region.LeaveOnSteal(), &owner};
+  context_ = {domain, parent_context, region.LeaveOnSteal(), &owner};
   begin_ = begin;
   end_ = end;
   // The initial ticket keeps the descriptor alive until completion.
@@ -299,6 +304,9 @@ inline Activation *RapidDomainState::Acquire() {
   while (true) {
     const uint32_t index = HeadIndex(head);
     if (index == kEmpty) {
+      if (pool_.IsCancelled()) {
+        return nullptr;
+      }
       if (!pool_.TryExecuteSomething()) {
         std::this_thread::yield();
       }
@@ -317,7 +325,7 @@ inline Activation *RapidDomainState::Acquire() {
 }
 
 inline std::pair<Activation *, Activation *>
-RapidDomainState::TryAcquirePair() {
+RapidDomainState::TryAcquirePair() noexcept {
   uint64_t head = free_head_.load(std::memory_order_acquire);
   while (true) {
     const uint32_t first_index = HeadIndex(head);
@@ -350,18 +358,19 @@ inline void RapidDomainState::Release(Activation &activation) noexcept {
       std::memory_order_release, std::memory_order_relaxed));
 }
 
-inline bool Activation::TryRun() {
+inline bool Activation::TryRun() noexcept {
   State expected = State::Pending;
   if (!state_.compare_exchange_strong(expected, State::Running,
                                       std::memory_order_acq_rel,
                                       std::memory_order_acquire)) {
     return false;
   }
-  owner_->Pool().ExecuteInRegion(&context_, [&] { owner_->Execute(*this); });
+  owner_->Pool().ExecuteInRegion(
+      &context_, [&]() noexcept { owner_->Execute(*this); });
   return true;
 }
 
-inline void Activation::ReleaseTicket() {
+inline void Activation::ReleaseTicket() noexcept {
   const size_t previous = tickets_.fetch_sub(1, std::memory_order_acq_rel);
   assert(previous > 0);
   if (previous == 1) {
@@ -409,7 +418,10 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
   }
 
   const size_t left_workers = workers / 2;
-  size_t left_work = (work * left_workers + workers / 2) / workers;
+  const size_t whole_work = (work / workers) * left_workers;
+  const size_t remainder_work =
+      ((work % workers) * left_workers + workers / 2) / workers;
+  size_t left_work = whole_work + remainder_work;
   left_work = std::clamp(left_work, size_t{1}, work - 1);
   const unsigned middle_worker =
       activation.context_.domain.start + static_cast<unsigned>(left_workers);
@@ -430,18 +442,35 @@ inline void RapidDomainState::Execute(Activation &activation) noexcept {
                     &activation.context_,
                     {middle_worker, activation.context_.domain.limit},
                     middle_work, activation.end_);
-  Publish(*right);
+  try {
+    Publish(*right);
+  } catch (...) {
+    activation.region_->Fail(std::current_exception());
+    // Failed publication has already canceled and released the right child.
+    left->Cancel();
+    return;
+  }
   left->AddTickets(1);
   left->TryRun();
   left->ReleaseTicket();
 }
 
+inline RegionContext *CompatibleParentContext(ThreadPool &pool,
+                                              RapidDomainState &state) noexcept {
+  RegionContext *parent = pool.CurrentRegionContext();
+  if (parent && parent->rapid_state && parent->rapid_state != &state) {
+    return nullptr;
+  }
+  return parent;
+}
+
 template <typename F>
 void ParallelForRanges(RapidStartGroup group, size_t begin, size_t end,
                        F &&function, bool leave_on_steal = false) {
-  if (!group.state || group.domain.Size() == 0 || begin >= end) {
+  if (group.IsEmpty() || begin >= end) {
     return;
   }
+  group.Validate();
   using Function = std::remove_reference_t<F>;
   Function *function_ptr = std::addressof(function);
   const auto invoke = [](void *opaque, size_t first, size_t last) {
@@ -449,20 +478,22 @@ void ParallelForRanges(RapidStartGroup group, size_t begin, size_t end,
     std::invoke(callable, first, last);
   };
   ThreadPool &pool = group.state->Pool();
-  RegionContext *parent = pool.CurrentRegionContext();
-  if (parent && parent->rapid_state && parent->rapid_state != group.state) {
-    parent = nullptr;
-  }
+  RegionContext *parent = CompatibleParentContext(pool, *group.state);
   DomainId domain = parent ? parent->domain : group.domain;
   if (domain.Size() == 1) {
-    std::invoke(function, begin, end);
+    if (!pool.IsCancelled()) {
+      std::invoke(function, begin, end);
+    }
     return;
   }
-  RapidRegion region(*group.state, parent, domain,
+  RapidRegion region(*group.state,
                      pool.CurrentThreadId() < pool.NumThreads(),
                      leave_on_steal, function_ptr, invoke);
   group.state->BeginRegion();
   Activation *root = group.state->Acquire();
+  if (!root) {
+    return;
+  }
   root->Initialize(*group.state, region, nullptr, parent, domain, begin, end);
   root->AddTickets(1);
   root->TryRun();
@@ -490,10 +521,10 @@ public:
       pool_.NotifyTaskCompletion(worker_waiter_);
     }
   }
-  void Fail(std::exception_ptr exception) noexcept {
+  void Fail(const std::exception_ptr &exception) noexcept {
     std::lock_guard<std::mutex> lock(exception_mutex_);
     if (!exception_) {
-      exception_ = std::move(exception);
+      exception_ = exception;
       cancelled_.store(true, std::memory_order_release);
     }
   }
@@ -512,116 +543,6 @@ private:
   std::mutex exception_mutex_;
   std::exception_ptr exception_;
 };
-
-inline size_t HybridBlockSize(size_t work, size_t workers, size_t grain,
-                              size_t blocks_per_worker_divisor = 1) noexcept {
-  assert(blocks_per_worker_divisor != 0);
-  const size_t work_per_worker = work / workers + (work % workers != 0);
-  // Bound scheduler metadata for short loops, then expose finer blocks only
-  // when each worker has enough useful work to amortize them.
-  const size_t blocks_per_worker = work_per_worker <= 8      ? 2
-                                   : work_per_worker <= 64   ? 8
-                                   : work_per_worker <= 4096 ? 32
-                                                             : 64;
-  const size_t blocks =
-      workers *
-      std::max<size_t>(blocks_per_worker / blocks_per_worker_divisor, 1);
-  const size_t target = work / blocks + (work % blocks != 0);
-  return std::max<size_t>({target, grain, 1});
-}
-
-inline size_t CalibratedTimespanSchedulingOverheadNs() noexcept {
-  static const size_t overhead_ns = [] {
-    constexpr size_t samples = 128;
-    constexpr size_t rounds = 5;
-    std::atomic<size_t> cursor{0};
-    std::atomic<size_t> published_block{1};
-    size_t best = std::numeric_limits<size_t>::max();
-    // Use the best batch average so preemption changes neither the estimate nor
-    // every later block decision. This calibration runs once per process.
-    for (size_t round = 0; round < rounds; ++round) {
-      size_t total = 0;
-      for (size_t sample = 0; sample < samples; ++sample) {
-        const auto origin = std::chrono::steady_clock::now();
-        const size_t block = published_block.load(std::memory_order_relaxed);
-        cursor.fetch_add(block, std::memory_order_relaxed);
-        cursor.load(std::memory_order_relaxed);
-        published_block.store(block, std::memory_order_relaxed);
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - origin)
-                .count();
-        total += static_cast<size_t>(
-            std::max<decltype(elapsed)>(elapsed, 1));
-      }
-      best = std::min(best, total / samples + (total % samples != 0));
-    }
-    return std::max<size_t>(best, 1);
-  }();
-  return overhead_ns;
-}
-
-inline size_t TimespanDomainSchedulingOverheadNs(size_t local_overhead_ns,
-                                                 size_t workers) noexcept {
-  // A stolen block can be inspected by every worker in the domain, so account
-  // for the domain-wide cache/coherence opportunity rather than one claim.
-  if (local_overhead_ns >
-      std::numeric_limits<size_t>::max() / std::max<size_t>(workers, 1)) {
-    return std::numeric_limits<size_t>::max();
-  }
-  return local_overhead_ns * std::max<size_t>(workers, 1);
-}
-
-inline size_t TimespanTargetNanoseconds(size_t scheduling_overhead_ns,
-                                        size_t completed, size_t elapsed_ns,
-                                        size_t range_work,
-                                        size_t stealing_workers,
-                                        size_t workers) noexcept {
-  if (range_work == 0 || completed == 0) {
-    return std::max<size_t>(scheduling_overhead_ns, 1);
-  }
-  const long double projected_range_ns =
-      static_cast<long double>(elapsed_ns) * range_work / completed;
-  const long double steal_pressure =
-      1.0L + static_cast<long double>(stealing_workers) /
-                   std::max<size_t>(workers, 1);
-  // Minimize H*T/tau scheduling work plus pressure*tau tail exposure.
-  const long double target = std::sqrt(
-      static_cast<long double>(std::max<size_t>(scheduling_overhead_ns, 1)) *
-      projected_range_ns / steal_pressure);
-  if (target >= std::numeric_limits<size_t>::max()) {
-    return std::numeric_limits<size_t>::max();
-  }
-  return std::max<size_t>(
-      static_cast<size_t>(target + 0.5L),
-      std::max<size_t>(scheduling_overhead_ns, 1));
-}
-
-inline size_t TimespanBlockSize(size_t current, size_t completed,
-                                size_t elapsed_ns, size_t remaining,
-                                size_t grain, size_t target_ns) noexcept {
-  if (remaining == 0) {
-    return grain;
-  }
-  const long double ratio = std::clamp(
-      static_cast<long double>(target_ns) / std::max<size_t>(elapsed_ns, 1),
-      0.25L, 8.0L);
-  const long double estimate = static_cast<long double>(completed) * ratio;
-  const size_t scaled = estimate >= std::numeric_limits<size_t>::max()
-                            ? std::numeric_limits<size_t>::max()
-                            : std::max<size_t>(static_cast<size_t>(estimate + 0.5L),
-                                               grain);
-  const size_t growth_limit =
-      current > std::numeric_limits<size_t>::max() / 8
-          ? std::numeric_limits<size_t>::max()
-          : current * 8;
-  const size_t balance_limit =
-      std::max(grain, remaining / 4 + (remaining % 4 != 0));
-  const size_t upper = std::max(grain, std::min(growth_limit, balance_limit));
-  const size_t lower = std::min(
-      upper, std::max(grain, current / 4 + (current % 4 != 0)));
-  return std::clamp(scaled, lower, upper);
-}
 
 template <typename F>
 void RunOrdinaryRange(OrdinaryRegion &region, F &function, size_t begin,
@@ -642,6 +563,19 @@ struct MailboxDomainContext {
 
 inline thread_local MailboxDomainContext current_mailbox_context;
 
+class ScopedMailboxDomainContext {
+public:
+  explicit ScopedMailboxDomainContext(MailboxDomainContext replacement)
+      : previous_(std::exchange(current_mailbox_context, replacement)) {}
+  ScopedMailboxDomainContext(const ScopedMailboxDomainContext &) = delete;
+  ScopedMailboxDomainContext &
+  operator=(const ScopedMailboxDomainContext &) = delete;
+  ~ScopedMailboxDomainContext() { current_mailbox_context = previous_; }
+
+private:
+  MailboxDomainContext previous_;
+};
+
 template <typename F> class RangeTask final : public Task {
 public:
   RangeTask(OrdinaryRegion &region, RapidDomainState &state, F &function,
@@ -650,10 +584,8 @@ public:
         begin_(begin), end_(end) {}
 
   void operator()() final {
-    const MailboxDomainContext previous_context = current_mailbox_context;
-    current_mailbox_context = {&state_, domain_};
+    ScopedMailboxDomainContext context({&state_, domain_});
     RunOrdinaryRange(region_, function_, begin_, end_);
-    current_mailbox_context = previous_context;
     region_.TaskComplete();
     delete this;
   }
@@ -671,22 +603,54 @@ private:
   size_t end_;
 };
 
-template <typename F, bool Timespan> class LazyRangeCoordinator {
+// Lazy-stealing range coordinator.
+//
+// One proportional range per slot. The owner claims blocks from its own range
+// first; a worker that exhausts its range leaves the Rapid domain once and then
+// claims blocks from peer ranges. Three orthogonal policies are compile-time
+// parameters so their costs can be measured independently:
+//
+//   Law      how the owner sizes its next block (see rapid_start_model.h);
+//   Victims  which peer range an idle worker probes first;
+//   profile  optional cross-call state that warms the first block from the
+//            previous invocation of the same loop site.
+//
+// Only the owner writes a range's statistics and adaptive block; thieves read
+// the last published block and claim atomically, so migration and contention
+// never feed back into the estimate.
+template <typename F, GrainLaw Law, VictimPolicy Victims>
+class LazyRangeCoordinator {
 public:
+  static constexpr bool kTimed = IsTimedLaw(Law);
+  static constexpr bool kItem = IsItemLaw(Law);
+
   LazyRangeCoordinator(ThreadPool &pool, F &function, size_t begin, size_t end,
-                       size_t slots, size_t grain, size_t target_block_ns = 0)
+                       size_t slots, size_t grain, size_t target_block_ns = 0,
+                       LoopProfile *profile = nullptr)
       : pool_(pool), function_(function), slots_(slots),
-        ranges_(new Range[slots]), block_(HybridBlockSize(end - begin, slots,
-                                                         grain)),
-        grain_(grain), target_block_ns_(target_block_ns) {
-    if constexpr (Timespan) {
-      if (target_block_ns_ == 0) {
-        scheduling_overhead_ns_ = TimespanDomainSchedulingOverheadNs(
-            CalibratedTimespanSchedulingOverheadNs(), slots_);
+        ranges_(new Range[slots]), grain_(grain),
+        target_block_ns_(target_block_ns), profile_(profile) {
+    const size_t work = end - begin;
+    block_ = HybridBlockSize(work, slots, grain);
+    if constexpr (kTimed) {
+      scheduling_overhead_ns_ = TimespanDomainSchedulingOverheadNs(
+          CalibratedTimespanSchedulingOverheadNs(), slots_);
+      if (profile_ && profile_->IsWarm()) {
+        // Warm start: size the first block from the previous call's per-item
+        // time instead of the structural step function, then keep at least
+        // four later steal opportunities per range.
+        const size_t item_ns = profile_->item_ns.load(std::memory_order_relaxed);
+        const size_t range_work = model_detail::CeilDivide(work, slots);
+        const size_t target =
+            TargetNanoseconds(1, item_ns, range_work, profile_->Cv(), 0);
+        size_t warm = ItemsForDuration(target, item_ns, grain_, range_work);
+        warm = std::min(warm, std::max(grain_, model_detail::CeilDivide(
+                                                   range_work, size_t{4})));
+        block_ = std::max(warm, grain_);
       }
     }
-    const size_t quotient = (end - begin) / slots;
-    const size_t remainder = (end - begin) % slots;
+    const size_t quotient = work / slots;
+    const size_t remainder = work % slots;
     size_t cursor = begin;
     for (size_t slot = 0; slot < slots; ++slot) {
       ranges_[slot].next.store(cursor, std::memory_order_relaxed);
@@ -700,47 +664,18 @@ public:
 
   void ReserveFirstBlock(size_t own_slot) noexcept {
     Range &range = ranges_[own_slot];
-    range.first = range.next.fetch_add(Block(range), std::memory_order_relaxed);
+    const size_t block = Block(range);
+    range.first = range.next.fetch_add(block, std::memory_order_relaxed);
+    range.first_block = block;
   }
 
   void Run(size_t own_slot) noexcept {
-    Range &range = ranges_[own_slot];
-    if constexpr (Timespan) {
-      RunTimedBlock(range, range.first, Block(range));
-    } else {
-      RunClaimedBlock(range, range.first, block_);
-    }
-    while (!IsCancelled() && RunBlock(own_slot, true)) {
-    }
-    if constexpr (Timespan) {
+    RunOwnedRange(own_slot);
+    if constexpr (kTimed) {
       steal_pressure_.fetch_add(1, std::memory_order_relaxed);
     }
-    bool in_rapid_domain = true;
-    while (!IsCancelled() && HasUnclaimedWork()) {
-      if (in_rapid_domain) {
-        RegionContext *context = pool_.CurrentRegionContext();
-        const bool executed = pool_.TryExecuteSomething();
-        if (pool_.CurrentRegionContext() != context) {
-          in_rapid_domain = false;
-        }
-        if (executed) {
-          continue;
-        }
-      }
-      in_rapid_domain = false;
-      bool found = false;
-      for (size_t offset = 1; offset < slots_ && !IsCancelled(); ++offset) {
-        const size_t slot = (own_slot + offset) % slots_;
-        if (RunBlock(slot, false)) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        break;
-      }
-    }
-    if constexpr (Timespan) {
+    RunPeerRanges(own_slot);
+    if constexpr (kTimed) {
       steal_pressure_.fetch_sub(1, std::memory_order_relaxed);
     }
   }
@@ -751,21 +686,182 @@ public:
     }
   }
 
+  // Aggregate owner-side statistics into the loop profile. Call after all
+  // slots have completed; safe to call when no profile was supplied.
+  void PublishProfile() noexcept {
+    if (!profile_ || IsCancelled()) {
+      return;
+    }
+    if constexpr (kTimed) {
+      long double weighted_item_ns = 0.0L;
+      long double weighted_cv = 0.0L;
+      long double weight = 0.0L;
+      size_t block_sum = 0;
+      size_t block_count = 0;
+      for (size_t slot = 0; slot < slots_; ++slot) {
+        const Range &range = ranges_[slot];
+        if (range.stats.count == 0) {
+          continue;
+        }
+        const long double w = static_cast<long double>(range.stats.count);
+        weighted_item_ns += range.stats.mean * w;
+        weighted_cv += range.stats.ItemCv() * w;
+        weight += w;
+        block_sum += range.adaptive_block.load(std::memory_order_relaxed);
+        ++block_count;
+      }
+      if (weight > 0.0L) {
+        profile_->Record(
+            model_detail::RoundNonnegativeToSize(weighted_item_ns / weight),
+            weighted_cv / weight,
+            block_count ? block_sum / block_count : block_);
+      }
+    }
+  }
+
+  // Diagnostics for tests and tracing.
+  size_t InitialBlock() const noexcept { return block_; }
+  size_t StealPressure() const noexcept {
+    return steal_pressure_.load(std::memory_order_relaxed);
+  }
+
 private:
   struct alignas(OOX_EIGEN_CACHE_LINE_SIZE) Range {
     std::atomic<size_t> next{0};
     std::atomic<size_t> adaptive_block{1};
     size_t first = 0;
+    size_t first_block = 0;
     size_t end = 0;
     size_t work = 0;
-    size_t samples = 0;
+    RunningStats stats; // owner-only
   };
 
-  size_t Block(Range &range) const noexcept {
-    if constexpr (Timespan) {
-      return range.adaptive_block.load(std::memory_order_relaxed);
+  void RunOwnedRange(size_t own_slot) noexcept {
+    Range &range = ranges_[own_slot];
+    if constexpr (kTimed) {
+      RunTimedBlock(range, range.first, range.first_block);
+    } else {
+      RunClaimedBlock(range, range.first, range.first_block);
     }
-    return block_;
+    while (!IsCancelled() && RunBlock(own_slot, true)) {
+    }
+  }
+
+  void RunPeerRanges(size_t own_slot) noexcept {
+    bool in_rapid_domain = true;
+    while (!IsCancelled() && HasUnclaimedWork()) {
+      if (in_rapid_domain) {
+        RegionContext *context = pool_.CurrentRegionContext();
+        bool executed = false;
+        try {
+          executed = pool_.TryExecuteSomething();
+        } catch (...) {
+          Fail(std::current_exception());
+          return;
+        }
+        if (pool_.CurrentRegionContext() != context) {
+          in_rapid_domain = false;
+        }
+        if (executed) {
+          continue;
+        }
+      }
+      in_rapid_domain = false;
+      if (!StealOnePeerBlock(own_slot)) {
+        break;
+      }
+    }
+  }
+
+  bool StealOnePeerBlock(size_t own_slot) noexcept {
+    if constexpr (Victims == VictimPolicy::MostRemaining) {
+      size_t best = slots_;
+      size_t best_remaining = 0;
+      for (size_t slot = 0; slot < slots_; ++slot) {
+        if (slot == own_slot) {
+          continue;
+        }
+        const size_t next = ranges_[slot].next.load(std::memory_order_relaxed);
+        const size_t remaining =
+            next < ranges_[slot].end ? ranges_[slot].end - next : 0;
+        if (remaining > best_remaining) {
+          best_remaining = remaining;
+          best = slot;
+        }
+      }
+      if (best != slots_ && RunBlock(best, false)) {
+        return true;
+      }
+      // The chosen victim was drained between the scan and the claim; make one
+      // ordinary pass so progress does not depend on a stale snapshot.
+      for (size_t k = 1; k < slots_ && !IsCancelled(); ++k) {
+        if (RunBlock(VictimCandidate(VictimPolicy::Linear, own_slot, k, slots_),
+                     false)) {
+          return true;
+        }
+      }
+      return false;
+    } else {
+      for (size_t k = 1; k < slots_ && !IsCancelled(); ++k) {
+        const size_t slot = VictimCandidate(Victims, own_slot, k, slots_);
+        if (RunBlock(slot, false)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  size_t Block(Range &range) const noexcept {
+    if constexpr (kTimed) {
+      return range.adaptive_block.load(std::memory_order_relaxed);
+    } else if constexpr (kItem) {
+      const size_t next = range.next.load(std::memory_order_relaxed);
+      const size_t remaining = next < range.end ? range.end - next : 0;
+      if constexpr (Law == GrainLaw::Factoring) {
+        return FactoringChunk(remaining, slots_, grain_);
+      } else {
+        return GuidedChunk(remaining, slots_, grain_);
+      }
+    } else {
+      return block_;
+    }
+  }
+
+  size_t TargetNanoseconds(size_t completed, size_t elapsed_ns,
+                           size_t range_work, long double item_cv,
+                           size_t stealing) const noexcept {
+    if (target_block_ns_ != 0) {
+      return target_block_ns_;
+    }
+    if constexpr (Law == GrainLaw::Heartbeat) {
+      return HeartbeatTargetNanoseconds(scheduling_overhead_ns_);
+    } else if constexpr (Law == GrainLaw::SqrtCv) {
+      return SqrtCvTargetNanoseconds(scheduling_overhead_ns_, completed,
+                                     elapsed_ns, range_work, stealing, slots_,
+                                     item_cv);
+    } else if constexpr (Law == GrainLaw::FixedSizeChunk) {
+      const long double item_ns =
+          completed ? static_cast<long double>(elapsed_ns) /
+                          static_cast<long double>(completed)
+                    : 0.0L;
+      const size_t items = FixedSizeChunkItems(
+          range_work, scheduling_overhead_ns_, item_cv * item_ns, slots_);
+      if (items != 0 && item_ns > 0.0L) {
+        return std::max<size_t>(
+            model_detail::RoundNonnegativeToSize(
+                static_cast<long double>(items) * item_ns),
+            scheduling_overhead_ns_);
+      }
+      // sigma unknown yet (first sample) or P == 1: fall back to the sqrt law.
+      return TimespanTargetNanoseconds(scheduling_overhead_ns_, completed,
+                                       elapsed_ns, range_work, stealing,
+                                       slots_);
+    } else {
+      return TimespanTargetNanoseconds(scheduling_overhead_ns_, completed,
+                                       elapsed_ns, range_work, stealing,
+                                       slots_);
+    }
   }
 
   bool IsCancelled() const noexcept {
@@ -784,7 +880,7 @@ private:
     Range &range = ranges_[slot];
     const size_t block = Block(range);
     const size_t first = range.next.fetch_add(block, std::memory_order_relaxed);
-    if constexpr (Timespan) {
+    if constexpr (kTimed) {
       if (calibrate) {
         return RunTimedBlock(range, first, block);
       }
@@ -806,15 +902,15 @@ private:
       const size_t remaining = cursor < range.end ? range.end - cursor : 0;
       const size_t elapsed_ns = static_cast<size_t>(
           std::max<decltype(elapsed)>(elapsed, 1));
-      const size_t target_ns =
-          target_block_ns_ != 0
-              ? target_block_ns_
-              : TimespanTargetNanoseconds(
-                    scheduling_overhead_ns_, completed, elapsed_ns, range.work,
-                    steal_pressure_.load(std::memory_order_relaxed), slots_);
-      size_t next = TimespanBlockSize(
-          block, completed, elapsed_ns, remaining, grain_, target_ns);
-      if (range.samples++ != 0) {
+      range.stats.Add(static_cast<long double>(elapsed_ns) /
+                          static_cast<long double>(completed),
+                      static_cast<long double>(completed));
+      const size_t target_ns = TargetNanoseconds(
+          completed, elapsed_ns, range.work, range.stats.ItemCv(),
+          steal_pressure_.load(std::memory_order_relaxed));
+      size_t next = TimespanBlockSize(block, completed, elapsed_ns, remaining,
+                                      grain_, target_ns);
+      if (range.stats.count > 1) {
         next = next > block ? block + (next - block) / 4
                             : block - (block - next) / 4;
       }
@@ -832,22 +928,27 @@ private:
         std::invoke(function_, index);
       }
     } catch (...) {
-      std::lock_guard<std::mutex> lock(exception_mutex_);
-      if (!exception_) {
-        exception_ = std::current_exception();
-        cancelled_.store(true, std::memory_order_release);
-      }
+      Fail(std::current_exception());
     }
     return true;
+  }
+
+  void Fail(const std::exception_ptr &exception) noexcept {
+    std::lock_guard<std::mutex> lock(exception_mutex_);
+    if (!exception_) {
+      exception_ = exception;
+      cancelled_.store(true, std::memory_order_release);
+    }
   }
 
   ThreadPool &pool_;
   F &function_;
   size_t slots_;
   std::unique_ptr<Range[]> ranges_;
-  size_t block_;
+  size_t block_ = 1;
   size_t grain_;
   size_t target_block_ns_;
+  LoopProfile *profile_;
   size_t scheduling_overhead_ns_ = 0;
   std::atomic<size_t> steal_pressure_{0};
   std::atomic<bool> cancelled_{false};
@@ -859,7 +960,8 @@ template <typename F>
 void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
                  F &&function) {
   auto ranges = [&](size_t first, size_t last) {
-    for (size_t i = first; i < last; ++i) {
+    for (size_t i = first;
+         i < last && !group.state->Pool().IsCancelled(); ++i) {
       std::invoke(function, i);
     }
   };
@@ -869,9 +971,10 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
 template <typename F>
 void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
                         F &&function, size_t grain = 1) {
-  if (!group.state || group.domain.Size() == 0 || begin >= end) {
+  if (group.IsEmpty() || begin >= end) {
     return;
   }
+  group.Validate();
   ThreadPool &pool = group.state->Pool();
   const DomainId domain = current_mailbox_context.state == group.state
                               ? current_mailbox_context.domain
@@ -888,7 +991,7 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
   OrdinaryRegion ordinary(pool);
   const size_t work = end - begin;
   const size_t work_per_worker =
-      work / group.domain.Size() + (work % group.domain.Size() != 0);
+      model_detail::CeilDivide(work, group.domain.Size());
   // Halve publication density through 512 iterations per worker. Preserve
   // finer tasks beyond that point so irregular work remains stealable.
   const size_t task_density_divisor = work_per_worker <= 512 ? 2 : 1;
@@ -896,46 +999,48 @@ void ParallelForMailbox(RapidStartGroup group, size_t begin, size_t end,
       HybridBlockSize(end - begin, group.domain.Size(),
                       std::max<size_t>(grain, 1), task_density_divisor);
   try {
-    ParallelForRanges(group, begin, end, [&](size_t first, size_t last) {
-      RegionContext *context = pool.CurrentRegionContext();
-      const DomainId domain = context ? context->domain : group.domain;
-      const size_t target = domain.start;
-      while (first < last) {
-        const size_t task_end = first + std::min(block, last - first);
-        auto *task = new RangeTask<Function>(ordinary, *group.state, callable,
-                                             domain, first, task_end);
-        ordinary.AddTask();
-        try {
-          pool.RunOnThread(task, target);
-        } catch (...) {
-          task->Discard();
-          throw;
+    pool.PublishOrdinaryBatch([&](auto &&publish) {
+      ParallelForRanges(group, begin, end, [&](size_t first, size_t last) {
+        RegionContext *context = pool.CurrentRegionContext();
+        const DomainId domain = context ? context->domain : group.domain;
+        const size_t target = domain.start;
+        while (first < last) {
+          const size_t task_end = first + std::min(block, last - first);
+          auto *task = new RangeTask<Function>(
+              ordinary, *group.state, callable, domain, first, task_end);
+          ordinary.AddTask();
+          try {
+            publish(task, target);
+          } catch (...) {
+            task->Discard();
+            throw;
+          }
+          first = task_end;
         }
-        first = task_end;
-      }
+      });
     });
   } catch (...) {
     ordinary.Fail(std::current_exception());
   }
+  pool.FinishOrdinaryBatch();
   ordinary.TaskComplete();
   pool.HelpUntil(ordinary);
   ordinary.Rethrow();
 }
 
-template <bool Timespan, typename F>
-void ParallelForLazyStealingImpl(RapidStartGroup group, size_t begin,
-                                 size_t end, F &&function, size_t grain,
-                                 size_t target_block_ns) {
-  if (!group.state || group.domain.Size() == 0 || begin >= end) {
+template <GrainLaw Law, VictimPolicy Victims, typename F>
+void ParallelForLazyStealingPolicy(RapidStartGroup group, size_t begin,
+                                   size_t end, F &&function, size_t grain = 1,
+                                   size_t target_block_ns = 0,
+                                   LoopProfile *profile = nullptr) {
+  if (group.IsEmpty() || begin >= end) {
     return;
   }
+  group.Validate();
   using Function = std::remove_reference_t<F>;
   Function &callable = function;
   ThreadPool &pool = group.state->Pool();
-  RegionContext *parent = pool.CurrentRegionContext();
-  if (parent && parent->rapid_state && parent->rapid_state != group.state) {
-    parent = nullptr;
-  }
+  RegionContext *parent = CompatibleParentContext(pool, *group.state);
   const DomainId domain = parent ? parent->domain : group.domain;
   if (domain.Size() == 1) {
     for (size_t index = begin; index < end && !pool.IsCancelled(); ++index) {
@@ -945,9 +1050,9 @@ void ParallelForLazyStealingImpl(RapidStartGroup group, size_t begin,
   }
   group.domain = domain;
   const size_t slots = std::min(group.domain.Size(), end - begin);
-  LazyRangeCoordinator<Function, Timespan> coordinator(
+  LazyRangeCoordinator<Function, Law, Victims> coordinator(
       pool, callable, begin, end, slots, std::max<size_t>(grain, 1),
-      target_block_ns);
+      target_block_ns, profile);
   // Protect one block for every proportional owner before work is published.
   // A worker can then steal later blocks without racing a delayed owner.
   for (size_t slot = 0; slot < slots; ++slot) {
@@ -961,25 +1066,26 @@ void ParallelForLazyStealingImpl(RapidStartGroup group, size_t begin,
         }
       },
       true);
+  coordinator.PublishProfile();
   coordinator.Rethrow();
 }
 
 template <typename F>
 void ParallelForLazyStealing(RapidStartGroup group, size_t begin, size_t end,
                              F &&function, size_t grain = 1) {
-  ParallelForLazyStealingImpl<false>(group, begin, end,
-                                     std::forward<F>(function), grain, 0);
+  ParallelForLazyStealingPolicy<GrainLaw::Fixed, VictimPolicy::Linear>(
+      group, begin, end, std::forward<F>(function), grain, 0, nullptr);
 }
 
 template <typename F>
 void ParallelForTimespanLazyStealing(RapidStartGroup group, size_t begin,
                                      size_t end, F &&function,
                                      size_t grain = 1,
-                                     size_t target_block_ns = 0) {
-  ParallelForLazyStealingImpl<true>(group, begin, end,
-                                    std::forward<F>(function), grain,
-                                    target_block_ns);
+                                     size_t target_block_ns = 0,
+                                     LoopProfile *profile = nullptr) {
+  ParallelForLazyStealingPolicy<GrainLaw::Sqrt, VictimPolicy::Linear>(
+      group, begin, end, std::forward<F>(function), grain, target_block_ns,
+      profile);
 }
 
-} // namespace rapid
-} // namespace oox::detail::eigen_pool
+} // namespace oox::detail::eigen_pool::rapid

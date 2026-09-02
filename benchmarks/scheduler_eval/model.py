@@ -627,8 +627,13 @@ def write_spmv_chart(path, predictions):
         rows = [row for row in predictions if row["family"] == family]
         xs = [float(row["parameter"]) for row in rows]
         px = left + panel * (panel_width + gap)
-        sx = lambda value: px + (math.log10(value) - x0) * panel_width / (x1 - x0)
-        sy = lambda value: top + (y1 - math.log10(value)) * panel_height / (y1 - y0)
+
+        def sx(value):
+            return px + (math.log10(value) - x0) * panel_width / (x1 - x0)
+
+        def sy(value):
+            return top + (y1 - math.log10(value)) * panel_height / (y1 - y0)
+
         elements.extend([
             f'<text x="{px + panel_width / 2:.1f}" y="43" text-anchor="middle" '
             f'font-size="14">{html.escape(family.title())}</text>',

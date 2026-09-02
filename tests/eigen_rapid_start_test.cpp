@@ -6,10 +6,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <future>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -89,6 +93,7 @@ TEST(EigenRapidStart, ConcurrentRootsAreIndependent) {
   constexpr int work = 1000;
   std::atomic<int> completed{0};
   std::vector<std::thread> threads;
+  threads.reserve(callers);
   for (int caller = 0; caller < callers; ++caller) {
     threads.emplace_back([&] {
       ParallelFor(harness.group, 0, work,
@@ -165,6 +170,52 @@ TEST(EigenRapidStart, DescriptorScarcityFallsBackWithoutDeadlock) {
   EXPECT_EQ(count.load(), 256);
 }
 
+TEST(EigenRapidStart, RejectsDomainsOutsideThePool) {
+  RapidHarness harness(4);
+  EXPECT_THROW(ParallelFor({&harness.state, {0, 5}}, 0, 1, [](size_t) {}),
+               std::invalid_argument);
+  EXPECT_THROW(ParallelFor({&harness.state, {3, 2}}, 0, 1, [](size_t) {}),
+               std::invalid_argument);
+}
+
+TEST(EigenRapidStart, RejectsActivationCapacityOverflow) {
+  ThreadPool pool(1, false, false);
+  EXPECT_THROW(
+      { RapidDomainState state(pool, std::numeric_limits<size_t>::max()); },
+      std::length_error);
+}
+
+TEST(EigenRapidStart, CancelledSingleWorkerDoesNotStartNewWork) {
+  RapidHarness harness(1);
+  harness.pool.Cancel();
+  std::atomic<unsigned> completed{0};
+  ParallelFor(harness.group, 0, 128,
+              [&](size_t) { completed.fetch_add(1, std::memory_order_relaxed); });
+  EXPECT_EQ(completed.load(), 0u);
+}
+
+TEST(EigenRapidStart, CancellationReleasesDescriptorWaiters) {
+  RapidHarness harness(2, false, 1);
+  auto *first = harness.state.Acquire();
+  auto *second = harness.state.Acquire();
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+
+  std::promise<void> started;
+  auto started_future = started.get_future();
+  auto result = std::async(std::launch::async, [&] {
+    started.set_value();
+    ParallelFor(harness.group, 0, 128, [](size_t) {});
+  });
+  ASSERT_EQ(started_future.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+  harness.pool.Cancel();
+  EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
+
+  harness.state.Release(*second);
+  harness.state.Release(*first);
+}
+
 TEST(EigenRapidStart, SerialSubdomainPropagatesExceptions) {
   RapidHarness harness(8);
   EXPECT_THROW(
@@ -199,6 +250,7 @@ TEST(EigenRapidStart, CancellationCompletesConcurrentRoots) {
   constexpr int callers = 8;
   std::atomic<int> entered{0};
   std::vector<std::future<void>> results;
+  results.reserve(callers);
   for (int caller = 0; caller < callers; ++caller) {
     results.push_back(std::async(std::launch::async, [&] {
       ParallelFor(harness.group, 0, 10000, [&](size_t index) {
@@ -241,7 +293,11 @@ TEST(EigenRapidStart, ElasticLendingLeasesWholeTopologySubtrees) {
   EXPECT_FALSE(harness.state.TryLeaseSubtree({1, 7}));
 }
 
-enum class HybridPolicy { Mailbox, LazyStealing, TimespanLazyStealing };
+enum class HybridPolicy : std::uint8_t {
+  Mailbox,
+  LazyStealing,
+  TimespanLazyStealing
+};
 
 template <typename F>
 void RunHybrid(HybridPolicy policy, RapidStartGroup group, size_t begin,
@@ -273,6 +329,28 @@ TEST_P(EigenRapidHybridTest, ExecutesEveryIterationExactlyOnceAndNests) {
   });
   for (const auto &visit : visits) {
     EXPECT_EQ(visit.load(), 1u);
+  }
+}
+
+TEST_P(EigenRapidHybridTest, MatchesSerialOracleAcrossSmallRangesAndGrains) {
+  RapidHarness harness(8);
+  for (size_t size = 0; size <= 65; ++size) {
+    for (const size_t grain : {size_t{1}, size_t{2}, size_t{7}, size_t{64},
+                               size_t{1024}}) {
+      constexpr size_t begin = 3;
+      std::vector<std::atomic<unsigned>> visits(begin + size + 3);
+      RunHybrid(GetParam(), harness.group, begin, begin + size,
+                [&](size_t index) {
+                  visits[index].fetch_add(1, std::memory_order_relaxed);
+                },
+                grain);
+      for (size_t index = 0; index < visits.size(); ++index) {
+        const unsigned expected =
+            index >= begin && index < begin + size ? 1u : 0u;
+        ASSERT_EQ(visits[index].load(), expected)
+            << "size " << size << ", grain " << grain << ", index " << index;
+      }
+    }
   }
 }
 
@@ -325,6 +403,18 @@ TEST(EigenRapidMailbox, RunsOrdinaryTasksOutsideRapidDomains) {
     }
   });
   EXPECT_TRUE(outside.load());
+}
+
+TEST(EigenRapidMailbox, CallableCanCancelItsPool) {
+  RapidHarness harness(8);
+  auto result = std::async(std::launch::async, [&] {
+    ParallelForMailbox(harness.group, 0, 4096, [&](size_t index) {
+      if (index == 0) {
+        harness.pool.Cancel();
+      }
+    });
+  });
+  EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
 }
 
 TEST(EigenRapidMailbox, KeepsNestedWorkInsideItsLogicalOwner) {
@@ -505,8 +595,7 @@ TEST(EigenRapidLazyStealing, DeregistersAtFirstGlobalSteal) {
   std::atomic<unsigned> stolen{0};
   pool->RunOnThread(
       MakeTask([&] { stolen.fetch_add(1, std::memory_order_relaxed); }), 1);
-  oox::detail::eigen_pool::RegionContext context{
-      nullptr, {0, 1}, nullptr, true};
+  oox::detail::eigen_pool::RegionContext context{{0, 1}, nullptr, true};
   const size_t before = pool->RapidDeregistrationCount();
   EXPECT_TRUE(pool->ExecuteInRegion(
       &context, [&] { return pool->TryExecuteSomething(); }));

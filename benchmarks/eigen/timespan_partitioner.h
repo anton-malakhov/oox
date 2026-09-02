@@ -94,22 +94,17 @@ struct Task {
   using Scheduler = EigenPoolWrapper;
   using Func = std::decay_t<F>;
 
-  static inline const uint64_t INIT_TIME = [] {
-  // should be calculated using timespan_tuner with EIGEN_SIMPLE
-  // currently 0.99 percentile for maximums is used: 99% of iterations should
-  // fit scheduling in timespan
-#if defined(__x86_64__)
-    if (GetNumThreads() == 48) {
-      return 16500;
-    }
-    // return 13500;
-    return 205000;
-#elif defined(__aarch64__)
-    return 1800;
-#else
-#error "Unsupported architecture"
+  // Publication gate in Now() ticks. Expressed in nanoseconds and converted
+  // through the measured timer frequency so the value means the same thing on
+  // a 24 MHz ARM counter and a ~3 GHz TSC. The historical constants (1800 ticks
+  // on Apple Silicon, 205000 TSC ticks on x86) both corresponded to roughly
+  // 70-75 us; that is the default. Override with -DOOX_EIGEN_INIT_TIME_NS.
+  // timespan_tuner now reports recommended_init_time_ticks directly.
+#ifndef OOX_EIGEN_INIT_TIME_NS
+#define OOX_EIGEN_INIT_TIME_NS 75000
 #endif
-  }();
+  static inline const uint64_t INIT_TIME =
+      NanosecondsToTicks(OOX_EIGEN_INIT_TIME_NS);
 
   using StolenFlag = std::atomic<bool>;
 
