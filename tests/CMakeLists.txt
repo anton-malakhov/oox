@@ -55,13 +55,12 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     gtest_discover_tests(${unittest}_tbb)
   endif ()
 
-  if (EIGEN_FOUND)
+  if (OOX_ENABLE_EIGEN)
     add_executable(${unittest}_eigen ${unittest}.cpp)
-    target_compile_definitions(${unittest}_eigen PRIVATE HAVE_EIGEN)
     target_link_libraries(${unittest}_eigen PRIVATE
-            ${PROJECT_NAME}
+            ${PROJECT_NAME}::eigen
             ${OOX_GTEST_LIB}
-            Threads::Threads)
+    )
     gtest_discover_tests(${unittest}_eigen)
   endif ()
 
@@ -79,6 +78,50 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
   endif ()
 
 endforeach ()
+
+if (OOX_ENABLE_EIGEN)
+  add_executable(eigen_pool_test eigen_pool_test.cpp)
+  target_link_libraries(eigen_pool_test PRIVATE
+          ${PROJECT_NAME}::eigen
+          ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_pool_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30)
+
+  add_executable(eigen_pool_instantiation eigen_pool_instantiation.cpp)
+  target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
+  add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
+
+  find_package(Eigen3 3.4 QUIET NO_MODULE)
+  if (TARGET Eigen3::Eigen)
+    set(OOX_UPSTREAM_EIGEN_TARGET Eigen3::Eigen)
+  else ()
+    FetchContent_Declare(
+            oox_upstream_eigen
+            GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+            GIT_TAG 3.4.0
+            GIT_SHALLOW TRUE)
+    FetchContent_GetProperties(oox_upstream_eigen)
+    if (NOT oox_upstream_eigen_POPULATED)
+      FetchContent_Populate(oox_upstream_eigen)
+    endif ()
+    add_library(oox_upstream_eigen_headers INTERFACE)
+    target_include_directories(oox_upstream_eigen_headers INTERFACE
+            ${oox_upstream_eigen_SOURCE_DIR})
+    set(OOX_UPSTREAM_EIGEN_TARGET oox_upstream_eigen_headers)
+  endif ()
+
+  foreach (include_order IN ITEMS oox_first upstream_first)
+    add_executable(eigen_include_${include_order}
+            eigen_include_${include_order}.cpp)
+    target_link_libraries(eigen_include_${include_order} PRIVATE
+            ${PROJECT_NAME}::eigen
+            ${OOX_UPSTREAM_EIGEN_TARGET})
+    add_test(NAME EigenIncludeOrder_${include_order}
+             COMMAND eigen_include_${include_order})
+  endforeach ()
+
+endif ()
 
 if (OOX_EXCEPTIONS_ENABLED)
   add_test(NAME ExceptionPolicyCompile

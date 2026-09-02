@@ -1,7 +1,7 @@
 set(OOX_SCHEDULER_EVAL_MODES)
 set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
 
-if(EIGEN_FOUND)
+if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
@@ -21,7 +21,7 @@ function(oox_configure_scheduler_eval_target target mode)
     SCHEDULER_EVAL_MODE_NAME="${mode}")
   if(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE EIGEN_MODE=${mode})
-    target_link_libraries(${target} PRIVATE OOX Threads::Threads)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
       RAPID_START_MODE=1 TBB_MODE=TBB_RAPID)
@@ -86,11 +86,11 @@ endforeach()
 
 add_custom_target(scheduler_eval_all DEPENDS ${OOX_SCHEDULER_EVAL_TARGETS})
 
-if(EIGEN_FOUND OR TBB_FOUND)
+if(OOX_ENABLE_EIGEN OR TBB_FOUND)
   find_package(Python3 COMPONENTS Interpreter)
 endif()
 
-if(EIGEN_FOUND AND Python3_Interpreter_FOUND)
+if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
   add_test(NAME scheduler_eval_runner_smoke
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
       --build ${PROJECT_BINARY_DIR}

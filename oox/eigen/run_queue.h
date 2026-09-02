@@ -7,16 +7,16 @@
 // Public License v. 2.0. If a copy of the MPL was not distributed
 // with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-#ifndef EIGEN_CXX11_THREADPOOL_RUNQUEUE_H
-#define EIGEN_CXX11_THREADPOOL_RUNQUEUE_H
+#ifndef OOX_EIGEN_RUN_QUEUE_H
+#define OOX_EIGEN_RUN_QUEUE_H
 
 #include <atomic>
 #include <cassert>
-#include <memory>
+#include <cstdint>
 #include <mutex>
-#include <vector>
+#include <utility>
 
-namespace Eigen {
+namespace oox::detail::eigen_pool {
 
 // RunQueue is a fixed-size, partially non-blocking deque or Work items.
 // Operations on front of the queue must be done by a single thread (owner),
@@ -118,41 +118,6 @@ public:
     return w;
   }
 
-  // PopBackHalf removes and returns half last elements in the queue.
-  // Returns number of elements removed.
-  unsigned PopBackHalf(std::vector<Work> *result) {
-    if (Empty())
-      return 0;
-    std::unique_lock<std::mutex> lock(mutex_);
-    unsigned back = back_.load(std::memory_order_relaxed);
-    unsigned size = Size();
-    unsigned mid = back;
-    if (size > 1)
-      mid = back + (size - 1) / 2;
-    unsigned n = 0;
-    unsigned start = 0;
-    for (; static_cast<int>(mid - back) >= 0; mid--) {
-      Elem *e = &array_[mid & kMask];
-      uint8_t s = e->state.load(std::memory_order_relaxed);
-      if (n == 0) {
-        if (s != kReady || !e->state.compare_exchange_strong(
-                               s, kBusy, std::memory_order_acquire))
-          continue;
-        start = mid;
-      } else {
-        // Note: no need to store temporal kBusy, we exclusively own these
-        // elements.
-        eigen_plain_assert(s == kReady);
-      }
-      result->push_back(std::move(e->w));
-      e->state.store(kEmpty, std::memory_order_release);
-      n++;
-    }
-    if (n != 0)
-      back_.store(start + 1 + (kSize << 1), std::memory_order_relaxed);
-    return n;
-  }
-
   // Size returns current queue size.
   // Can be called by any thread at any time.
   unsigned Size() const { return SizeOrNotEmpty<true>(); }
@@ -160,13 +125,6 @@ public:
   // Empty tests whether container is empty.
   // Can be called by any thread at any time.
   bool Empty() const { return SizeOrNotEmpty<false>() == 0; }
-
-  // Delete all the elements from the queue.
-  void Flush() {
-    while (!Empty()) {
-      PopFront();
-    }
-  }
 
 private:
   static const unsigned kMask = kSize - 1;
@@ -221,8 +179,7 @@ private:
     }
   }
 
-  __attribute__((always_inline)) inline unsigned
-  CalculateSize(unsigned front, unsigned back) const {
+  inline unsigned CalculateSize(unsigned front, unsigned back) const {
     int size = (front & kMask2) - (back & kMask2);
     // Fix overflow.
     if (size < 0)
@@ -240,6 +197,6 @@ private:
   void operator=(const RunQueue &) = delete;
 };
 
-} // namespace Eigen
+} // namespace oox::detail::eigen_pool
 
-#endif // EIGEN_CXX11_THREADPOOL_RUNQUEUE_H
+#endif // OOX_EIGEN_RUN_QUEUE_H

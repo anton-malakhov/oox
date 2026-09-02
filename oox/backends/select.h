@@ -3,6 +3,19 @@
 #ifndef OOX_BACKENDS_SELECT_H
 #define OOX_BACKENDS_SELECT_H
 
+// OOX_SERIAL_DEBUG intentionally overrides every asynchronous backend. Outside
+// serial-debug builds, enabling more than one backend is an error: selecting by
+// incidental preprocessor order would make consumer behavior non-portable.
+#if !OOX_SERIAL_DEBUG &&                                                   \
+    ((defined(HAVE_OMP) && HAVE_OMP) +                                    \
+     (defined(HAVE_TBB) && HAVE_TBB) +                                    \
+     (defined(HAVE_TF) && HAVE_TF) +                                      \
+     (defined(HAVE_TWIST) && HAVE_TWIST) +                                \
+     (defined(HAVE_FOLLY) && HAVE_FOLLY) +                                \
+     (defined(HAVE_EIGEN) && HAVE_EIGEN) > 1)
+#error "Enable exactly one OOX asynchronous backend"
+#endif
+
 #if OOX_SERIAL_DEBUG
 #include "serial/backend.h"
 #elif HAVE_OMP

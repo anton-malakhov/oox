@@ -32,8 +32,8 @@ template <SpinPayload Payload> void Spin(benchmark::State &state) {
   const auto tasks = static_cast<std::size_t>(state.range(0));
   const auto work = static_cast<std::size_t>(state.range(1));
   const auto calls = static_cast<std::size_t>(state.range(2));
-  IsolatedValue shared_storage;
-  std::atomic_ref<std::uint64_t> shared(shared_storage.value);
+  alignas(hardware_constructive_interference_size)
+      std::atomic<std::uint64_t> shared{1};
   std::vector<IsolatedValue> distributed(tasks);
   for (auto _ : state) {
     for (std::size_t call = 0; call < calls; ++call) {

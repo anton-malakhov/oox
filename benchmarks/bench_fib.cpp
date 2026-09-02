@@ -62,6 +62,17 @@ static void Fib_OOX1(benchmark::State& state) {
 }
 BENCHMARK(Fib_OOX1)->Unit(benchmark::kMillisecond)->UseRealTime()->DenseRange(cutoff, max_cutoff, cutoff_step);
 
+static void Fib_OOX1_ProblemSize(benchmark::State& state) {
+  cutoff = 8;
+  const int n = state.range(0);
+  const auto fib = Serial::Fib(n);
+  for (auto _ : state) {
+    const auto value = oox::wait_and_get(OOX1::Fib(n));
+    assert(value == fib);
+  }
+}
+BENCHMARK(Fib_OOX1_ProblemSize)->Unit(benchmark::kMillisecond)->UseRealTime()->Arg(24);
+
 static void Fib_OOX2(benchmark::State& state) {
   cutoff = state.range(0);
   auto fib = Serial::Fib(FibN+cutoff);

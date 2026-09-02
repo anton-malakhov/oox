@@ -7,13 +7,16 @@
 // Public License v. 2.0. If a copy of the MPL was not distributed
 // with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-#ifndef EIGEN_FIXEDSIZEVECTOR_H
-#define EIGEN_FIXEDSIZEVECTOR_H
+#ifndef OOX_EIGEN_MAX_SIZE_VECTOR_H
+#define OOX_EIGEN_MAX_SIZE_VECTOR_H
 #include "memory.h"
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <new>
 
-namespace Eigen {
+namespace oox::detail::eigen_pool {
 
 /** \class MaxSizeVector
  * \ingroup Core
@@ -36,17 +39,17 @@ template <typename T> class MaxSizeVector {
 
 public:
   // Construct a new MaxSizeVector, reserve n elements.
-  __attribute__((always_inline)) inline explicit MaxSizeVector(size_t n)
+  explicit MaxSizeVector(size_t n)
       : reserve_(n), size_(0),
         data_(static_cast<T *>(
-            ::internal::handmade_aligned_malloc(n * sizeof(T), alignment))) {}
+            internal::handmade_aligned_malloc(n * sizeof(T), alignment))) {}
 
   // Construct a new MaxSizeVector, reserve and resize to n.
   // Copy the init value to all elements.
-  __attribute__((always_inline)) inline MaxSizeVector(size_t n, const T &init)
+  MaxSizeVector(size_t n, const T &init)
       : reserve_(n), size_(n),
         data_(static_cast<T *>(
-            ::internal::handmade_aligned_malloc(n * sizeof(T), alignment))) {
+            internal::handmade_aligned_malloc(n * sizeof(T), alignment))) {
     size_t i = 0;
     try {
       for (; i < size_; ++i) {
@@ -57,16 +60,16 @@ public:
       for (; (i + 1) > 0; --i) {
         data_[i - 1].~T();
       }
-      ::internal::handmade_aligned_free(data_);
+      internal::handmade_aligned_free(data_);
       throw;
     }
   }
 
-  __attribute__((always_inline)) ~MaxSizeVector() {
+  ~MaxSizeVector() {
     for (size_t i = size_; i > 0; --i) {
       data_[i - 1].~T();
     }
-    ::internal::handmade_aligned_free(data_);
+    internal::handmade_aligned_free(data_);
   }
 
   void resize(size_t n) {
@@ -81,58 +84,58 @@ public:
   }
 
   // Append new elements (up to reserved size).
-  __attribute__((always_inline)) void push_back(const T &t) {
+  void push_back(const T &t) {
     assert(size_ < reserve_);
     new (&data_[size_++]) T(t);
   }
 
   // For C++03 compatibility this only takes one argument
   template <class X>
-  __attribute__((always_inline)) void emplace_back(const X &x) {
+  void emplace_back(const X &x) {
     assert(size_ < reserve_);
     new (&data_[size_++]) T(x);
   }
 
-  __attribute__((always_inline)) const T &operator[](size_t i) const {
+  const T &operator[](size_t i) const {
     assert(i < size_);
     return data_[i];
   }
 
-  __attribute__((always_inline)) T &operator[](size_t i) {
+  T &operator[](size_t i) {
     assert(i < size_);
     return data_[i];
   }
 
-  __attribute__((always_inline)) T &back() {
+  T &back() {
     assert(size_ > 0);
     return data_[size_ - 1];
   }
 
-  __attribute__((always_inline)) const T &back() const {
+  const T &back() const {
     assert(size_ > 0);
     return data_[size_ - 1];
   }
 
-  __attribute__((always_inline)) void pop_back() {
+  void pop_back() {
     assert(size_ > 0);
     data_[--size_].~T();
   }
 
-  __attribute__((always_inline)) size_t size() const { return size_; }
+  size_t size() const { return size_; }
 
-  __attribute__((always_inline)) bool empty() const { return size_ == 0; }
+  bool empty() const { return size_ == 0; }
 
-  __attribute__((always_inline)) T *data() { return data_; }
+  T *data() { return data_; }
 
-  __attribute__((always_inline)) const T *data() const { return data_; }
+  const T *data() const { return data_; }
 
-  __attribute__((always_inline)) T *begin() { return data_; }
+  T *begin() { return data_; }
 
-  __attribute__((always_inline)) T *end() { return data_ + size_; }
+  T *end() { return data_ + size_; }
 
-  __attribute__((always_inline)) const T *begin() const { return data_; }
+  const T *begin() const { return data_; }
 
-  __attribute__((always_inline)) const T *end() const { return data_ + size_; }
+  const T *end() const { return data_ + size_; }
 
 private:
   size_t reserve_;
@@ -140,6 +143,6 @@ private:
   T *data_;
 };
 
-} // namespace Eigen
+} // namespace oox::detail::eigen_pool
 
-#endif // EIGEN_FIXEDSIZEVECTOR_H
+#endif // OOX_EIGEN_MAX_SIZE_VECTOR_H

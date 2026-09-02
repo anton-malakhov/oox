@@ -13,11 +13,8 @@
 // the OOX-specific adaptations retained here.
 
 #include "mpmc_queue.h"
-#include "stack_depth.h"
-#include "tracing.h"
-#ifndef EIGEN_CXX11_THREADPOOL_NONBLOCKING_THREAD_POOL_H
-#define EIGEN_CXX11_THREADPOOL_NONBLOCKING_THREAD_POOL_H
-#define EIGEN_POOL_RUNNEXT
+#ifndef OOX_EIGEN_NONBLOCKING_THREAD_POOL_H
+#define OOX_EIGEN_NONBLOCKING_THREAD_POOL_H
 
 #include "max_size_vector.h"
 #include "run_queue.h"
@@ -27,16 +24,20 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-namespace Eigen {
+namespace oox::detail::eigen_pool {
 
 struct Task {
+  std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
   virtual ~Task() = default;
 };
@@ -56,39 +57,6 @@ template <typename F> struct UniqueTask : Task {
 template <typename F> Task *MakeTask(F &&f) {
   return new UniqueTask<decltype(std::forward<F>(f))>{std::forward<F>(f)};
 }
-
-/**/
-template <typename F>
-struct ProxyTask : Task {
-  ProxyTask(F&& func)
-    : Func_{std::move(func)}
-  {}
-
-  void operator()() override {
-    // We should enter this function 2 times
-    // prevState:
-    // 0 => first entrance, run Func_
-    // 1 in same thread  => this thread finished Func_ before other thread entered
-    // 1 in other thread => other thread entered function before Func_ is finished
-    // 2 this is the last change of state, drop object
-    auto prevState = State_.fetch_add(1, std::memory_order_seq_cst);
-    if (prevState == 0) {
-      Func_();
-      prevState = State_.fetch_add(1, std::memory_order_seq_cst);
-    }
-    if (prevState == 2) {
-      delete this;
-    }
-  }
-
-  std::decay_t<F> Func_;
-  std::atomic_uint_fast32_t State_ = 0;
-};
-
-template <typename F> Task *MakeProxyTask(F &&f) {
-  return new ProxyTask{std::forward<F>(f)};
-}
-/**/
 
 // This defines an interface that ThreadPoolDevice can take to use
 // custom thread pools underneath.
@@ -121,7 +89,7 @@ public:
 };
 
 template <typename Environment>
-class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
+class ThreadPoolTempl : public ThreadPoolInterface {
 public:
   using TaskPtr = Task *;
   using Queue = RunQueue<TaskPtr, 1024>;
@@ -131,73 +99,55 @@ public:
 
   ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
                   Environment env = Environment())
-      : env_(env), num_threads_(num_threads), allow_spinning_(allow_spinning),
-        thread_data_(num_threads), all_coprimes_(num_threads),
-        global_steal_partition_(EncodePartition(0, num_threads_)), blocked_(0),
-        spinning_(0), done_(false), cancelled_(false) {
+      : env_(env), num_threads_(ValidateThreadCount(num_threads)),
+        allow_spinning_(allow_spinning), thread_data_(num_threads_),
+        all_coprimes_(num_threads_),
+        pool_generation_(NextPoolGeneration()), done_(false),
+        cancelled_(false) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
-    // and NonEmptyQueueIndex. Iteration is based on the fact that if we take
+    // operations. Iteration is based on the fact that if we take
     // a random starting thread index t and calculate num_threads - 1 subsequent
     // indices as (t + coprime) % num_threads, we will cover all threads without
     // repetitions (effectively getting a presudo-random permutation of thread
     // indices).
-    assert(num_threads_ < kMaxThreads);
     for (int i = 1; i <= num_threads_; ++i) {
       all_coprimes_.emplace_back(i);
       ComputeCoprimes(i, &all_coprimes_.back());
     }
     thread_data_.resize(num_threads_);
-    for (int i = 0; i < num_threads_; i++) {
-      SetStealPartition(i, EncodePartition(0, num_threads_));
-      if (i == 0) {
-        PerThread *pt = GetPerThread();
-        pt->pool = this;
-        pt->rand = GlobalThreadIdHash();
-        pt->thread_id = i;
-      } else {
+    const bool needs_fallback_worker = use_main_thread && num_threads_ == 1;
+    if (use_main_thread) {
+      RegisterCreator(!needs_fallback_worker);
+    }
+    const int first_background_worker =
+        use_main_thread && !needs_fallback_worker ? 1 : 0;
+    try {
+      for (int i = first_background_worker; i < num_threads_; ++i) {
         thread_data_[i].thread.reset(env_.CreateThread([this, i]() {
           PerThread *pt = GetPerThread();
-          pt->pool = this;
-          pt->rand = GlobalThreadIdHash();
-          pt->thread_id = i;
+          const PerThread previous = *pt;
+          RegisterThread(pt, i, true);
           WorkerLoop();
+          *pt = previous;
         }));
       }
+    } catch (...) {
+      done_.store(true, std::memory_order_release);
+      WakeAll();
+      JoinThreads();
+      FlushQueues();
+      RestoreCreatorRegistration();
+      throw;
     }
   }
 
   ~ThreadPoolTempl() {
-    done_ = true;
-
-    // Now if all threads block without work, they will start exiting.
-    // But note that threads can continue to work arbitrary long,
-    // block, submit new work, unblock and otherwise live full life.
-    if (cancelled_) {
-      // Since we were cancelled, there might be entries in the queues.
-      // Empty them to prevent their destructor from asserting.
-      for (size_t i = 0; i < thread_data_.size(); i++) {
-        thread_data_[i].Flush();
-      }
-    }
-    // Join threads explicitly (by destroying) to avoid destruction order within
-    // this class.
-    for (size_t i = 0; i < thread_data_.size(); ++i)
-      thread_data_[i].thread.reset();
-  }
-
-  void SetStealPartitions(
-      const std::vector<std::pair<unsigned, unsigned>> &partitions) {
-    assert(partitions.size() == static_cast<std::size_t>(num_threads_));
-
-    // Pass this information to each thread queue.
-    for (int i = 0; i < num_threads_; i++) {
-      const auto &pair = partitions[i];
-      unsigned start = pair.first, end = pair.second;
-      AssertBounds(start, end);
-      unsigned val = EncodePartition(start, end);
-      SetStealPartition(i, val);
-    }
+    done_.store(true, std::memory_order_release);
+    WakeAll();
+    JoinThreads();
+    FlushQueues();
+    RestoreCreatorRegistration();
   }
 
   void Schedule(TaskPtr p) override {
@@ -206,63 +156,66 @@ public:
   }
 
   void RunOnThread(TaskPtr t, size_t threadIndex) {
+    if (t == nullptr) {
+      return;
+    }
+    if (cancelled_.load(std::memory_order_acquire)) {
+      delete t;
+      return;
+    }
     threadIndex = threadIndex % num_threads_;
     PerThread *pt = GetPerThread();
-    if (!thread_data_[threadIndex].PushTask(
-            t, (pt && threadIndex == pt->thread_id))) {
-      // failed to push, execute directly
-      ExecuteTask(t);
-    }
+    const bool local = IsRegistered(pt) && pt->owns_queue &&
+                       threadIndex == static_cast<size_t>(pt->thread_id);
+    PublishTask(t, static_cast<int>(threadIndex), local);
   }
 
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
-    PerThread *pt = GetPerThread();
-    bool pushed = false;
-    if (pt->pool == this) {
-      // Worker thread of this pool, push onto the thread's queue.
-      if (thread_data_[pt->thread_id].PushTask(t, true)) {
-        return;
-      }
-    } else {
-      // A free-standing thread (or worker of another pool), push onto a random
-      // queue.
-      assert(start < limit);
-      assert(limit <= num_threads_);
-      int num_queues = limit - start;
-      int rnd = Rand(&pt->rand) % num_queues;
-      assert(start + rnd < limit);
-      const bool localThread = (start + rnd) == pt->thread_id;
-      if (thread_data_[start + rnd].PushTask(t, localThread)) {
-        return;
-      }
+    if (t == nullptr) {
+      return;
     }
-    // Note: below we touch this after making w available to worker threads.
-    // Strictly speaking, this can lead to a racy-use-after-free. Consider that
-    // Schedule is called from a thread that is neither main thread nor a worker
-    // thread of this pool. Then, execution of w directly or indirectly
-    // completes overall computations, which in turn leads to destruction of
-    // this. We expect that such scenario is prevented by program, that is,
-    // this is kept alive while any threads can potentially be in Schedule.
-    ExecuteTask(t); // Push failed, execute directly.
+    AssertBounds(start, limit);
+    if (cancelled_.load(std::memory_order_acquire)) {
+      delete t;
+      return;
+    }
+
+    PerThread *pt = GetPerThread();
+    if (IsRegistered(pt) && pt->owns_queue && pt->thread_id >= start &&
+        pt->thread_id < limit) {
+      // Worker thread of this pool, push onto the thread's queue.
+      PublishTask(t, pt->thread_id, true);
+      return;
+    }
+
+    if (pt->rand == 0) {
+      pt->rand = GlobalThreadIdHash();
+    }
+    const int target =
+        start + static_cast<int>(Rand(&pt->rand) % (limit - start));
+    PublishTask(t, target, false);
   }
 
   void Cancel() override {
-    cancelled_ = true;
-    done_ = true;
+    cancelled_.store(true, std::memory_order_release);
+    done_.store(true, std::memory_order_release);
 
     // Let each thread know it's been cancelled.
-#ifdef EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
+#ifdef OOX_EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
     for (size_t i = 0; i < thread_data_.size(); i++) {
-      thread_data_[i].thread->OnCancel();
+      if (thread_data_[i].thread) {
+        thread_data_[i].thread->OnCancel();
+      }
     }
 #endif
+    WakeAll();
   }
 
   size_t NumThreads() const final { return num_threads_; }
 
   size_t CurrentThreadId() const final {
     const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
-    if (pt->pool == this) {
+    if (IsRegistered(pt)) {
       return pt->thread_id;
     } else {
       return -1;
@@ -286,6 +239,32 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+  template <typename Predicate> void Wait(Predicate ready) {
+    const bool registered = IsRegistered(GetPerThread());
+    if (ready()) {
+      return;
+    }
+    auto &event = registered ? worker_event_ : waiter_event_;
+
+    while (!ready()) {
+      const uint64_t token = event.PrepareWait();
+      if (registered && TryExecuteOne()) {
+        event.CancelWait();
+        continue;
+      }
+      if (ready() || cancelled_.load(std::memory_order_acquire)) {
+        event.CancelWait();
+        return;
+      }
+      event.Wait(token);
+    }
+  }
+
+  void NotifyTaskCompletion() {
+    worker_event_.NotifyAll();
+    waiter_event_.NotifyAll();
+  }
+
 private:
   // Create a single atomic<int> that encodes start and limit information for
   // each thread.
@@ -296,31 +275,67 @@ private:
   // scheduling and steal domain(s).
   static const int kMaxPartitionBits = 16;
   static const int kMaxThreads = 1 << kMaxPartitionBits;
+  static const int kSpinCount = 64;
 
-  inline unsigned EncodePartition(unsigned start, unsigned limit) {
-    return (start << kMaxPartitionBits) | limit;
+  class EventCount {
+  public:
+    uint64_t PrepareWait() {
+      // The caller checks for work again after registering. Sequential
+      // consistency makes either that check or a concurrent notification win.
+      const uint64_t epoch = epoch_.load(std::memory_order_seq_cst);
+      waiters_.fetch_add(1, std::memory_order_seq_cst);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      return epoch;
+    }
+
+    void CancelWait() { waiters_.fetch_sub(1, std::memory_order_seq_cst); }
+
+    void Wait(uint64_t token) {
+      epoch_.wait(token, std::memory_order_acquire);
+      CancelWait();
+    }
+
+    void NotifyOne() { Notify(false); }
+    void NotifyAll() { Notify(true); }
+
+  private:
+    void Notify(bool all) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (waiters_.load(std::memory_order_seq_cst) == 0) {
+        return;
+      }
+      epoch_.fetch_add(1, std::memory_order_seq_cst);
+      if (all) {
+        epoch_.notify_all();
+      } else {
+        epoch_.notify_one();
+      }
+    }
+
+    std::atomic<uint64_t> epoch_{0};
+    std::atomic<size_t> waiters_{0};
+  };
+
+  static int ValidateThreadCount(int count) {
+    if (count <= 0 || count >= kMaxThreads) {
+      throw std::invalid_argument("thread count must be in [1, 65535]");
+    }
+    return count;
   }
 
-  void ExecuteTask(TaskPtr p) { (*p)(); }
-
-  inline void DecodePartition(unsigned val, unsigned *start, unsigned *limit) {
-    *limit = val & (kMaxThreads - 1);
-    val >>= kMaxPartitionBits;
-    *start = val;
+  void ExecuteTask(TaskPtr p) {
+    struct FinishTask {
+      ThreadPoolTempl *pool;
+      std::atomic<size_t> *outstanding;
+      ~FinishTask() { pool->TaskFinished(outstanding); }
+    } finish{this, p->outstanding};
+    (*p)();
   }
 
   void AssertBounds(int start, int end) {
-    assert(start >= 0);
-    assert(start < end); // non-zero sized partition
-    assert(end <= num_threads_);
-  }
-
-  inline void SetStealPartition(size_t i, unsigned val) {
-    thread_data_[i].steal_partition.store(val, std::memory_order_relaxed);
-  }
-
-  inline unsigned GetStealPartition(int i) {
-    return thread_data_[i].steal_partition.load(std::memory_order_relaxed);
+    if (start < 0 || start >= end || end > num_threads_) {
+      throw std::invalid_argument("invalid scheduling partition");
+    }
   }
 
   void ComputeCoprimes(int N, MaxSizeVector<unsigned> *coprimes) {
@@ -342,66 +357,34 @@ private:
   typedef typename Environment::EnvThread Thread;
 
   struct PerThread {
-    constexpr PerThread() : pool(NULL), rand(0), thread_id(-1) {}
+    constexpr PerThread()
+        : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
+          owns_queue(false) {}
     ThreadPoolTempl *pool; // Parent pool, or null for normal threads.
+    uint64_t pool_generation;
     uint64_t rand;         // Random generator state.
     int thread_id;         // Worker thread index in pool.
+    bool owns_queue;
   };
 
   struct ThreadData {
-    constexpr ThreadData() : thread(), steal_partition(0), local_tasks(), mailbox(1024) {}
+    ThreadData()
+        : thread(), outstanding_tasks(0), local_tasks(),
+          mailbox(1024) {}
     std::unique_ptr<Thread> thread;
-    std::atomic<unsigned> steal_partition;
+    std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
-    std::size_t stack_size = size_t{16} * 1024 * 1024;
-#ifdef EIGEN_POOL_RUNNEXT
-    std::atomic<TaskPtr> runnext{nullptr};
-    // use IDLE to indicate that the thread is idling and tasks shouldn't be
-    // pushed
-    static inline const TaskPtr IDLE = reinterpret_cast<TaskPtr>(1);
-#endif
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
-// #ifdef EIGEN_POOL_RUNNEXT
-//         if (runnext.load(std::memory_order_relaxed) == nullptr) {
-//           TaskPtr expected = nullptr;
-//           if (runnext.compare_exchange_strong(expected, p,
-//                                               std::memory_order_release)) {
-//             return true;
-//           }
-//         }
-// #endif
         return local_tasks.PushFront(p);
       } else {
         return mailbox.try_push(p);
       }
     }
 
-    bool SetIdle() {
-      auto current = runnext.load(std::memory_order_relaxed);
-      if (current == nullptr) {
-        return runnext.compare_exchange_strong(current, IDLE,
-                                               std::memory_order_relaxed);
-      }
-      return current == IDLE;
-    }
-
-    void ResetIdle() {
-      auto current = runnext.load(std::memory_order_relaxed);
-      if (current == IDLE) {
-        runnext.compare_exchange_strong(current, nullptr,
-                                        std::memory_order_relaxed);
-      }
-    }
-
     TaskPtr PopFront() {
-#ifdef EIGEN_POOL_RUNNEXT
-      if (auto p = PopRunnext(); p && p != IDLE) {
-        return p;
-      }
-#endif
       if (auto p = local_tasks.PopFront()) {
         return p;
       }
@@ -412,49 +395,12 @@ private:
 
     TaskPtr PopBack(bool force) {
       TaskPtr task = nullptr;
-      // Every mode uses mailboxes for targeted remote publication. Explicit
-      // stealing modes preserve affinity; sharing modes and the general OOX
-      // backend let thieves consume another worker's mailbox.
-#if !defined(EIGEN_MODE) ||                                                  \
-    (EIGEN_MODE == EIGEN_SHARING || EIGEN_MODE == EIGEN_SHARING_STEALING)
       mailbox.try_pop(task);
-#endif
       if (!task && force) {
         task = local_tasks.PopBack();
       }
       return task;
     }
-
-    void Flush() {
-      while (!mailbox.empty()) {
-        TaskPtr task = nullptr;
-        mailbox.pop(task);
-      }
-      while (!local_tasks.Empty()) {
-        local_tasks.PopFront();
-      }
-    }
-
-#ifdef EIGEN_POOL_RUNNEXT
-    TaskPtr PopRunnext() {
-      if (auto p = runnext.load(std::memory_order_relaxed); p) {
-        auto success = runnext.compare_exchange_strong(
-            p, nullptr, std::memory_order_acquire);
-        if (success) {
-          return p;
-        }
-      }
-      return nullptr;
-    }
-
-    TaskPtr StealWithRunnext() {
-      TaskPtr t = PopBack();
-      if (!t) {
-        t = PopRunnext();
-      }
-      return t;
-    }
-#endif
   };
 
   Environment env_;
@@ -462,56 +408,209 @@ private:
   const bool allow_spinning_;
   MaxSizeVector<ThreadData> thread_data_;
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
-  unsigned global_steal_partition_;
-  std::atomic<unsigned> blocked_;
-  std::atomic<bool> spinning_;
+  const uint64_t pool_generation_;
+
+  std::mutex overflow_mutex_;
+  std::deque<TaskPtr> overflow_tasks_;
+  EventCount worker_event_;
+  EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
 
+  bool creator_registered_ = false;
+  std::thread::id creator_thread_id_;
+  PerThread creator_previous_registration_;
+
   // Main worker thread loop. Returns true if processed some tasks
   bool WorkerLoop(bool external = false, bool once = false) {
-    PerThread *pt = GetPerThread();
-    auto thread_id = pt->thread_id;
-    auto &threadData = thread_data_[thread_id];
-
-    auto can_steal = internal::IsStackHalfConsumed();
-
-    threadData.ResetIdle();
     bool processed_anything = false;
-    bool all_empty = false;
-    while (!cancelled_) {
-      TaskPtr t = threadData.PopFront();
-      if (!t && (!external || can_steal)) {
-        t = LocalSteal(all_empty);
-        if (t) {
-          Tracing::TaskStolen();
-        }
-      }
-      if (!t && (!external || can_steal)) {
-        t = GlobalSteal(all_empty);
-        if (t) {
-          Tracing::TaskStolen();
-        }
-      }
-      if (!t && external && threadData.SetIdle()) {
-        // external thread shouldn't wait for work, it should just exit.
+    for (;;) {
+      if (cancelled_.load(std::memory_order_acquire)) {
         return processed_anything;
       }
-      if (t) {
-        ExecuteTask(t);
+
+      if (TryExecuteOne()) {
         processed_anything = true;
-        all_empty = false;
-      } else if (done_) {
-        return processed_anything;
-      } else {
-        all_empty = true;
+        if (once) {
+          return true;
+        }
+        continue;
       }
-      if (once) {
-        break;
+      if (external || once || ShouldExit()) {
+        return processed_anything;
+      }
+
+      bool found_work = false;
+      if (allow_spinning_) {
+        for (int i = 0; i < kSpinCount; ++i) {
+          if (cancelled_.load(std::memory_order_acquire)) {
+            return processed_anything;
+          }
+          if (TryExecuteOne()) {
+            processed_anything = true;
+            found_work = true;
+            break;
+          }
+          std::this_thread::yield();
+        }
+      }
+      if (found_work) {
+        continue;
+      }
+
+      const uint64_t token = worker_event_.PrepareWait();
+      if (TryExecuteOne()) {
+        worker_event_.CancelWait();
+        processed_anything = true;
+        continue;
+      }
+      if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
+        worker_event_.CancelWait();
+        return processed_anything;
+      }
+      worker_event_.Wait(token);
+    }
+  }
+
+  static uint64_t NextPoolGeneration() {
+    static std::atomic<uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void RegisterThread(PerThread *pt, int thread_id, bool owns_queue) {
+    pt->pool = this;
+    pt->pool_generation = pool_generation_;
+    pt->rand = GlobalThreadIdHash();
+    pt->thread_id = thread_id;
+    pt->owns_queue = owns_queue;
+  }
+
+  void RegisterCreator(bool owns_queue) {
+    creator_thread_id_ = std::this_thread::get_id();
+    PerThread *pt = GetPerThread();
+    creator_previous_registration_ = *pt;
+    RegisterThread(pt, 0, owns_queue);
+    creator_registered_ = true;
+  }
+
+  void RestoreCreatorRegistration() {
+    if (!creator_registered_ ||
+        creator_thread_id_ != std::this_thread::get_id()) {
+      return;
+    }
+    PerThread *pt = GetPerThread();
+    if (IsRegistered(pt)) {
+      *pt = creator_previous_registration_;
+    }
+    creator_registered_ = false;
+  }
+
+  bool IsRegistered(const PerThread *pt) const {
+    return pt->pool == this && pt->pool_generation == pool_generation_;
+  }
+
+  void PublishTask(TaskPtr task, int target, bool local) {
+    auto &outstanding = thread_data_[target].outstanding_tasks;
+    task->outstanding = &outstanding;
+    outstanding.fetch_add(1, std::memory_order_relaxed);
+    try {
+      if (!thread_data_[target].PushTask(task, local)) {
+        std::lock_guard<std::mutex> lock(overflow_mutex_);
+        overflow_tasks_.push_back(task);
+      }
+    } catch (...) {
+      outstanding.fetch_sub(1, std::memory_order_relaxed);
+      throw;
+    }
+    WakeOneWorker();
+  }
+
+  TaskPtr PopOverflow() {
+    std::lock_guard<std::mutex> lock(overflow_mutex_);
+    if (overflow_tasks_.empty()) {
+      return nullptr;
+    }
+    TaskPtr task = overflow_tasks_.front();
+    overflow_tasks_.pop_front();
+    return task;
+  }
+
+  bool TryExecuteOne() {
+    PerThread *pt = GetPerThread();
+    assert(IsRegistered(pt));
+
+    TaskPtr task = nullptr;
+    if (pt->owns_queue) {
+      task = thread_data_[pt->thread_id].PopFront();
+    }
+    if (!task) {
+      task = PopOverflow();
+    }
+    if (!task) {
+      task = GlobalSteal(true);
+    }
+    if (!task) {
+      return false;
+    }
+    ExecuteTask(task);
+    return true;
+  }
+
+  void TaskFinished(std::atomic<size_t> *outstanding) {
+    assert(outstanding != nullptr);
+    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
+    assert(previous > 0);
+    if (previous == 1 && done_.load(std::memory_order_acquire) &&
+        NoOutstandingTasks()) {
+      WakeAllWorkers();
+    }
+  }
+
+  bool NoOutstandingTasks() const {
+    for (const auto &data : thread_data_) {
+      if (data.outstanding_tasks.load(std::memory_order_acquire) != 0) {
+        return false;
       }
     }
+    return true;
+  }
 
-    return processed_anything;
+  bool ShouldExit() const {
+    return done_.load(std::memory_order_acquire) && NoOutstandingTasks();
+  }
+
+  void WakeOneWorker() { worker_event_.NotifyOne(); }
+
+  void WakeAllWorkers() { worker_event_.NotifyAll(); }
+
+  void WakeAll() {
+    WakeAllWorkers();
+    waiter_event_.NotifyAll();
+  }
+
+  void JoinThreads() {
+    for (auto &data : thread_data_) {
+      data.thread.reset();
+    }
+  }
+
+  void FlushQueues() {
+    for (auto &data : thread_data_) {
+      while (TaskPtr task = data.PopFront()) {
+        auto *outstanding = task->outstanding;
+        delete task;
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+    std::lock_guard<std::mutex> lock(overflow_mutex_);
+    while (!overflow_tasks_.empty()) {
+      TaskPtr task = overflow_tasks_.front();
+      overflow_tasks_.pop_front();
+      auto *outstanding = task->outstanding;
+      delete task;
+      outstanding->fetch_sub(1, std::memory_order_relaxed);
+    }
+    assert(NoOutstandingTasks());
   }
 
   // Steal tries to steal work from other worker threads in the range [start,
@@ -542,56 +641,20 @@ private:
     return nullptr;
   }
 
-  // Steals work within threads belonging to the partition.
-  TaskPtr LocalSteal(bool force) {
-    PerThread *pt = GetPerThread();
-    unsigned partition = GetStealPartition(pt->thread_id);
-    // If thread steal partition is the same as global partition, there is no
-    // need to go through the steal loop twice.
-    if (global_steal_partition_ == partition)
-      return nullptr;
-    unsigned start, limit;
-    DecodePartition(partition, &start, &limit);
-    AssertBounds(start, limit);
-
-    return Steal(start, limit, force);
-  }
-
   // Steals work from any other thread in the pool.
   TaskPtr GlobalSteal(bool force) { return Steal(0, num_threads_, force); }
 
-  int NonEmptyQueueIndex() {
-    PerThread *pt = GetPerThread();
-    // We intentionally design NonEmptyQueueIndex to steal work from
-    // anywhere in the queue so threads don't block in WaitForWork() forever
-    // when all threads in their partition go to sleep. Steal is still local.
-    const size_t size = thread_data_.size();
-    unsigned r = Rand(&pt->rand);
-    unsigned inc = all_coprimes_[size - 1][r % all_coprimes_[size - 1].size()];
-    unsigned victim = r % size;
-    for (unsigned i = 0; i < size; i++) {
-      if (!thread_data_[victim].queue.Empty()) {
-        return victim;
-      }
-      victim += inc;
-      if (victim >= size) {
-        victim -= size;
-      }
-    }
-    return -1;
-  }
-
-  static __attribute__((always_inline)) inline uint64_t GlobalThreadIdHash() {
+  static inline uint64_t GlobalThreadIdHash() {
     return std::hash<std::thread::id>()(std::this_thread::get_id());
   }
 
-  __attribute__((always_inline)) inline PerThread *GetPerThread() {
+  inline PerThread *GetPerThread() {
     static thread_local PerThread per_thread_;
     PerThread *pt = &per_thread_;
     return pt;
   }
 
-  static __attribute__((always_inline)) inline unsigned Rand(uint64_t *state) {
+  static inline unsigned Rand(uint64_t *state) {
     uint64_t current = *state;
     // Update the internal state
     *state = current * 6364136223846793005ULL + 0xda3e39cb94b95bdbULL;
@@ -603,6 +666,6 @@ private:
 
 typedef ThreadPoolTempl<StlThreadEnvironment> ThreadPool;
 
-} // namespace Eigen
+} // namespace oox::detail::eigen_pool
 
-#endif // EIGEN_CXX11_THREADPOOL_NONBLOCKING_THREAD_POOL_H
+#endif // OOX_EIGEN_NONBLOCKING_THREAD_POOL_H

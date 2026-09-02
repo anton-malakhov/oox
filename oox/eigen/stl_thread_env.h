@@ -1,7 +1,20 @@
-#pragma once
+// This file is part of Eigen, a lightweight C++ template library
+// for linear algebra.
+//
+// Copyright (C) 2014 Benoit Steiner <benoit.steiner.goog@gmail.com>
+//
+// This Source Code Form is subject to the terms of the Mozilla
+// Public License v. 2.0. If a copy of the MPL was not distributed
+// with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+#ifndef OOX_EIGEN_STL_THREAD_ENV_H
+#define OOX_EIGEN_STL_THREAD_ENV_H
 
 #include <functional>
 #include <thread>
+#include <utility>
+
+namespace oox::detail::eigen_pool {
 
 struct StlThreadEnvironment {
   // EnvThread constructor must start the thread,
@@ -21,3 +34,7 @@ struct StlThreadEnvironment {
     return new EnvThread(std::move(f));
   }
 };
+
+} // namespace oox::detail::eigen_pool
+
+#endif // OOX_EIGEN_STL_THREAD_ENV_H
