@@ -228,6 +228,20 @@ void drain_backend_task_epilogues() {
 #endif
 }
 
+testing::AssertionResult life_count_reaches(oox::internal::task_node* task, int expected) {
+    const auto deadline = std::chrono::steady_clock::now() + k_async_test_timeout;
+    int actual;
+    do {
+        actual = task->life_get_count();
+        if (actual == expected) {
+            return testing::AssertionSuccess();
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return testing::AssertionFailure()
+        << "task life count remained " << actual << ", expected " << expected;
+}
+
 } // namespace
 
 /////////////////////////////////////// BASIC API ////////////////////////////////////////
@@ -548,7 +562,7 @@ TEST(SharedVar, SameStateTwiceAsWriter) {
     }, value, value);
     oox::wait_for_all(done);
     drain_backend_task_epilogues();
-    EXPECT_EQ(done.current_task->life_get_count(), 2);
+    EXPECT_TRUE(life_count_reaches(done.current_task, 2));
     EXPECT_EQ(value.get(), 2);
 }
 
@@ -561,7 +575,7 @@ TEST(SharedVar, CopiedStateTwiceAsWriter) {
     }, value, alias);
     oox::wait_for_all(done);
     drain_backend_task_epilogues();
-    EXPECT_EQ(done.current_task->life_get_count(), 2);
+    EXPECT_TRUE(life_count_reaches(done.current_task, 2));
     EXPECT_EQ(value.get(), 2);
     EXPECT_EQ(alias.get(), 2);
 }
