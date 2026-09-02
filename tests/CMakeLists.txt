@@ -16,6 +16,7 @@ endif ()
 
 list(APPEND OOX_UNITTESTS
         test_oox
+        test_shared_var
 )
 
 foreach (unittest IN LISTS OOX_UNITTESTS)
@@ -27,6 +28,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
           ${PROJECT_NAME}
           ${OOX_GTEST_LIB}
   )
+  if (unittest STREQUAL "test_shared_var")
+    target_compile_definitions(${unittest}
+            PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+  endif ()
   gtest_discover_tests(${unittest})
 
   # Serial debugging implementation
@@ -45,6 +50,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     target_compile_definitions(${unittest}_tbb PRIVATE HAVE_TBB)
     if (OOX_EXCEPTIONS_ENABLED)
       target_compile_definitions(${unittest}_tbb PRIVATE TBB_USE_EXCEPTIONS=1)
+    endif ()
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tbb
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
     endif ()
     target_link_libraries(${unittest}_tbb
             PRIVATE
@@ -68,6 +77,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
     target_compile_definitions(${unittest}_tf PRIVATE HAVE_TF)
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tf
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+    endif ()
     target_link_libraries(${unittest}_tf
             PRIVATE
             ${PROJECT_NAME}
@@ -79,6 +92,24 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
 
 endforeach ()
 
+add_test(NAME NonThrowConsumeCompile
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 "-D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                 "-D OOX_CXX_COMPILER_TARGET=${CMAKE_CXX_COMPILER_TARGET}"
+                 "-D OOX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+                 "-D OOX_SYSROOT=${CMAKE_SYSROOT}"
+                 "-D OOX_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}"
+                 "-D OOX_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+                 "-D OOX_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                 "-D OOX_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_test eigen_pool_test.cpp)
   target_link_libraries(eigen_pool_test PRIVATE
@@ -130,6 +161,17 @@ if (OOX_EXCEPTIONS_ENABLED)
                    -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                    -P ${CMAKE_CURRENT_LIST_DIR}/exception_policy_compile.cmake)
 endif ()
+
+add_test(NAME NestedCMakePreservesListValues
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nested_cmake_list_values.cmake)
 
 if (OOX_BUILD_TWIST_TESTS)
   add_subdirectory(twist)

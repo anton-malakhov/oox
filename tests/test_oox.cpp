@@ -64,6 +64,72 @@ namespace ArchSample {
 
 auto plus = std::plus<int>();
 
+struct copy_only_value {
+    int value = 0;
+
+    copy_only_value() = default;
+    explicit copy_only_value(int v) : value(v) {}
+    copy_only_value(const copy_only_value&) = default;
+    copy_only_value(copy_only_value&&) = delete;
+    copy_only_value& operator=(const copy_only_value&) = default;
+    copy_only_value& operator=(copy_only_value&&) = delete;
+};
+
+struct copy_only_value_initialized {
+    int value;
+
+    copy_only_value_initialized() = default;
+    copy_only_value_initialized(const copy_only_value_initialized&) noexcept = default;
+    copy_only_value_initialized(copy_only_value_initialized&&) = delete;
+};
+
+struct throwing_move_copyable_value {
+    int value = 0;
+
+    throwing_move_copyable_value() noexcept = default;
+    throwing_move_copyable_value(const throwing_move_copyable_value&) noexcept = default;
+    throwing_move_copyable_value(throwing_move_copyable_value&&) { throw 1; }
+};
+
+struct asymmetric_assignment_value {
+    int value = 0;
+
+    asymmetric_assignment_value() = default;
+    explicit asymmetric_assignment_value(int v) : value(v) {}
+    asymmetric_assignment_value(const asymmetric_assignment_value&) = default;
+    asymmetric_assignment_value(asymmetric_assignment_value&&) = default;
+    asymmetric_assignment_value& operator=(const asymmetric_assignment_value& other) noexcept {
+        value = other.value;
+        return *this;
+    }
+    asymmetric_assignment_value& operator=(asymmetric_assignment_value&) { throw 1; }
+};
+
+struct non_default_forwarded_value {
+    int value;
+
+    explicit non_default_forwarded_value(int v) : value(v) {}
+    non_default_forwarded_value(const non_default_forwarded_value&) = default;
+    non_default_forwarded_value(non_default_forwarded_value&&) = default;
+};
+
+#if OOX_EXCEPTIONS_ENABLED
+struct throwing_var_assignment_value {
+    int value = 0;
+
+    throwing_var_assignment_value() = default;
+    explicit throwing_var_assignment_value(int v) : value(v) {}
+    throwing_var_assignment_value(const throwing_var_assignment_value&) = default;
+    throwing_var_assignment_value(throwing_var_assignment_value&&) = default;
+    throwing_var_assignment_value& operator=(const throwing_var_assignment_value&) {
+        throw std::runtime_error("copy assignment failed");
+    }
+    throwing_var_assignment_value& operator=(throwing_var_assignment_value&&) {
+        throw std::runtime_error("move assignment failed");
+    }
+};
+#endif
+
 TEST(OOX, Simple) {
     const oox::var<int> a = oox::run(plus, 2, 3);
     oox::var<int> b = oox::run(plus, 1, a);
@@ -123,6 +189,91 @@ TEST(OOX, Consistency) {
 TEST(OOX, ConsistencyInfLoop) {
     const oox::var<int> tmp = 1;
     ASSERT_EQ(oox::wait_and_get(tmp), 1);
+}
+
+TEST(OOX, VarStorageKeepsFlagsInPointerTags) {
+    static_assert(sizeof(oox::internal::var_storage) == sizeof(void*));
+    static_assert(std::is_trivially_copyable_v<oox::internal::var_storage>);
+    static_assert(alignof(oox::internal::result_state<unsigned char>) >=
+                  oox::internal::var_storage_pointer_alignment);
+
+    alignas(4) unsigned char slot[4]{};
+    oox::internal::var_storage direct(slot, false, false);
+    oox::internal::var_storage forwarded(slot, true, false);
+    oox::internal::var_storage initializing(slot, false, true);
+    oox::internal::var_storage both(slot, true, true);
+
+    EXPECT_EQ(direct.tagged_ptr, reinterpret_cast<std::uintptr_t>(slot));
+    EXPECT_EQ(forwarded.ptr(), slot);
+    EXPECT_TRUE(forwarded.forwarded());
+    EXPECT_EQ(initializing.ptr(), slot);
+    EXPECT_TRUE(initializing.initialize_if_empty());
+    EXPECT_TRUE(both.forwarded());
+    EXPECT_TRUE(both.initialize_if_empty());
+}
+
+TEST(OOX, ValueAssignmentPublishesDeferredVar) {
+    oox::var<int> value(oox::deferred);
+    auto reader = oox::run(plus, 1, value);
+    const int published = 41;
+    value = published;
+    ASSERT_EQ(oox::wait_and_get(value), 41);
+    ASSERT_EQ(oox::wait_and_get(reader), 42);
+}
+
+TEST(OOX, ValueAssignmentSerializesAfterReader) {
+    oox::var<int> value(1);
+    auto reader = oox::run([](int input) { return input; }, value);
+    value = 7;
+    ASSERT_EQ(oox::wait_and_get(reader), 1);
+    ASSERT_EQ(oox::wait_and_get(value), 7);
+}
+
+TEST(OOX, CopyOnlyAssignmentUsesTheCopyOverload) {
+    copy_only_value initial(1);
+    copy_only_value replacement(42);
+    oox::var<copy_only_value> value(initial);
+    value = replacement;
+    ASSERT_EQ(oox::wait_and_get(value).value, 42);
+}
+
+TEST(OOX, CopyAssignmentUsesTheConstQualifiedExpression) {
+    asymmetric_assignment_value initial(1);
+    const asymmetric_assignment_value replacement(42);
+    oox::var<asymmetric_assignment_value, false> value(initial);
+    value = replacement;
+    ASSERT_EQ(oox::wait_and_get(value).value, 42);
+}
+
+TEST(OOX, LazyMaterializationUsesValueInitializationAndSafeCopy) {
+    oox::var<copy_only_value_initialized, false> initialized;
+    oox::run<false>([](copy_only_value_initialized& value) noexcept {
+        ++value.value;
+    }, initialized);
+    ASSERT_EQ(oox::wait_and_get(initialized).value, 1);
+
+    oox::var<throwing_move_copyable_value, false> copied;
+    oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 42;
+    }, copied);
+    ASSERT_EQ(oox::wait_and_get(copied).value, 42);
+}
+
+TEST(OOX, CallableDefaultArgumentsMayBeOmitted) {
+    auto omitted = oox::run<false>([](int value = 42) noexcept { return value; });
+    auto partial = oox::run<false>([](int first, int second = 2) noexcept {
+        return first + second;
+    }, 40);
+    ASSERT_EQ(oox::wait_and_get(omitted), 42);
+    ASSERT_EQ(oox::wait_and_get(partial), 42);
+}
+
+TEST(OOX, PopulatedNonDefaultConstructibleVarCanBeForwarded) {
+    auto forwarded = oox::run<false>([]() noexcept -> oox::var<non_default_forwarded_value, false> {
+        non_default_forwarded_value value(42);
+        return oox::var<non_default_forwarded_value, false>(value);
+    });
+    ASSERT_EQ(oox::wait_and_get(forwarded).value, 42);
 }
 
 
@@ -188,11 +339,11 @@ TEST(OOX, DeferredForwardingLayer) {
 
     oox::var<int> a(oox::deferred);
 
-    auto inner = [](oox::var<int> aa) -> oox::var<int> {
+    auto inner = [](int aa) -> oox::var<int> {
         return oox::run(plus, 1, aa);            // aa + 1
     };
 
-    auto outer = [inner](oox::var<int> aa) -> oox::var<int> {
+    auto outer = [inner](int aa) -> oox::var<int> {
         // creates a forwarding task
         return oox::run(inner, aa);
     };
@@ -230,11 +381,48 @@ struct dummy_exception final : std::exception {
     [[nodiscard]] const char* what() const noexcept override { return "dummy throw"; }
 };
 
+struct throwing_int_conversion {
+    throwing_int_conversion(int) { throw dummy_exception{}; }
+};
+
 TEST(OOX, ExceptionReturnRethrowsOriginal) {
     oox::var<int> a = oox::run([]() -> int {
         throw dummy_exception{};
     });
     EXPECT_THROW(oox::wait_and_get(a), dummy_exception);
+}
+
+TEST(OOX, ExceptionCrossTypeConversionBecomesGraphFailure) {
+    oox::var<int, true> value(1);
+    auto converted = oox::run<true>([](throwing_int_conversion) noexcept {}, value);
+    EXPECT_THROW(oox::wait_for_all(converted), dummy_exception);
+}
+
+TEST(OOX, ExceptionCallableDefaultArgumentsMayBeOmitted) {
+    auto omitted = oox::run<true>([](int value = 42) noexcept { return value; });
+    auto partial = oox::run<true>([](int first, int second = 2) noexcept {
+        return first + second;
+    }, 40);
+    EXPECT_EQ(oox::wait_and_get(omitted), 42);
+    EXPECT_EQ(oox::wait_and_get(partial), 42);
+}
+
+TEST(OOX, ExceptionNonThrowingRecoveryUsesSafeCopyMaterialization) {
+    auto recovered = oox::run<true>([]() -> oox::var<throwing_move_copyable_value, true> {
+        throw dummy_exception{};
+    });
+    auto done = oox::run<false>([](throwing_move_copyable_value& value) noexcept {
+        value.value = 42;
+    }, recovered);
+    EXPECT_NO_THROW(oox::wait_for_all(done));
+    EXPECT_EQ(oox::wait_and_get(recovered).value, 42);
+}
+
+TEST(OOX, ExceptionEmptyNonMaterializableForwardedVarIsGraphFailure) {
+    auto empty = oox::run<true>([]() -> oox::var<non_default_forwarded_value, true> {
+        return {};
+    });
+    EXPECT_THROW(oox::wait_for_all(empty), oox::empty_forwarded_var);
 }
 
 TEST(OOX, ExceptionPropagatesThroughChainAndSkipsUserCode) {
@@ -862,6 +1050,31 @@ TEST(OOX, ExceptionForwardingThrowsBeforeReturningVar) {
     oox::var<int> r = oox::run(bad_forward, a);
 
     EXPECT_THROW(oox::wait_and_get(r), dummy_exception);
+}
+
+TEST(OOX, ExceptionForwardedFailureCanBeRecovered) {
+    auto written = oox::run<true>([]() -> oox::var<int, true> {
+        throw dummy_exception{};
+    });
+    oox::run<true>([](int& value) { value = 42; }, written);
+    EXPECT_EQ(oox::wait_and_get(written), 42);
+
+    auto assigned = oox::run<true>([]() -> oox::var<int, true> {
+        throw dummy_exception{};
+    });
+    assigned = 43;
+    EXPECT_EQ(oox::wait_and_get(assigned), 43);
+}
+
+TEST(OOX, ExceptionThrowingValueAssignmentPropagates) {
+    oox::var<throwing_var_assignment_value, true> copied(throwing_var_assignment_value{1});
+    const throwing_var_assignment_value replacement(2);
+    copied = replacement;
+    EXPECT_THROW((void)oox::wait_and_get(copied), oox::cancelled_by_exception);
+
+    oox::var<throwing_var_assignment_value, true> moved(throwing_var_assignment_value{1});
+    moved = throwing_var_assignment_value{2};
+    EXPECT_THROW((void)oox::wait_and_get(moved), oox::cancelled_by_exception);
 }
 
 TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {

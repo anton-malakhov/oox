@@ -20,6 +20,7 @@ FetchContent_MakeAvailable(googletest)
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
 option(OOX_BUILD_TESTS "Enables builds of tests" ON)
+option(OOX_BUILD_EXAMPLES "Enables builds of examples" ON)
 option(OOX_BUILD_TWIST_TESTS "Build Twist-based concurrency tests" OFF)
 option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_ENABLE_EIGEN "Enable the bundled Eigen work-stealing backend" ON)
@@ -188,6 +189,10 @@ endif (OOX_BUILD_TESTS)
 if (OOX_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
 endif (OOX_BUILD_BENCHMARKS)
+
+if (OOX_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif (OOX_BUILD_EXAMPLES)
 
 # -----------------------------------------------------------------------------
 # create find_package(OOX CONFIG)
