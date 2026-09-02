@@ -17,7 +17,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Dependencies
-      run: sudo apt update && sudo apt install cmake clang-19
+      run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev
     - name: Configure scheduler evaluations
       run: >
         cmake -S . -B build-scheduler-eval
