@@ -12,6 +12,25 @@ on:
       - synchronize
       - reopened
 jobs:
+  scheduler-eval:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Dependencies
+      run: sudo apt update && sudo apt install cmake clang-19
+    - name: Configure scheduler evaluations
+      run: >
+        cmake -S . -B build-scheduler-eval
+        -DCMAKE_CXX_COMPILER=clang++-19
+        -DOOX_BUILD_TESTS=OFF -DOOX_BUILD_BENCHMARKS=ON
+        -DOOX_BUILD_TASKBENCH=OFF -DOOX_BUILD_SCHEDULER_EVALS=ON
+        -DOOX_ENABLE_TBB=OFF -DOOX_ENABLE_TF=OFF
+        -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=OFF
+    - name: Build scheduler evaluations
+      run: cmake --build build-scheduler-eval -j 8
+    - name: Test scheduler evaluations
+      run: ctest --test-dir build-scheduler-eval --output-on-failure -R EIGEN
+
   build:
     runs-on: ${{ matrix.os }}
 

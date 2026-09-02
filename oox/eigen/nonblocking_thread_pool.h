@@ -39,23 +39,24 @@ namespace oox::detail::eigen_pool {
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
+  virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
 };
 
 template <typename F> struct UniqueTask : Task {
 
-  UniqueTask(F &&f) : f(std::move(f)) {}
+  template <typename G> explicit UniqueTask(G &&f) : f(std::forward<G>(f)) {}
 
   void operator()() override {
+    std::unique_ptr<UniqueTask> self(this);
     f();
-    delete this; // really safe to do heere
   }
 
-  std::decay_t<F> f;
+  F f;
 };
 
 template <typename F> Task *MakeTask(F &&f) {
-  return new UniqueTask<decltype(std::forward<F>(f))>{std::forward<F>(f)};
+  return new UniqueTask<std::decay_t<F>>{std::forward<F>(f)};
 }
 
 // This defines an interface that ThreadPoolDevice can take to use
@@ -156,11 +157,12 @@ public:
   }
 
   void RunOnThread(TaskPtr t, size_t threadIndex) {
+    // The target is a placement hint: another worker may steal the task.
     if (t == nullptr) {
       return;
     }
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
     threadIndex = threadIndex % num_threads_;
@@ -176,7 +178,7 @@ public:
     }
     AssertBounds(start, limit);
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
 
@@ -329,7 +331,12 @@ private:
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
-    (*p)();
+    try {
+      (*p)();
+    } catch (...) {
+      // Pool tasks are fire-and-forget. Isolate an unhandled task exception so
+      // one callback cannot terminate the worker thread or the process.
+    }
   }
 
   void AssertBounds(int start, int end) {
@@ -520,6 +527,7 @@ private:
       }
     } catch (...) {
       outstanding.fetch_sub(1, std::memory_order_relaxed);
+      task->Discard();
       throw;
     }
     WakeOneWorker();
@@ -558,7 +566,7 @@ private:
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
     assert(outstanding != nullptr);
-    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
+    const size_t previous = outstanding->fetch_sub(1, std::memory_order_seq_cst);
     assert(previous > 0);
     if (previous == 1 && done_.load(std::memory_order_acquire) &&
         NoOutstandingTasks()) {
@@ -598,7 +606,7 @@ private:
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
         auto *outstanding = task->outstanding;
-        delete task;
+        task->Discard();
         outstanding->fetch_sub(1, std::memory_order_relaxed);
       }
     }
@@ -607,7 +615,7 @@ private:
       TaskPtr task = overflow_tasks_.front();
       overflow_tasks_.pop_front();
       auto *outstanding = task->outstanding;
-      delete task;
+      task->Discard();
       outstanding->fetch_sub(1, std::memory_order_relaxed);
     }
     assert(NoOutstandingTasks());

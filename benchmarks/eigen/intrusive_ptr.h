@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 template <typename T> struct IntrusivePtr {
 
@@ -99,7 +101,7 @@ bool operator!=(T *a, IntrusivePtr<U> const &b) noexcept {
 
 template <class T>
 bool operator<(IntrusivePtr<T> const &a, IntrusivePtr<T> const &b) noexcept {
-  return std::less<T *>(a.get(), b.get());
+  return std::less<T *>{}(a.get(), b.get());
 }
 
 template <class T> void swap(IntrusivePtr<T> &a, IntrusivePtr<T> &b) noexcept {

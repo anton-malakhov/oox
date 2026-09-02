@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "workloads.h"
+#include "benchmarks/eigen/intrusive_ptr.h"
 
 #include <cmath>
 #include <cstddef>
@@ -39,12 +40,20 @@ bool CheckSpmv() {
   return true;
 }
 
+struct PointerValue : intrusive_ref_counter<PointerValue> {};
+
+bool CheckIntrusivePtrOrdering() {
+  IntrusivePtr<PointerValue> left(new PointerValue);
+  IntrusivePtr<PointerValue> right(new PointerValue);
+  return left < right || right < left;
+}
+
 } // namespace
 
 int main() {
   scheduler_eval::Initialize();
   const std::vector<double> values(1003, 1.25);
-  const bool ok = CheckScan() && CheckSpmv() &&
+  const bool ok = CheckScan() && CheckSpmv() && CheckIntrusivePtrOrdering() &&
                   Close(scheduler_eval::BlockedReduce(values, 37), 1253.75);
   if (!ok)
     std::cerr << "scheduler evaluation correctness test failed\n";
