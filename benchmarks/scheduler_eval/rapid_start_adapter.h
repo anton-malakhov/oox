@@ -62,6 +62,9 @@ public:
   explicit Runtime(std::size_t threads)
       : threads_(Validate(threads)), state_(EigenPool()),
         group_{&state_, {0, static_cast<unsigned>(threads_)}} {
+#if EIGEN_MODE == EIGEN_RAPID_RESIDENT
+    rapid::PrepareResidentGroup(group_);
+#endif
     Run(0, threads_, [](std::size_t) {});
   }
 
@@ -71,7 +74,9 @@ public:
     if (from >= to) {
       return;
     }
-#if EIGEN_MODE == EIGEN_RAPID
+#if EIGEN_MODE == EIGEN_RAPID_RESIDENT
+    rapid::ParallelForResident(group_, from, to, std::forward<F>(func));
+#elif EIGEN_MODE == EIGEN_RAPID
     rapid::ParallelFor(group_, from, to, std::forward<F>(func));
 #elif EIGEN_MODE == EIGEN_RAPID_MAILBOX
     rapid::ParallelForMailbox(group_, from, to, std::forward<F>(func), grain);

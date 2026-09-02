@@ -22,6 +22,35 @@ void Launch(benchmark::State &state) {
                 [](std::size_t i) { benchmark::DoNotOptimize(i); });
 }
 
+#ifdef EIGEN_MODE
+void MixedOrdinary(benchmark::State &state) {
+  const auto ordinary_tasks = static_cast<std::size_t>(state.range(0));
+  const auto ordinary_work = static_cast<std::size_t>(state.range(1));
+  const auto parallel_tasks = static_cast<std::size_t>(state.range(2));
+  const auto parallel_work = static_cast<std::size_t>(state.range(3));
+  for (auto _ : state) {
+    std::atomic<std::size_t> remaining{ordinary_tasks};
+    for (std::size_t task = 0; task < ordinary_tasks; ++task) {
+      EigenPool().Schedule(oox::detail::eigen_pool::MakeTask([&] {
+        for (std::size_t work = 0; work < ordinary_work; ++work)
+          CpuRelax();
+        if (remaining.fetch_sub(1, std::memory_order_release) == 1)
+          EigenPool().NotifyTaskCompletion();
+      }));
+    }
+    ParallelFor(0, parallel_tasks, [&](std::size_t) {
+      for (std::size_t work = 0; work < parallel_work; ++work)
+        CpuRelax();
+    });
+    EigenPool().Wait(
+        [&] { return remaining.load(std::memory_order_acquire) == 0; });
+  }
+  state.SetItemsProcessed(state.iterations() *
+                          (ordinary_tasks * ordinary_work +
+                           parallel_tasks * parallel_work));
+}
+#endif
+
 enum class SpinPayload { Relax, Atomic, DistributedRead, ThreadLocal };
 
 const SparseMatrix &CachedSparseMatrix(std::size_t rows, std::size_t columns,
@@ -147,6 +176,16 @@ BENCHMARK(Launch)
     ->RangeMultiplier(4)
     ->Range(64, 1 << 18)
     ->UseRealTime();
+#ifdef EIGEN_MODE
+BENCHMARK(MixedOrdinary)
+    ->Setup(Setup)
+    ->ArgNames({"ordinary_tasks", "ordinary_work", "parallel_tasks",
+               "parallel_work"})
+    ->Args({1, 1 << 15, 1 << 13, 64})
+    ->Args({4, 1 << 15, 1 << 13, 64})
+    ->Args({8, 1 << 15, 1 << 13, 64})
+    ->UseRealTime();
+#endif
 BENCHMARK_TEMPLATE(Spin, SpinPayload::Relax)
     ->Setup(Setup) SCHEDULER_SPIN_ARGS(1)
     ->UseRealTime();

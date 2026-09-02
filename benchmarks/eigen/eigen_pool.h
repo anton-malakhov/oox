@@ -8,8 +8,14 @@
 #include "oox/eigen/nonblocking_thread_pool.h"
 
 inline oox::detail::eigen_pool::ThreadPool& EigenPool() {
+#if EIGEN_MODE == EIGEN_RAPID_RESIDENT
+  static auto pool = oox::detail::eigen_pool::ThreadPool(
+      GetNumThreads(), true, true,
+      oox::detail::eigen_pool::WorkerIdleMode::ResidentBusy);
+#else
   static auto pool =
       oox::detail::eigen_pool::ThreadPool(GetNumThreads(), true, true);
+#endif
   return pool;
 }
 

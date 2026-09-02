@@ -6,6 +6,7 @@
 #include "rapid_start_model.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -966,6 +967,148 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end,
     }
   };
   ParallelForRanges(group, begin, end, ranges);
+}
+
+inline thread_local RapidDomainState *current_resident_state = nullptr;
+
+class ScopedResidentState {
+public:
+  explicit ScopedResidentState(RapidDomainState &state) noexcept
+      : previous_(std::exchange(current_resident_state, &state)) {}
+  ~ScopedResidentState() { current_resident_state = previous_; }
+
+private:
+  RapidDomainState *previous_;
+};
+
+template <typename F> class ResidentRegion final : public ResidentTask {
+public:
+  ResidentRegion(RapidDomainState &state, F &function, size_t begin, size_t end,
+                 size_t slots, size_t helpers) noexcept
+      : state_(state), function_(function), begin_(begin), end_(end),
+        slots_(slots), remaining_(helpers) {}
+
+  void Run(size_t slot) noexcept final {
+    RunSlot(slot);
+  }
+
+  void RunCaller() noexcept { RunSlot(0); }
+
+  std::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
+
+  bool IsComplete() const noexcept {
+    return remaining_.load(std::memory_order_acquire) == 0;
+  }
+
+  void Rethrow() {
+    std::lock_guard<std::mutex> lock(exception_mutex_);
+    if (exception_) {
+      std::rethrow_exception(exception_);
+    }
+  }
+
+private:
+  void RunSlot(size_t slot) noexcept {
+    ScopedResidentState context(state_);
+    const size_t work = end_ - begin_;
+    const size_t quotient = work / slots_;
+    const size_t remainder = work % slots_;
+    const size_t first =
+        begin_ + slot * quotient + std::min(slot, remainder);
+    const size_t last = first + quotient + (slot < remainder ? 1 : 0);
+    try {
+      for (size_t index = first;
+           index < last && !state_.Pool().IsCancelled(); ++index) {
+        if (((index - first) & 63) == 0 &&
+            cancelled_.load(std::memory_order_acquire)) {
+          break;
+        }
+        std::invoke(function_, index);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(exception_mutex_);
+      if (!exception_) {
+        exception_ = std::current_exception();
+        cancelled_.store(true, std::memory_order_release);
+      }
+    }
+  }
+
+  RapidDomainState &state_;
+  F &function_;
+  size_t begin_;
+  size_t end_;
+  size_t slots_;
+  std::atomic<size_t> remaining_;
+  std::atomic<bool> cancelled_{false};
+  std::mutex exception_mutex_;
+  std::exception_ptr exception_;
+};
+
+inline void PrepareResidentGroup(RapidStartGroup group) {
+  group.Validate();
+  ThreadPool &pool = group.state->Pool();
+  if (!pool.UsesResidentBusyWait()) {
+    throw std::invalid_argument("resident Rapid requires a resident-busy pool");
+  }
+  const size_t current = pool.CurrentThreadId();
+  const size_t expected =
+      group.domain.Size() - (current < pool.NumThreads() &&
+                                     group.domain.Contains(current)
+                                 ? 1
+                                 : 0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool.ResidentAvailableWorkers(group.domain) < expected &&
+         !pool.IsCancelled()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error("resident Rapid workers did not become ready");
+    }
+    std::this_thread::yield();
+  }
+}
+
+template <typename F>
+void ParallelForResident(RapidStartGroup group, size_t begin, size_t end,
+                         F &&function) {
+  if (group.IsEmpty() || begin >= end) {
+    return;
+  }
+  group.Validate();
+  ThreadPool &pool = group.state->Pool();
+  if (!pool.UsesResidentBusyWait()) {
+    ParallelFor(group, begin, end, std::forward<F>(function));
+    return;
+  }
+  if (current_resident_state == group.state || group.domain.Size() == 1) {
+    for (size_t index = begin; index < end && !pool.IsCancelled(); ++index) {
+      std::invoke(function, index);
+    }
+    return;
+  }
+  constexpr size_t kMaximumParticipants = 64;
+  // The pool may contain arbitrarily many 64-bit availability words. A single
+  // invocation deliberately keeps one compact completion cohort.
+  const size_t slots = std::min(
+      {end - begin, group.domain.Size(), kMaximumParticipants});
+  std::array<unsigned, kMaximumParticipants - 1> workers{};
+  const size_t helpers = pool.ClaimResidentWorkers(
+      group.domain, workers.data(), slots - 1);
+  using Function = std::remove_reference_t<F>;
+  Function &callable = function;
+  ResidentRegion<Function> region(*group.state, callable, begin, end,
+                                  helpers + 1, helpers);
+  for (size_t helper = 0; helper < helpers; ++helper) {
+    pool.PublishResident(region, region.CompletionCounter(), workers[helper],
+                         helper + 1);
+  }
+  region.RunCaller();
+  while (!region.IsComplete()) {
+    if (!pool.TryExecuteSomething()) {
+      std::this_thread::yield();
+    }
+  }
+  region.Rethrow();
 }
 
 template <typename F>

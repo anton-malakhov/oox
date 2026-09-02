@@ -54,6 +54,8 @@ inline std::string GetParallelMode() {
 // Fixed block with alternative victim orders.
 #define EIGEN_RAPID_LAZY_HIERARCHICAL 15
 #define EIGEN_RAPID_LAZY_PRESSURE 16
+// Dedicated busy-wait pool with a 64-participant resident availability mask.
+#define EIGEN_RAPID_RESIDENT 17
 
 #define TASKFLOW_GUIDED 1
 #define TASKFLOW_DYNAMIC 2

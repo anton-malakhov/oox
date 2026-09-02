@@ -21,6 +21,7 @@
 #include "stl_thread_env.h"
 
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -45,6 +46,10 @@ namespace oox::detail::eigen_pool {
 namespace rapid {
 class RapidDomainState;
 }
+
+// ResidentBusy is an explicit pool-lifetime policy. Idle workers advertise a
+// bit and poll a command slot instead of entering the OS parking protocol.
+enum class WorkerIdleMode { Park, ResidentBusy };
 
 struct DomainId {
   unsigned start = 0;
@@ -93,6 +98,12 @@ public:
   virtual RegionContext *Context() noexcept = 0;
   virtual Task *FallbackTicket() noexcept = 0;
   virtual ~RapidTask() = default;
+};
+
+class ResidentTask {
+public:
+  virtual void Run(size_t slot) noexcept = 0;
+  virtual ~ResidentTask() = default;
 };
 
 class RapidTicketGuard {
@@ -200,11 +211,25 @@ public:
 
   ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
                   Environment env = Environment())
+      : ThreadPoolTempl(num_threads, allow_spinning, use_main_thread,
+                        WorkerIdleMode::Park, env) {}
+
+  ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
+                  WorkerIdleMode idle_mode, Environment env = Environment())
       : env_(env), num_threads_(ValidateThreadCount(num_threads)),
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
         global_steal_partition_(EncodePartition(0, num_threads_)),
-        pool_generation_(NextPoolGeneration()), done_(false),
+        pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
+        resident_available_words_(
+            idle_mode_ == WorkerIdleMode::ResidentBusy
+                ? (static_cast<size_t>(num_threads_) + 63) / 64
+                : 0),
+        resident_available_(resident_available_words_ == 0
+                                ? nullptr
+                                : std::make_unique<std::atomic<uint64_t>[]>(
+                                      resident_available_words_)),
+        done_(false),
         cancelled_(false) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
@@ -218,6 +243,9 @@ public:
       ComputeCoprimes(i, &all_coprimes_.back());
     }
     thread_data_.resize(num_threads_);
+    for (size_t word = 0; word < resident_available_words_; ++word) {
+      resident_available_[word].store(0, std::memory_order_relaxed);
+    }
     for (int i = 0; i < num_threads_; i++) {
       SetStealPartition(i, EncodePartition(0, num_threads_));
     }
@@ -434,6 +462,72 @@ public:
 
   bool IsCancelled() const noexcept {
     return cancelled_.load(std::memory_order_acquire);
+  }
+
+  bool UsesResidentBusyWait() const noexcept {
+    return idle_mode_ == WorkerIdleMode::ResidentBusy;
+  }
+
+  size_t ResidentAvailableWorkers(DomainId domain) const noexcept {
+    size_t available = 0;
+    for (size_t word = 0; word < resident_available_words_; ++word) {
+      available += std::popcount(
+          resident_available_[word].load(std::memory_order_acquire) &
+          ResidentDomainMask(word, domain));
+    }
+    return available;
+  }
+
+  size_t ClaimResidentWorkers(DomainId domain, unsigned *workers,
+                              size_t capacity) noexcept {
+    if (idle_mode_ != WorkerIdleMode::ResidentBusy || capacity == 0) {
+      return 0;
+    }
+    // The word index is worker / 64 and the bit is worker % 64. Rotating both
+    // starting positions avoids repeatedly favoring low-numbered workers.
+    const size_t ticket = resident_claim_cursor_.fetch_add(
+        std::max<size_t>(capacity, 1), std::memory_order_relaxed);
+    const size_t first_word = (ticket / 64) % resident_available_words_;
+    const unsigned first_bit = static_cast<unsigned>(ticket % 64);
+    size_t claimed = 0;
+    for (size_t offset = 0;
+         offset < resident_available_words_ && claimed < capacity; ++offset) {
+      const size_t word = (first_word + offset) % resident_available_words_;
+      const uint64_t allowed = ResidentDomainMask(word, domain);
+      uint64_t observed =
+          resident_available_[word].load(std::memory_order_acquire);
+      while (observed & allowed) {
+        const uint64_t candidates = observed & allowed;
+        uint64_t selected = 0;
+        for (unsigned step = 0;
+             step < 64 && std::popcount(selected) < capacity - claimed;
+             ++step) {
+          const unsigned bit = (first_bit + step) % 64;
+          selected |= candidates & (uint64_t{1} << bit);
+        }
+        if (resident_available_[word].compare_exchange_weak(
+                observed, observed & ~selected, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+          while (selected != 0) {
+            const unsigned bit = std::countr_zero(selected);
+            workers[claimed++] = static_cast<unsigned>(word * 64 + bit);
+            selected &= selected - 1;
+          }
+          break;
+        }
+      }
+    }
+    return claimed;
+  }
+
+  void PublishResident(ResidentTask &task, std::atomic<size_t> &completion,
+                       unsigned worker, size_t slot) noexcept {
+    assert(worker < static_cast<unsigned>(num_threads_));
+    ThreadData &data = thread_data_[worker];
+    assert(data.resident_task.load(std::memory_order_relaxed) == nullptr);
+    data.resident_slot = slot;
+    data.resident_completion = &completion;
+    data.resident_task.store(&task, std::memory_order_release);
   }
 
   void ScheduleRapid(RapidTask *rapid, size_t target) {
@@ -751,7 +845,8 @@ private:
     ThreadData()
         : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
           mailbox(1024), rapid_publication_state(0), rapid_slot(nullptr),
-          rapid_overflow(1024) {}
+          rapid_overflow(1024), resident_task(nullptr),
+          resident_ordinary(false) {}
     std::unique_ptr<Thread> thread;
     std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
@@ -761,6 +856,10 @@ private:
     std::atomic<size_t> rapid_publication_state;
     std::atomic<RapidTask *> rapid_slot;
     rigtorp::mpmc::Queue<RapidTask *> rapid_overflow;
+    std::atomic<ResidentTask *> resident_task;
+    size_t resident_slot = 0;
+    std::atomic<size_t> *resident_completion = nullptr;
+    std::atomic<bool> resident_ordinary;
 
     bool PushRapid(RapidTask *task) {
       RapidTask *empty = nullptr;
@@ -835,6 +934,10 @@ private:
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   unsigned global_steal_partition_;
   const uint64_t pool_generation_;
+  const WorkerIdleMode idle_mode_;
+  const size_t resident_available_words_;
+  std::unique_ptr<std::atomic<uint64_t>[]> resident_available_;
+  std::atomic<size_t> resident_claim_cursor_{0};
 
   std::once_flag cancellation_once_;
   std::mutex ordinary_cancellation_mutex_;
@@ -858,6 +961,8 @@ private:
 
   // Main worker thread loop. Returns true if processed some tasks
   bool WorkerLoop(bool external = false, bool once = false) {
+    PerThread *pt = GetPerThread();
+    assert(IsRegistered(pt));
     bool processed_anything = false;
     for (;;) {
       if (cancelled_.load(std::memory_order_acquire)) {
@@ -892,6 +997,13 @@ private:
         }
       }
       if (found_work) {
+        continue;
+      }
+
+      if (idle_mode_ == WorkerIdleMode::ResidentBusy) {
+        if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
+          processed_anything = true;
+        }
         continue;
       }
 
@@ -996,6 +1108,7 @@ private:
     if (!thread_data_[target].PushTask(task, local)) {
       return task;
     }
+    ReleaseOneResidentForOrdinary();
     if (wake) {
       WakeOneWorker();
     }
@@ -1068,6 +1181,90 @@ private:
     RapidTicketGuard release(*rapid);
     rapid->TryRun();
     return true;
+  }
+
+  static uint64_t ResidentDomainMask(size_t word, DomainId domain) noexcept {
+    const size_t word_begin = word * 64;
+    const size_t first = std::max(word_begin, static_cast<size_t>(domain.start));
+    const size_t last =
+        std::min(word_begin + 64, static_cast<size_t>(domain.limit));
+    if (first >= last) {
+      return 0;
+    }
+    const unsigned offset = static_cast<unsigned>(first - word_begin);
+    const unsigned count = static_cast<unsigned>(last - first);
+    const uint64_t bits = count == 64 ? ~uint64_t{0}
+                                      : (uint64_t{1} << count) - 1;
+    return bits << offset;
+  }
+
+  bool WithdrawResident(unsigned worker) noexcept {
+    const size_t word = worker / 64;
+    const uint64_t bit = uint64_t{1} << (worker % 64);
+    return (resident_available_[word].fetch_and(~bit,
+                                                std::memory_order_acq_rel) &
+            bit) != 0;
+  }
+
+  void ReleaseOneResidentForOrdinary() noexcept {
+    if (idle_mode_ != WorkerIdleMode::ResidentBusy) {
+      return;
+    }
+    unsigned worker = 0;
+    if (ClaimResidentWorkers({0, static_cast<unsigned>(num_threads_)}, &worker,
+                             1) == 1) {
+      thread_data_[worker].resident_ordinary.store(true,
+                                                   std::memory_order_release);
+    }
+  }
+
+  bool WaitResident(unsigned worker) noexcept {
+    ThreadData &data = thread_data_[worker];
+    const size_t word = worker / 64;
+    const uint64_t bit = uint64_t{1} << (worker % 64);
+    resident_available_[word].fetch_or(bit, std::memory_order_release);
+    bool processed = false;
+    if (!NoOutstandingTasks() && WithdrawResident(worker)) {
+      return processed;
+    }
+    for (;;) {
+      if (ResidentTask *task =
+              data.resident_task.exchange(nullptr, std::memory_order_acquire)) {
+        const size_t slot = data.resident_slot;
+        std::atomic<size_t> *completion = data.resident_completion;
+        assert(completion != nullptr);
+        task->Run(slot);
+        // A subsequent launch may claim this worker only after Run returned.
+        // Publishing availability before completion guarantees that a caller
+        // observing completion can immediately launch the next generation.
+        resident_available_[word].fetch_or(bit, std::memory_order_release);
+        completion->fetch_sub(1, std::memory_order_release);
+        processed = true;
+        if (!NoOutstandingTasks() && WithdrawResident(worker)) {
+          return processed;
+        }
+        continue;
+      }
+      if (data.resident_ordinary.exchange(false, std::memory_order_acquire)) {
+        return processed;
+      }
+      if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
+        if (WithdrawResident(worker)) {
+          return processed;
+        }
+      }
+      RelaxResidentWait();
+    }
+  }
+
+  static void RelaxResidentWait() noexcept {
+#if defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
   }
 
   static void DiscardPublishedTask(TaskPtr task) noexcept {

@@ -20,11 +20,14 @@ namespace {
 
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
+using oox::detail::eigen_pool::WorkerIdleMode;
 using oox::detail::eigen_pool::rapid::CalibratedTimespanSchedulingOverheadNs;
 using oox::detail::eigen_pool::rapid::ParallelFor;
 using oox::detail::eigen_pool::rapid::ParallelForLazyStealing;
 using oox::detail::eigen_pool::rapid::ParallelForMailbox;
+using oox::detail::eigen_pool::rapid::ParallelForResident;
 using oox::detail::eigen_pool::rapid::ParallelForTimespanLazyStealing;
+using oox::detail::eigen_pool::rapid::PrepareResidentGroup;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
 using oox::detail::eigen_pool::rapid::TimespanBlockSize;
@@ -34,8 +37,9 @@ using namespace std::chrono_literals;
 
 struct RapidHarness {
   explicit RapidHarness(unsigned workers, bool spinning = false,
-                        size_t slots_per_worker = 128)
-      : pool(static_cast<int>(workers), spinning, false),
+                        size_t slots_per_worker = 128,
+                        WorkerIdleMode idle_mode = WorkerIdleMode::Park)
+      : pool(static_cast<int>(workers), spinning, false, idle_mode),
         state(pool, slots_per_worker),
         group{&state, {0, workers}} {}
 
@@ -291,6 +295,58 @@ TEST(EigenRapidStart, ElasticLendingLeasesWholeTopologySubtrees) {
   left.Reset();
   EXPECT_TRUE(harness.state.TryLeaseSubtree({0, 8}));
   EXPECT_FALSE(harness.state.TryLeaseSubtree({1, 7}));
+}
+
+TEST(EigenRapidResident, MatchesExactOnceOracleAcrossSmallRanges) {
+  RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  for (size_t size = 0; size <= 257; ++size) {
+    std::vector<std::atomic<unsigned>> visits(size);
+    ParallelForResident(harness.group, 0, size, [&](size_t index) {
+      visits[index].fetch_add(1, std::memory_order_relaxed);
+    });
+    for (size_t index = 0; index < size; ++index) {
+      ASSERT_EQ(visits[index].load(std::memory_order_relaxed), 1u)
+          << "size " << size << ", index " << index;
+    }
+  }
+}
+
+TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
+  RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  constexpr size_t tasks = 1000;
+  std::atomic<size_t> ordinary{0};
+  for (size_t task = 0; task < tasks; ++task) {
+    harness.pool.Schedule(MakeTask([&] {
+      ordinary.fetch_add(1, std::memory_order_relaxed);
+    }));
+  }
+  std::atomic<size_t> nested{0};
+  ParallelForResident(harness.group, 0, 128, [&](size_t outer) {
+    ParallelForResident(harness.group, 0, 3, [&](size_t inner) {
+      nested.fetch_add(outer + inner + 1, std::memory_order_relaxed);
+    });
+  });
+  harness.pool.Wait([&] { return ordinary.load() == tasks; });
+  EXPECT_EQ(ordinary.load(), tasks);
+  EXPECT_EQ(nested.load(), 25152u);
+}
+
+TEST(EigenRapidResident, PropagatesExceptionsAndSupportsLargePools) {
+  RapidHarness harness(65, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  EXPECT_THROW(ParallelForResident(harness.group, 0, 1024,
+                                   [](size_t index) {
+                                     if (index == 517) {
+                                       throw std::runtime_error("resident");
+                                     }
+                                   }),
+               std::runtime_error);
+  std::atomic<size_t> completed{0};
+  ParallelForResident(harness.group, 0, 4096,
+                      [&](size_t) { completed.fetch_add(1); });
+  EXPECT_EQ(completed.load(), 4096u);
 }
 
 enum class HybridPolicy : std::uint8_t {
