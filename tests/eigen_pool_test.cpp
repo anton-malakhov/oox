@@ -204,7 +204,7 @@ TEST(EigenPool, NestedWaitsMakeProgressWithAllWorkersOccupied) {
   EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
 }
 
-TEST(EigenPool, QueueOverflowDoesNotRecurseInline) {
+TEST(EigenPool, QueueSaturationCompletesAllTasks) {
   ThreadPool pool(2, false, false);
   constexpr int task_count = 5000;
   std::atomic<int> completed_count{0};
@@ -224,6 +224,31 @@ TEST(EigenPool, QueueOverflowDoesNotRecurseInline) {
 
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(completed_count.load(), task_count);
+}
+
+TEST(EigenPool, InlineFallbackReleasesPublicationBeforeCancellation) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> entered, release, completed;
+  auto release_result = release.get_future().share();
+  auto completed_result = completed.get_future();
+  pool.Schedule(MakeTask([&] {
+    entered.set_value();
+    release_result.wait();
+    completed.set_value();
+  }));
+  ASSERT_EQ(entered.get_future().wait_for(2s), std::future_status::ready);
+
+  for (int task = 0; task < 1024; ++task) {
+    pool.Schedule(MakeTask([] {}));
+  }
+  std::atomic<bool> cancelled{false};
+  pool.Schedule(MakeTask([&] {
+    pool.Cancel();
+    cancelled.store(true, std::memory_order_release);
+  }));
+  EXPECT_TRUE(cancelled.load(std::memory_order_acquire));
+  release.set_value();
+  EXPECT_EQ(completed_result.wait_for(2s), std::future_status::ready);
 }
 
 TEST(EigenPool, RapidOverflowUsesOrdinaryQueueFallback) {

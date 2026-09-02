@@ -25,7 +25,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -319,13 +318,19 @@ public:
 #if OOX_EIGEN_BATCHED_WAKE
       const bool wake_now = first_publication;
       first_publication = false;
-      PublishAdmittedTask(task, static_cast<int>(thread_index), local,
-                          wake_now);
-      if (!wake_now) {
+      TaskPtr inline_task = PublishAdmittedTask(
+          task, static_cast<int>(thread_index), local, wake_now);
+      if (!wake_now && !inline_task) {
         ++deferred;
       }
+      if (inline_task) {
+        ExecuteTask(inline_task);
+      }
 #else
-      PublishAdmittedTask(task, static_cast<int>(thread_index), local);
+      if (TaskPtr inline_task =
+              PublishAdmittedTask(task, static_cast<int>(thread_index), local)) {
+        ExecuteTask(inline_task);
+      }
 #endif
     };
     std::forward<F>(publisher)(publish_one);
@@ -436,34 +441,41 @@ public:
       return;
     }
     target %= static_cast<size_t>(num_threads_);
-    PublicationGuard publication(
-        thread_data_[target].rapid_publication_state);
-    if (!publication.IsAdmitted()) {
-      rapid->Cancel();
-      return;
-    }
-    if (cancelled_.load(std::memory_order_acquire)) {
-      rapid->Cancel();
-      return;
-    }
-    rapid->AddTickets(1);
-    if (thread_data_[target].PushRapid(rapid)) {
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(
+          thread_data_[target].rapid_publication_state);
+      if (!publication.IsAdmitted()) {
+        rapid->Cancel();
+        return;
+      }
       if (cancelled_.load(std::memory_order_acquire)) {
         rapid->Cancel();
+        return;
       }
-      WakeOneWorker();
-      return;
-    }
+      rapid->AddTickets(1);
+      if (thread_data_[target].PushRapid(rapid)) {
+        if (cancelled_.load(std::memory_order_acquire)) {
+          rapid->Cancel();
+        }
+        WakeOneWorker();
+        return;
+      }
 
-    TaskPtr fallback = rapid->FallbackTicket();
-    static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
-    try {
-      PublishAdmittedTask(fallback, static_cast<int>(target), false);
-    } catch (...) {
-      // Publication owns the extra ticket. On failure Discard cancels the
-      // activation and releases that ticket before the exception escapes.
-      fallback->Discard();
-      throw;
+      TaskPtr fallback = rapid->FallbackTicket();
+      static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
+      try {
+        inline_task =
+            PublishAdmittedTask(fallback, static_cast<int>(target), false);
+      } catch (...) {
+        // Publication owns the extra ticket. On failure Discard cancels the
+        // activation and releases that ticket before the exception escapes.
+        fallback->Discard();
+        throw;
+      }
+    }
+    if (inline_task) {
+      ExecuteTask(inline_task);
     }
   }
 
@@ -824,10 +836,8 @@ private:
   unsigned global_steal_partition_;
   const uint64_t pool_generation_;
 
-  std::mutex overflow_mutex_;
   std::once_flag cancellation_once_;
   std::mutex ordinary_cancellation_mutex_;
-  std::deque<TaskPtr> overflow_tasks_;
   EventCount worker_event_;
   EventCount waiter_event_;
   std::atomic<bool> done_;
@@ -963,42 +973,33 @@ private:
   }
 
   void PublishOrdinaryTask(TaskPtr task, int target, bool local) {
-    PublicationGuard publication(ordinary_publication_state_);
-    if (!publication.IsAdmitted() ||
-        cancelled_.load(std::memory_order_acquire)) {
-      task->Discard();
-      return;
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (!publication.IsAdmitted() ||
+          cancelled_.load(std::memory_order_acquire)) {
+        task->Discard();
+        return;
+      }
+      inline_task = PublishAdmittedTask(task, target, local);
     }
-    PublishAdmittedTask(task, target, local);
+    if (inline_task) {
+      ExecuteTask(inline_task);
+    }
   }
 
-  void PublishAdmittedTask(TaskPtr task, int target, bool local,
-                           bool wake = true) {
+  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local,
+                              bool wake = true) {
     auto &outstanding = thread_data_[target].outstanding_tasks;
     task->outstanding = &outstanding;
     outstanding.fetch_add(1, std::memory_order_relaxed);
-    try {
-      if (!thread_data_[target].PushTask(task, local)) {
-        std::lock_guard<std::mutex> lock(overflow_mutex_);
-        overflow_tasks_.push_back(task);
-      }
-    } catch (...) {
-      outstanding.fetch_sub(1, std::memory_order_relaxed);
-      throw;
+    if (!thread_data_[target].PushTask(task, local)) {
+      return task;
     }
     if (wake) {
       WakeOneWorker();
     }
-  }
-
-  TaskPtr PopOverflow() {
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    if (overflow_tasks_.empty()) {
-      return nullptr;
-    }
-    TaskPtr task = overflow_tasks_.front();
-    overflow_tasks_.pop_front();
-    return task;
+    return nullptr;
   }
 
   bool TryExecuteOne() {
@@ -1018,9 +1019,6 @@ private:
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
       task = thread_data_[pt->thread_id].PopFront();
-    }
-    if (!task) {
-      task = PopOverflow();
     }
     if (!task) {
       task = LocalSteal(true);
@@ -1129,12 +1127,6 @@ private:
         DiscardPublishedTask(task);
       }
     }
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    while (!overflow_tasks_.empty()) {
-      TaskPtr task = overflow_tasks_.front();
-      overflow_tasks_.pop_front();
-      DiscardPublishedTask(task);
-    }
   }
 
   void DrainCancelledOrdinaryQueues() {
@@ -1165,12 +1157,6 @@ private:
         DiscardPublishedTask(task);
       }
       data.FlushRapid();
-    }
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    while (!overflow_tasks_.empty()) {
-      TaskPtr task = overflow_tasks_.front();
-      overflow_tasks_.pop_front();
-      DiscardPublishedTask(task);
     }
     assert(NoOutstandingTasks());
   }

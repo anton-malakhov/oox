@@ -354,7 +354,7 @@ gate is optimal. OOX must estimate those quantities from its own traces.
 
 | Mode | Initial distribution | Grain and later balancing |
 | --- | --- | --- |
-| `RAPID_START` | Hierarchical region activation through rapid inboxes with ordinary-queue overflow fallback | Proportional contiguous worker/data subtrees with inherited nested domains |
+| `RAPID_START` | Hierarchical region activation through bounded rapid inboxes with ordinary inline backpressure | Proportional contiguous worker/data subtrees with inherited nested domains |
 | `RAPID_MAILBOX` | Rapid activation publishes adaptive, bounded range blocks to targeted ordinary mailboxes, then exits | Unrestricted deque stealing without recursive grain-one task creation |
 | `RAPID_LAZY_STEALING` | Rapid activation starts a proportional range on each worker and exposes it after the first local claim | Atomic adaptive block claims; a worker leaves its Rapid domain once, only when a started peer range has unclaimed work |
 | `RAPID_TIMESPAN_LAZY_STEALING` | The same protected Rapid owner ranges as lazy stealing | Each owner combines calibrated platform overhead, projected owner-range time, and live steal pressure, then publishes its smoothed block estimate to thieves |

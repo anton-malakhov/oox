@@ -86,7 +86,8 @@ The implementation also hardens the ordinary pool paths used by both the new
 and normal policies. Publication and cancellation have an explicit ordering;
 fallback tickets are drained; completion owns descriptor recycling; parked
 worker and external-waiter wakeups cannot consume one another's notifications;
-queue overflow preserves progress without recursive inline execution; and
+bounded queue saturation preserves progress through post-admission inline
+backpressure; and
 ordinary work receives a fairness opportunity during sustained Rapid traffic.
 
 ### From recursive tasks to bounded blocks
