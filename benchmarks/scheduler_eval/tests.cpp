@@ -182,11 +182,15 @@ bool CheckGranularityEstimator() {
 bool CheckSchedulerMetrics() {
 #ifdef EIGEN_MODE
   const auto before = EigenPool().GetStatistics();
-  std::atomic<std::size_t> completed{0};
-  ParallelFor(0, 4096, [&](std::size_t) { ++completed; });
+  std::atomic<bool> completed{false};
+  EigenPoolWrapper scheduler;
+  scheduler.run(
+      [&] { completed.store(true, std::memory_order_release); });
+  while (!completed.load(std::memory_order_acquire))
+    scheduler.execute_something_else();
   const auto after = EigenPool().GetStatistics();
-  return completed.load() == 4096 && after.scheduled > before.scheduled &&
-         after.scheduled - before.scheduled == after.executed - before.executed;
+  return after.scheduled - before.scheduled == 1 &&
+         after.executed - before.executed == 1;
 #else
   return true;
 #endif
