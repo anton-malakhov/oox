@@ -15,7 +15,7 @@ jobs:
   pbbs-applications:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Dependencies
       run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
     - name: Initialize PBBS
@@ -36,7 +36,7 @@ jobs:
   scheduler-eval:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Dependencies
       run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev
     - name: Configure scheduler evaluations
@@ -50,7 +50,7 @@ jobs:
     - name: Build scheduler evaluations
       run: cmake --build build-scheduler-eval -j 8
     - name: Test scheduler evaluations
-      run: ctest --test-dir build-scheduler-eval --output-on-failure -R EIGEN
+      run: ctest --test-dir build-scheduler-eval --output-on-failure -L scheduler-eval
 
   build:
     runs-on: ${{ matrix.os }}
@@ -88,7 +88,7 @@ jobs:
             c_compiler: cl
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Dependencies
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.

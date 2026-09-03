@@ -1,5 +1,6 @@
 set(OOX_SCHEDULER_EVAL_MODES)
 set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
+set(OOX_SCHEDULER_EVAL_TESTS)
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
@@ -54,6 +55,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   add_test(NAME ${benchmark_target}_smoke COMMAND ${benchmark_target}
     --benchmark_filter=Launch/64
     --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS ${benchmark_target}_smoke)
 
   foreach(tool scheduling_dist trace_spin)
     set(tool_target ${tool}_${mode})
@@ -65,6 +67,8 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     --scenario spin --iterations 1 --tasks-per-worker 2)
   add_test(NAME trace_spin_${mode}_smoke COMMAND trace_spin_${mode}
     --tasks 8 --work 8 --iterations 2)
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS
+    scheduling_dist_${mode}_smoke trace_spin_${mode}_smoke)
 
   # The tuner deliberately blocks one task per worker. Run it only with the
   # non-adaptive baseline: a timespan policy cannot split a blocked first task.
@@ -74,6 +78,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     add_executable(${tuner_target} timespan_tuner.cpp)
     oox_configure_scheduler_eval_target(${tuner_target} ${mode})
     add_test(NAME ${tuner_target}_smoke COMMAND ${tuner_target} --iterations 2)
+    list(APPEND OOX_SCHEDULER_EVAL_TESTS ${tuner_target}_smoke)
   endif()
 
   set(test_target test_scheduler_eval_${mode})
@@ -89,6 +94,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   endif()
   oox_configure_scheduler_eval_target(${test_target} ${mode})
   add_test(NAME ${test_target} COMMAND ${test_target})
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS ${test_target})
 
   if(NOT mode IN_LIST OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES)
     set(nested_test_target test_scheduler_eval_nested_${mode})
@@ -96,6 +102,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     add_executable(${nested_test_target} tests_nested.cpp)
     oox_configure_scheduler_eval_target(${nested_test_target} ${mode})
     add_test(NAME ${nested_test_target} COMMAND ${nested_test_target})
+    list(APPEND OOX_SCHEDULER_EVAL_TESTS ${nested_test_target})
   endif()
 endforeach()
 
@@ -116,6 +123,7 @@ if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
       --timeout 120
       --smoke)
   set_tests_properties(scheduler_eval_runner_smoke PROPERTIES TIMEOUT 180)
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_runner_smoke)
 endif()
 
 if(TBB_FOUND AND Python3_Interpreter_FOUND)
@@ -129,4 +137,10 @@ if(TBB_FOUND AND Python3_Interpreter_FOUND)
       --timeout 120
       --smoke)
   set_tests_properties(scheduler_eval_rapid_runner_smoke PROPERTIES TIMEOUT 180)
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_rapid_runner_smoke)
+endif()
+
+if(OOX_SCHEDULER_EVAL_TESTS)
+  set_tests_properties(${OOX_SCHEDULER_EVAL_TESTS}
+    PROPERTIES LABELS scheduler-eval)
 endif()

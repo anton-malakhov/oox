@@ -52,6 +52,11 @@ OOX_MODES = [
 ]
 
 
+def log_tail(path: Path, line_count: int = 100) -> str:
+    lines = path.read_text(errors="replace").splitlines()
+    return "\n".join(lines[-line_count:])
+
+
 def adapter_text():
     return r'''#ifndef PARLAY_INTERNAL_SCHEDULER_PLUGINS_EIGEN_H_
 #define PARLAY_INTERNAL_SCHEDULER_PLUGINS_EIGEN_H_
@@ -352,18 +357,26 @@ def main():
                     command.append("-small")
                 output = args.output / f"{backend}_{mode}.txt"
                 print(f"Writing {output}", flush=True)
-                with output.open("w") as stream:
-                    try:
+                try:
+                    with output.open("w") as stream:
                         subprocess.run(command, cwd=source, env=env, stdout=stream,
                                        stderr=subprocess.STDOUT, check=True,
                                        timeout=args.timeout)
-                    except subprocess.TimeoutExpired as error:
-                        raise RuntimeError(
-                            f"PBBS timed out after {args.timeout}s; inspect {output}"
-                        ) from error
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        f"PBBS timed out after {args.timeout}s. Log tail:\n"
+                        f"{log_tail(output)}"
+                    ) from error
+                except subprocess.CalledProcessError as error:
+                    raise RuntimeError(
+                        f"PBBS exited with status {error.returncode}. Log tail:\n"
+                        f"{log_tail(output)}"
+                    ) from error
                 log = output.read_text(errors="replace")
                 if "TEST TERMINATED ABNORMALLY" in log or "make: ***" in log:
-                    raise RuntimeError(f"PBBS reported a failure; inspect {output}")
+                    raise RuntimeError(
+                        f"PBBS reported a failure. Log tail:\n{log_tail(output)}"
+                    )
     finally:
         restore_checkout(source)
 
