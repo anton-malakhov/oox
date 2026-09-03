@@ -22,6 +22,9 @@
 
 #include <atomic>
 #include <cassert>
+#ifdef OOX_EIGEN_ENABLE_STATS
+#include <chrono>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -39,23 +42,24 @@ namespace oox::detail::eigen_pool {
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
+  virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
 };
 
 template <typename F> struct UniqueTask : Task {
 
-  UniqueTask(F &&f) : f(std::move(f)) {}
+  template <typename G> explicit UniqueTask(G &&f) : f(std::forward<G>(f)) {}
 
   void operator()() override {
+    std::unique_ptr<UniqueTask> self(this);
     f();
-    delete this; // really safe to do heere
   }
 
-  std::decay_t<F> f;
+  F f;
 };
 
 template <typename F> Task *MakeTask(F &&f) {
-  return new UniqueTask<decltype(std::forward<F>(f))>{std::forward<F>(f)};
+  return new UniqueTask<std::decay_t<F>>{std::forward<F>(f)};
 }
 
 // This defines an interface that ThreadPoolDevice can take to use
@@ -94,6 +98,17 @@ public:
   using TaskPtr = Task *;
   using Queue = RunQueue<TaskPtr, 1024>;
 
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct Statistics {
+    uint64_t scheduled{};
+    uint64_t executed{};
+    uint64_t successful_steals{};
+    uint64_t failed_steal_rounds{};
+    uint64_t sleeps{};
+    uint64_t idle_nanoseconds{};
+  };
+#endif
+
   ThreadPoolTempl(int num_threads, Environment env = Environment())
       : ThreadPoolTempl(num_threads, true, false, env) {}
 
@@ -102,7 +117,6 @@ public:
       : env_(env), num_threads_(ValidateThreadCount(num_threads)),
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
-        global_steal_partition_(EncodePartition(0, num_threads_)),
         pool_generation_(NextPoolGeneration()), done_(false),
         cancelled_(false) {
     // Calculate coprimes of all numbers [1, num_threads].
@@ -117,10 +131,6 @@ public:
       ComputeCoprimes(i, &all_coprimes_.back());
     }
     thread_data_.resize(num_threads_);
-    for (int i = 0; i < num_threads_; i++) {
-      SetStealPartition(i, EncodePartition(0, num_threads_));
-    }
-
     const bool needs_fallback_worker = use_main_thread && num_threads_ == 1;
     if (use_main_thread) {
       RegisterCreator(!needs_fallback_worker);
@@ -155,31 +165,18 @@ public:
     RestoreCreatorRegistration();
   }
 
-  void SetStealPartitions(
-      const std::vector<std::pair<unsigned, unsigned>> &partitions) {
-    assert(partitions.size() == static_cast<std::size_t>(num_threads_));
-
-    // Pass this information to each thread queue.
-    for (int i = 0; i < num_threads_; i++) {
-      const auto &pair = partitions[i];
-      unsigned start = pair.first, end = pair.second;
-      AssertBounds(start, end);
-      unsigned val = EncodePartition(start, end);
-      SetStealPartition(i, val);
-    }
-  }
-
   void Schedule(TaskPtr p) override {
     // schedule on main thread only when explicitly requested
     ScheduleWithHint(p, 0, num_threads_);
   }
 
   void RunOnThread(TaskPtr t, size_t threadIndex) {
+    // The target is a placement hint: another worker may steal the task.
     if (t == nullptr) {
       return;
     }
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
     threadIndex = threadIndex % num_threads_;
@@ -195,7 +192,7 @@ public:
     }
     AssertBounds(start, limit);
     if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
+      t->Discard();
       return;
     }
 
@@ -257,6 +254,24 @@ public:
     constexpr bool JustOnce = true;
     return WorkerLoop(External, JustOnce);
   }
+
+#ifdef OOX_EIGEN_ENABLE_STATS
+  Statistics GetStatistics() const {
+    Statistics result;
+    for (const auto &data : thread_data_) {
+      result.scheduled += data.statistics.scheduled.load(std::memory_order_relaxed);
+      result.executed += data.statistics.executed.load(std::memory_order_relaxed);
+      result.successful_steals +=
+          data.statistics.successful_steals.load(std::memory_order_relaxed);
+      result.failed_steal_rounds +=
+          data.statistics.failed_steal_rounds.load(std::memory_order_relaxed);
+      result.sleeps += data.statistics.sleeps.load(std::memory_order_relaxed);
+      result.idle_nanoseconds +=
+          data.statistics.idle_nanoseconds.load(std::memory_order_relaxed);
+    }
+    return result;
+  }
+#endif
 
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
@@ -342,37 +357,24 @@ private:
     return count;
   }
 
-  inline unsigned EncodePartition(unsigned start, unsigned limit) {
-    return (start << kMaxPartitionBits) | limit;
-  }
-
   void ExecuteTask(TaskPtr p) {
     struct FinishTask {
       ThreadPoolTempl *pool;
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
-    (*p)();
-  }
-
-  inline void DecodePartition(unsigned val, unsigned *start, unsigned *limit) {
-    *limit = val & (kMaxThreads - 1);
-    val >>= kMaxPartitionBits;
-    *start = val;
+    try {
+      (*p)();
+    } catch (...) {
+      // Pool tasks are fire-and-forget. Isolate an unhandled task exception so
+      // one callback cannot terminate the worker thread or the process.
+    }
   }
 
   void AssertBounds(int start, int end) {
     if (start < 0 || start >= end || end > num_threads_) {
       throw std::invalid_argument("invalid scheduling partition");
     }
-  }
-
-  inline void SetStealPartition(size_t i, unsigned val) {
-    thread_data_[i].steal_partition.store(val, std::memory_order_relaxed);
-  }
-
-  inline unsigned GetStealPartition(int i) {
-    return thread_data_[i].steal_partition.load(std::memory_order_relaxed);
   }
 
   void ComputeCoprimes(int N, MaxSizeVector<unsigned> *coprimes) {
@@ -404,15 +406,28 @@ private:
     bool owns_queue;
   };
 
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct AtomicStatistics {
+    std::atomic<uint64_t> scheduled{0};
+    std::atomic<uint64_t> executed{0};
+    std::atomic<uint64_t> successful_steals{0};
+    std::atomic<uint64_t> failed_steal_rounds{0};
+    std::atomic<uint64_t> sleeps{0};
+    std::atomic<uint64_t> idle_nanoseconds{0};
+  };
+#endif
+
   struct ThreadData {
     ThreadData()
-        : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
+        : thread(), outstanding_tasks(0), local_tasks(),
           mailbox(1024) {}
     std::unique_ptr<Thread> thread;
-    std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+#ifdef OOX_EIGEN_ENABLE_STATS
+    AtomicStatistics statistics;
+#endif
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
@@ -446,7 +461,6 @@ private:
   const bool allow_spinning_;
   MaxSizeVector<ThreadData> thread_data_;
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
-  unsigned global_steal_partition_;
   const uint64_t pool_generation_;
 
   std::mutex overflow_mutex_;
@@ -507,7 +521,20 @@ private:
         worker_event_.CancelWait();
         return processed_anything;
       }
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_begin = std::chrono::steady_clock::now();
+#endif
       worker_event_.Wait(token);
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_end = std::chrono::steady_clock::now();
+      auto &statistics = thread_data_[GetPerThread()->thread_id].statistics;
+      statistics.sleeps.fetch_add(1, std::memory_order_relaxed);
+      statistics.idle_nanoseconds.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(idle_end -
+                                                               idle_begin)
+              .count(),
+          std::memory_order_relaxed);
+#endif
     }
   }
 
@@ -549,6 +576,10 @@ private:
   }
 
   void PublishTask(TaskPtr task, int target, bool local) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[target].statistics.scheduled.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     auto &outstanding = thread_data_[target].outstanding_tasks;
     task->outstanding = &outstanding;
     outstanding.fetch_add(1, std::memory_order_relaxed);
@@ -559,6 +590,7 @@ private:
       }
     } catch (...) {
       outstanding.fetch_sub(1, std::memory_order_relaxed);
+      task->Discard();
       throw;
     }
     WakeOneWorker();
@@ -586,21 +618,22 @@ private:
       task = PopOverflow();
     }
     if (!task) {
-      task = LocalSteal(true);
-    }
-    if (!task) {
       task = GlobalSteal(true);
     }
     if (!task) {
       return false;
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.executed.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     ExecuteTask(task);
     return true;
   }
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
     assert(outstanding != nullptr);
-    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
+    const size_t previous = outstanding->fetch_sub(1, std::memory_order_seq_cst);
     assert(previous > 0);
     if (previous == 1 && done_.load(std::memory_order_acquire) &&
         NoOutstandingTasks()) {
@@ -640,7 +673,7 @@ private:
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
         auto *outstanding = task->outstanding;
-        delete task;
+        task->Discard();
         outstanding->fetch_sub(1, std::memory_order_relaxed);
       }
     }
@@ -649,7 +682,7 @@ private:
       TaskPtr task = overflow_tasks_.front();
       overflow_tasks_.pop_front();
       auto *outstanding = task->outstanding;
-      delete task;
+      task->Discard();
       outstanding->fetch_sub(1, std::memory_order_relaxed);
     }
     assert(NoOutstandingTasks());
@@ -673,6 +706,11 @@ private:
       assert(start + victim < limit);
       TaskPtr t = thread_data_[start + victim].PopBack(force);
       if (t) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+        if (static_cast<int>(start + victim) != pt->thread_id)
+          thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
+              1, std::memory_order_relaxed);
+#endif
         return t;
       }
       victim += inc;
@@ -680,22 +718,11 @@ private:
         victim -= size;
       }
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.failed_steal_rounds.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     return nullptr;
-  }
-
-  // Steals work within threads belonging to the partition.
-  TaskPtr LocalSteal(bool force) {
-    PerThread *pt = GetPerThread();
-    unsigned partition = GetStealPartition(pt->thread_id);
-    // If thread steal partition is the same as global partition, there is no
-    // need to go through the steal loop twice.
-    if (global_steal_partition_ == partition)
-      return nullptr;
-    unsigned start, limit;
-    DecodePartition(partition, &start, &limit);
-    AssertBounds(start, limit);
-
-    return Steal(start, limit, force);
   }
 
   // Steals work from any other thread in the pool.

@@ -12,6 +12,43 @@ on:
       - synchronize
       - reopened
 jobs:
+  pbbs-applications:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
+    - name: Initialize PBBS
+      run: git submodule update --init thirdparty/pbbsbench
+    - name: Compile and run checker-backed application suite
+      timeout-minutes: 35
+      run: >
+        python3 benchmarks/pbbs/run.py --ci-smoke --timeout 900
+        --output cmake-build-pbbs/ci-smoke-results
+        --backend oox --mode EIGEN_STEALING --threads 2
+        --compiler clang++-19
+
+  scheduler-eval:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev
+    - name: Configure scheduler evaluations
+      run: >
+        cmake -S . -B build-scheduler-eval
+        -DCMAKE_CXX_COMPILER=clang++-19
+        -DOOX_BUILD_TESTS=OFF -DOOX_BUILD_BENCHMARKS=ON
+        -DOOX_BUILD_TASKBENCH=OFF -DOOX_BUILD_SCHEDULER_EVALS=ON
+        -DOOX_ENABLE_TBB=OFF -DOOX_ENABLE_TF=OFF
+        -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=OFF
+    - name: Build scheduler evaluations
+      run: cmake --build build-scheduler-eval -j 8
+    - name: Test scheduler evaluations
+      run: >
+        python3 benchmarks/scheduler_eval/ctest_ci.py
+        --test-dir build-scheduler-eval --output-on-failure -L scheduler-eval
+
   build:
     runs-on: ${{ matrix.os }}
 
@@ -48,7 +85,7 @@ jobs:
             c_compiler: cl
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Dependencies
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
@@ -66,6 +103,7 @@ jobs:
         -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
         -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        -DOOX_BUILD_BENCHMARKS=OFF
         -S ${{ github.workspace }}
 
     - name: Build

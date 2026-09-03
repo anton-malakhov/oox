@@ -18,6 +18,38 @@ using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
 
+struct MoveAwareCallable {
+  bool *moved_from;
+  bool *ran;
+
+  MoveAwareCallable(bool &moved, bool &called)
+      : moved_from(&moved), ran(&called) {}
+  MoveAwareCallable(const MoveAwareCallable &) = default;
+  MoveAwareCallable(MoveAwareCallable &&other) noexcept : ran(other.ran) {
+    *other.moved_from = true;
+    moved_from = other.moved_from;
+  }
+  void operator()() { *ran = true; }
+};
+
+TEST(EigenPool, MakeTaskCopiesLvalueCallable) {
+  bool moved_from = false;
+  bool ran = false;
+  MoveAwareCallable callable(moved_from, ran);
+  (*MakeTask(callable))();
+  EXPECT_FALSE(moved_from);
+  EXPECT_TRUE(ran);
+}
+
+TEST(EigenPool, WorkerSurvivesUnhandledTaskException) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> completed;
+  auto result = completed.get_future();
+  pool.Schedule(MakeTask([] { throw std::runtime_error("task failure"); }));
+  pool.Schedule(MakeTask([&] { completed.set_value(); }));
+  EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
+}
+
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
   EXPECT_THROW(ThreadPool(-1), std::invalid_argument);

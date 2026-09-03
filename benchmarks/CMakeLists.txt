@@ -31,6 +31,7 @@ FetchContent_MakeAvailable(benchmark)
 
 list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
 option(OOX_BUILD_TASKBENCH "Build Task-Bench-style benchmarks" ON)
+option(OOX_BUILD_SCHEDULER_EVALS "Build composable-scheduler evaluation kernels" OFF)
 set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tasks: tbb, system, or jemalloc")
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
 set(OOX_BACKENDS)
@@ -161,4 +162,8 @@ endif()
 
 if(OOX_BUILD_TASKBENCH)
   add_subdirectory(taskbench)
+endif()
+
+if(OOX_BUILD_SCHEDULER_EVALS)
+  add_subdirectory(scheduler_eval)
 endif()
