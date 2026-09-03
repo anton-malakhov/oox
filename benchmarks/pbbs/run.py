@@ -57,6 +57,14 @@ def log_tail(path: Path, line_count: int = 100) -> str:
     return "\n".join(lines[-line_count:])
 
 
+def failure(message: str) -> RuntimeError:
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25")
+        escaped = escaped.replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=PBBS application failure::{escaped}", file=sys.stderr)
+    return RuntimeError(message)
+
+
 def adapter_text():
     return r'''#ifndef PARLAY_INTERNAL_SCHEDULER_PLUGINS_EIGEN_H_
 #define PARLAY_INTERNAL_SCHEDULER_PLUGINS_EIGEN_H_
@@ -363,18 +371,18 @@ def main():
                                        stderr=subprocess.STDOUT, check=True,
                                        timeout=args.timeout)
                 except subprocess.TimeoutExpired as error:
-                    raise RuntimeError(
+                    raise failure(
                         f"PBBS timed out after {args.timeout}s. Log tail:\n"
                         f"{log_tail(output)}"
                     ) from error
                 except subprocess.CalledProcessError as error:
-                    raise RuntimeError(
+                    raise failure(
                         f"PBBS exited with status {error.returncode}. Log tail:\n"
                         f"{log_tail(output)}"
                     ) from error
                 log = output.read_text(errors="replace")
                 if "TEST TERMINATED ABNORMALLY" in log or "make: ***" in log:
-                    raise RuntimeError(
+                    raise failure(
                         f"PBBS reported a failure. Log tail:\n{log_tail(output)}"
                     )
     finally:
