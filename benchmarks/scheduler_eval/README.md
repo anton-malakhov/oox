@@ -55,6 +55,10 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Balanced SpMV | Equal row work; isolates distribution overhead |
 | Hyperbolic SpMV | A few very heavy rows and a long light tail |
 | Triangular SpMV | Gradually changing row width and work |
+| Flat/nested BFS | Trees, parallel chains, phased graphs, and square grids |
+| Variable-cost loops | Constant, uniform, exponential, Pareto, linear, clustered, periodic, shuffled, and phase-changing costs |
+| Competing loops | Two simultaneous OOX loops contending for one worker pool |
+| First touch | Serial versus parallel page initialization before parallel reads |
 | Matrix multiply | Nested parallel regions with substantial inner work |
 | Matrix transpose | Nested tiled regions with short inner tasks |
 

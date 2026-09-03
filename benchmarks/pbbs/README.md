@@ -20,6 +20,7 @@ Initialize the dependency after cloning OOX, then run one small workload:
 ```sh
 git submodule update --init thirdparty/pbbsbench
 python3 benchmarks/pbbs/run.py --prepare-only
+python3 benchmarks/pbbs/run.py --compile-only --threads 2
 python3 benchmarks/pbbs/run.py --backend oox --threads 8 \
   --mode EIGEN_SHARING_STEALING \
   --benchmark integerSort/parallelRadixSort
@@ -34,10 +35,20 @@ to compare them. Their mode names differ: the reference uses `EIGEN_SIMPLE`, `EI
 The historical reference targets Linux. It builds on macOS with the affinity
 shim, but its original scheduler can stall there; use Linux for reference data.
 
-By default six representative PBBS applications use small inputs. Add `--full`
-for paper-scale inputs. Full runs generate or download large datasets and can
-take hours; use an otherwise idle Linux machine with fixed affinity. Use
-`--all-benchmarks --full` for the reference branch's complete application suite.
+The default suite covers every PBBS application requested by the OOX porting
+plan: flat BFS, convex hull, remove-duplicates, radix and sample sort, suffix
+array, nearest neighbors, Delaunay triangulation/refinement, ray casting,
+minimum spanning forest, and spanning forest. Each workload runs PBBS's own
+checker. The driver also corrects the pinned octree benchmark's small-input
+underflow and selects its static build/query path, matching current canonical
+PBBS behavior. Two stale success-return defects in the pinned deduplication
+driver and suffix-array checker are corrected while the checkout is active;
+their actual PBBS validators still decide correctness.
+
+Add `--full` for paper-scale inputs. Full runs generate or download large
+datasets and can take hours; use an otherwise idle Linux machine with fixed
+affinity. Use `--all-benchmarks --full` for every benchmark in the pinned PBBS
+tree, beyond the porting-plan set.
 
 Raw logs are written below `cmake-build-pbbs/results` with the backend in each
 filename. They retain PBBS's
@@ -49,7 +60,7 @@ pinned versions when it exits, including after a benchmark error. PBBS leaves
 some generated inputs and build products untracked in its checkout; the parent
 repository ignores those while still reporting modifications to tracked files.
 
-This split is intentional: scheduler microbenchmarks are native CMake targets
-under `benchmarks/scheduler_eval`, while PBBS remains the pinned upstream
-application suite so its algorithms, generators, validators, and run protocol
-are not silently changed.
+This split is intentional: scheduler microbenchmarks and the flat-versus-nested
+BFS graph families are native CMake targets under `benchmarks/scheduler_eval`,
+while PBBS remains the pinned upstream application suite so its algorithms,
+generators, validators, and run protocol are not silently changed.

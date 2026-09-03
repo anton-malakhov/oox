@@ -11,12 +11,18 @@ import sys
 
 COMMIT = "396a299f03c58dbe9e7604daab38a65781227b75"
 DEFAULT_BENCHMARKS = [
+    "breadthFirstSearch/backForwardBFS",
+    "convexHull/quickHull",
+    "removeDuplicates/parlayhash",
     "integerSort/parallelRadixSort",
     "comparisonSort/sampleSort",
-    "removeDuplicates/parlayhash",
-    "histogram/parallel",
-    "breadthFirstSearch/backForwardBFS",
-    "maximalIndependentSet/incrementalMIS",
+    "suffixArray/parallelRange",
+    "nearestNeighbors/octTree",
+    "delaunayTriangulation/incrementalDelaunay",
+    "delaunayRefine/incrementalRefine",
+    "rayCast/kdTree",
+    "minSpanningForest/parallelFilterKruskal",
+    "spanningForest/ndST",
 ]
 BACKENDS = ["reference", "oox"]
 REFERENCE_MODES = [
@@ -148,6 +154,60 @@ def validate_source(source: Path):
 
 
 def configure_checkout(source: Path, root: Path, compiler: str):
+    runall = source / "runall"
+    runall_text = subprocess.check_output(
+        ["git", "show", f"{COMMIT}:runall"], cwd=source, text=True
+    )
+    runall_text = runall_text.replace(
+        '    # ["nearestNeighbors/octTree",True,0],',
+        '    ["nearestNeighbors/octTree",True,0],',
+    )
+    runall.write_text(runall_text)
+
+    neighbors = source / "benchmarks/nearestNeighbors/octTree/neighbors.h"
+    neighbors_text = git_file(
+        source, "benchmarks/nearestNeighbors/octTree/neighbors.h"
+    ).decode()
+    neighbors_text = neighbors_text.replace(
+        "size_t n2 = 2000000;", "size_t n2 = 0;"
+    )
+    neighbors_text = neighbors_text.replace(
+        "bool report_stats = true;", "bool report_stats = false;"
+    )
+    neighbors_text = neighbors_text.replace(
+        "int algorithm_version = 0;", "int algorithm_version = 2;"
+    )
+    neighbors_text = neighbors_text.replace(
+        "knn_tree T(v1, whole_box);", "knn_tree T(v, whole_box);"
+    )
+    neighbors_text = neighbors_text.replace(
+        "    T.batch_insert(v2, root, bd.first, bd.second);",
+        "    // Static nearest-neighbor benchmark: no dynamic insertion phase.",
+    )
+    neighbors_text = neighbors_text.replace(
+        "    knn_tree R(v, whole_box);",
+        "    // The PBBS checker validates the query results.",
+    )
+    neighbors_text = neighbors_text.replace("    T.are_equal(R.tree.get(), dims);", "")
+    neighbors.write_text(neighbors_text)
+
+    dedup_time = source / "benchmarks/removeDuplicates/bench/dedupTime.C"
+    dedup_text = git_file(
+        source, "benchmarks/removeDuplicates/bench/dedupTime.C"
+    ).decode()
+    dedup_text = dedup_text.replace(
+        "  return 1;\n}\n\nint main", "  return 0;\n}\n\nint main", 1
+    )
+    dedup_time.write_text(dedup_text)
+
+    suffix_check = source / "benchmarks/suffixArray/bench/SACheck.C"
+    suffix_text = git_file(
+        source, "benchmarks/suffixArray/bench/SACheck.C"
+    ).decode()
+    marker = "  return 0;\n}\n\nint main"
+    suffix_text = suffix_text.replace(marker, "  return 1;\n}\n\nint main", 1)
+    suffix_check.write_text(suffix_text)
+
     runner = source / "common/runTests.py"
     runner_text = subprocess.check_output(
         ["git", "show", f"{COMMIT}:common/runTests.py"], cwd=source, text=True
@@ -189,6 +249,10 @@ def restore_checkout(source: Path):
         "parlaylib/include/parlay/internal/scheduler_plugins/common/initialization.h",
         "common/runTests.py",
         "common/parallelDefs",
+        "runall",
+        "benchmarks/nearestNeighbors/octTree/neighbors.h",
+        "benchmarks/removeDuplicates/bench/dedupTime.C",
+        "benchmarks/suffixArray/bench/SACheck.C",
     ]:
         restore_reference_file(source, path)
 
@@ -212,6 +276,10 @@ def parse_args():
     parser.add_argument("--full", action="store_true",
                         help="Use full PBBS inputs; the default uses testInputs_small")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="Compile the selected suite without generating inputs")
+    parser.add_argument("--numa", action="store_true",
+                        help="Use PBBS's numactl interleave policy on Linux")
     return parser.parse_args(), root
 
 
@@ -246,7 +314,11 @@ def main():
                     "EIGEN_MODE": mode,
                     "BENCH_NUM_THREADS": str(args.threads),
                 })
-                command = [sys.executable, "runall", "-force", "-par", "-nonuma"]
+                command = [sys.executable, "runall", "-force", "-par"]
+                if not args.numa:
+                    command.append("-nonuma")
+                if args.compile_only:
+                    command.append("-notime")
                 if benchmarks:
                     command.extend(["-only", *benchmarks, "-ext"])
                 if not args.full:

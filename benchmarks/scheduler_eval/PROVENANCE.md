@@ -24,6 +24,8 @@ backend abstraction. No runner clones the reference at execution time.
 | `bench_mmul.cpp` | Nested dense matrix multiplication | Compared elementwise with serial multiplication |
 | `bench_mtranspose.cpp` | Nested blocked transpose | Exact element mapping |
 | `bench_spin.cpp` | Relax, atomic, isolated distributed-read, and thread-local-read payload matrix | CMake smoke run per backend mode |
+| Nested BFS studies | Independent CSR generators for trees, parallel chains, phased graphs, and square grids; flat and nested adjacency traversal | Both variants compared with a serial level oracle |
+| Irregular loop studies | Nine deterministic cost distributions, competing loops, and serial/parallel first-touch variants | Parallel loop checksums compared with a serial oracle |
 | `scheduling_dist` | Spin, barrier, and multitask arrival/worker distributions | JSON smoke run per backend mode |
 | `timespan_tuner` | Warm baseline p99 publication-timespan estimator | Baseline JSON smoke test |
 | `trace_spin` | Chrome task-span trace across repeated publications | JSON smoke run per backend mode |
@@ -60,6 +62,13 @@ backend abstraction. No runner clones the reference at execution time.
 10. The Rapid Start prototype is limited to 64 workers and is not reentrant.
     Nested matrix workloads are omitted for that mode, and aggregate scores use
     only benchmark cases shared by every selected mode.
+11. The graph families are compact deterministic analogues of the published
+    workload shapes, not copies of DeepSea generators or claims to reproduce a
+    paper's machine-specific timing percentages.
+12. Worker availability is stressed with competing submissions. Worker count
+    remains a process-level parameter because an Eigen pool cannot be resized
+    after initialization. First-touch variants expose portable locality effects;
+    controlled NUMA placement remains an external `numactl` runner concern.
 
 ## Evaluation rules
 

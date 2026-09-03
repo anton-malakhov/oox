@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#include "common.h"
-#include "workloads.h"
 #include "benchmarks/eigen/intrusive_ptr.h"
+#include "common.h"
+#include "graph_workloads.h"
+#include "synthetic_workloads.h"
+#include "workloads.h"
 
 #include <cmath>
 #include <cstddef>
@@ -40,6 +42,36 @@ bool CheckSpmv() {
   return true;
 }
 
+#ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
+bool CheckBfs() {
+  for (const auto kind : {scheduler_eval::GraphKind::Tree,
+                          scheduler_eval::GraphKind::ParallelChains,
+                          scheduler_eval::GraphKind::Phases,
+                          scheduler_eval::GraphKind::SquareGrid}) {
+    const auto graph = scheduler_eval::MakeGraph(kind, 1024);
+    const auto expected = scheduler_eval::BfsSerial(graph);
+    if (scheduler_eval::BfsFlat(graph) != expected ||
+        scheduler_eval::BfsNested(graph, 8) != expected)
+      return false;
+  }
+  return true;
+}
+#endif
+
+bool CheckSyntheticCosts() {
+  using scheduler_eval::CostKind;
+  for (const auto kind :
+       {CostKind::Constant, CostKind::Uniform, CostKind::Exponential,
+        CostKind::Pareto, CostKind::Linear, CostKind::Clustered,
+        CostKind::Periodic, CostKind::Shuffled, CostKind::PhaseChanging}) {
+    const auto costs = scheduler_eval::MakeIterationCosts(kind, 2048, 17);
+    if (scheduler_eval::RunCostLoop(costs) !=
+        scheduler_eval::RunCostLoopSerial(costs))
+      return false;
+  }
+  return true;
+}
+
 struct PointerValue : intrusive_ref_counter<PointerValue> {};
 
 bool CheckIntrusivePtrOrdering() {
@@ -53,7 +85,14 @@ bool CheckIntrusivePtrOrdering() {
 int main() {
   scheduler_eval::Initialize();
   const std::vector<double> values(1003, 1.25);
-  const bool ok = CheckScan() && CheckSpmv() && CheckIntrusivePtrOrdering() &&
+  const bool bfs_ok =
+#ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
+      CheckBfs();
+#else
+      true;
+#endif
+  const bool ok = CheckScan() && CheckSpmv() && bfs_ok &&
+                  CheckSyntheticCosts() && CheckIntrusivePtrOrdering() &&
                   Close(scheduler_eval::BlockedReduce(values, 37), 1253.75);
   if (!ok)
     std::cerr << "scheduler evaluation correctness test failed\n";

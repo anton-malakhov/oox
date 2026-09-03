@@ -12,6 +12,20 @@ on:
       - synchronize
       - reopened
 jobs:
+  pbbs-applications:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Dependencies
+      run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
+    - name: Initialize PBBS
+      run: git submodule update --init thirdparty/pbbsbench
+    - name: Compile application benchmark suite
+      run: >
+        python3 benchmarks/pbbs/run.py --compile-only
+        --backend oox --mode EIGEN_STEALING --threads 2
+        --compiler clang++-19
+
   scheduler-eval:
     runs-on: ubuntu-latest
     steps:
