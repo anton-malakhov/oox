@@ -251,6 +251,9 @@ def configure_checkout(source: Path, root: Path, compiler: str):
         ["git", "show", f"{COMMIT}:common/parallelDefs"], cwd=source, text=True
     )
     text = text.replace(
+        "CCFLAGS = -O2 -g -std=c++17", "CCFLAGS = -O2 -g -std=c++20", 1
+    )
+    text = text.replace(
         "EIGENFLAGS = -DPARLAY_EIGEN",
         f"EIGENFLAGS = -I {root} -DPARLAY_EIGEN",
     )

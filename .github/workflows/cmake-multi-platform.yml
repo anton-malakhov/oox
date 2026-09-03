@@ -50,7 +50,9 @@ jobs:
     - name: Build scheduler evaluations
       run: cmake --build build-scheduler-eval -j 8
     - name: Test scheduler evaluations
-      run: ctest --test-dir build-scheduler-eval --output-on-failure -L scheduler-eval
+      run: >
+        python3 benchmarks/scheduler_eval/ctest_ci.py
+        --test-dir build-scheduler-eval --output-on-failure -L scheduler-eval
 
   build:
     runs-on: ${{ matrix.os }}
