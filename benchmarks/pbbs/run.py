@@ -187,6 +187,12 @@ def configure_checkout(source: Path, root: Path, compiler: str):
         '    # ["nearestNeighbors/octTree",True,0],',
         '    ["nearestNeighbors/octTree",True,0],',
     )
+    runall_text = runall_text.replace(
+        "    if (procs==1) : rounds = 1",
+        "    if \"PBBS_ROUNDS\" in os.environ : "
+        "rounds = int(os.environ[\"PBBS_ROUNDS\"])\n"
+        "    elif (procs==1) : rounds = 1",
+    )
     runall.write_text(runall_text)
 
     neighbors = source / "benchmarks/nearestNeighbors/octTree/neighbors.h"
@@ -357,6 +363,8 @@ def main():
                     "EIGEN_MODE": mode,
                     "BENCH_NUM_THREADS": str(args.threads),
                 })
+                if args.ci_smoke:
+                    env["PBBS_ROUNDS"] = "1"
                 command = [sys.executable, "runall", "-force", "-par"]
                 if not args.numa:
                     command.append("-nonuma")
