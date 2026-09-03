@@ -24,6 +24,10 @@ DEFAULT_BENCHMARKS = [
     "minSpanningForest/parallelFilterKruskal",
     "spanningForest/ndST",
 ]
+CI_SMOKE_BENCHMARKS = [
+    "integerSort/parallelRadixSort",
+    "comparisonSort/sampleSort",
+]
 BACKENDS = ["reference", "oox"]
 REFERENCE_MODES = [
     "EIGEN_SIMPLE",
@@ -273,6 +277,8 @@ def parse_args():
     parser.add_argument("--benchmark", action="append")
     parser.add_argument("--all-benchmarks", action="store_true",
                         help="Run PBBS's complete default application suite")
+    parser.add_argument("--ci-smoke", action="store_true",
+                        help="Run the bounded checker-backed CI workload set")
     parser.add_argument("--full", action="store_true",
                         help="Use full PBBS inputs; the default uses testInputs_small")
     parser.add_argument("--prepare-only", action="store_true")
@@ -280,6 +286,8 @@ def parse_args():
                         help="Compile the selected suite without generating inputs")
     parser.add_argument("--numa", action="store_true",
                         help="Use PBBS's numactl interleave policy on Linux")
+    parser.add_argument("--timeout", type=int,
+                        help="Maximum seconds allowed for one PBBS suite run")
     return parser.parse_args(), root
 
 
@@ -297,9 +305,20 @@ def main():
         backends = args.backend or ["oox"]
         if args.mode and len(backends) != 1:
             raise ValueError("--mode requires exactly one --backend")
-        if args.all_benchmarks and args.benchmark:
-            raise ValueError("--all-benchmarks cannot be combined with --benchmark")
-        benchmarks = None if args.all_benchmarks else (args.benchmark or DEFAULT_BENCHMARKS)
+        selectors = sum(bool(value) for value in
+                        (args.all_benchmarks, args.ci_smoke, args.benchmark))
+        if selectors > 1:
+            raise ValueError("choose only one benchmark selection option")
+        if args.ci_smoke and (args.full or args.compile_only):
+            raise ValueError("--ci-smoke requires executable small inputs")
+        if args.timeout is not None and args.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        if args.all_benchmarks:
+            benchmarks = None
+        elif args.ci_smoke:
+            benchmarks = CI_SMOKE_BENCHMARKS
+        else:
+            benchmarks = args.benchmark or DEFAULT_BENCHMARKS
         for backend in backends:
             select_backend(source, backend)
             supported = REFERENCE_MODES if backend == "reference" else OOX_MODES
@@ -326,8 +345,14 @@ def main():
                 output = args.output / f"{backend}_{mode}.txt"
                 print(f"Writing {output}", flush=True)
                 with output.open("w") as stream:
-                    subprocess.run(command, cwd=source, env=env, stdout=stream,
-                                   stderr=subprocess.STDOUT, check=True)
+                    try:
+                        subprocess.run(command, cwd=source, env=env, stdout=stream,
+                                       stderr=subprocess.STDOUT, check=True,
+                                       timeout=args.timeout)
+                    except subprocess.TimeoutExpired as error:
+                        raise RuntimeError(
+                            f"PBBS timed out after {args.timeout}s; inspect {output}"
+                        ) from error
                 log = output.read_text(errors="replace")
                 if "TEST TERMINATED ABNORMALLY" in log or "make: ***" in log:
                     raise RuntimeError(f"PBBS reported a failure; inspect {output}")

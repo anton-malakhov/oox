@@ -21,6 +21,7 @@ Initialize the dependency after cloning OOX, then run one small workload:
 git submodule update --init thirdparty/pbbsbench
 python3 benchmarks/pbbs/run.py --prepare-only
 python3 benchmarks/pbbs/run.py --compile-only --threads 2
+python3 benchmarks/pbbs/run.py --ci-smoke --timeout 600 --threads 2
 python3 benchmarks/pbbs/run.py --backend oox --threads 8 \
   --mode EIGEN_SHARING_STEALING \
   --benchmark integerSort/parallelRadixSort
@@ -44,6 +45,11 @@ underflow and selects its static build/query path, matching current canonical
 PBBS behavior. Two stale success-return defects in the pinned deduplication
 driver and suffix-array checker are corrected while the checkout is active;
 their actual PBBS validators still decide correctness.
+
+`--ci-smoke` runs the small radix-sort and sample-sort suites, including PBBS's
+real output checkers. It complements `--compile-only` without making CI execute
+every multi-million-element application. `--timeout` bounds each backend/mode
+suite invocation and reports the retained log when the limit is exceeded.
 
 Add `--full` for paper-scale inputs. Full runs generate or download large
 datasets and can take hours; use an otherwise idle Linux machine with fixed
