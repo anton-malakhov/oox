@@ -27,6 +27,12 @@ bool Close(double left, double right) {
   return std::abs(left - right) <= 1e-9 * std::max(1.0, std::abs(right));
 }
 
+bool Report(const char *name, bool ok) {
+  if (!ok)
+    std::cerr << name << " failed\n";
+  return ok;
+}
+
 bool CheckScan() {
   std::vector<std::uint64_t> values(1024, 1);
   scheduler_eval::ExclusiveScan(values);
@@ -205,11 +211,16 @@ int main() {
 #else
       true;
 #endif
-  const bool ok = CheckScan() && CheckSpmv() && bfs_ok &&
-                  CheckSyntheticCosts() && CheckPrimaryWorkloads() &&
-                  CheckIntrusivePtrOrdering() && CheckGranularityEstimator() &&
-                  CheckSchedulerMetrics() &&
-                  Close(scheduler_eval::BlockedReduce(values, 37), 1253.75);
+  bool ok = Report("scan", CheckScan());
+  ok &= Report("spmv", CheckSpmv());
+  ok &= Report("bfs", bfs_ok);
+  ok &= Report("synthetic costs", CheckSyntheticCosts());
+  ok &= Report("primary workloads", CheckPrimaryWorkloads());
+  ok &= Report("intrusive pointer ordering", CheckIntrusivePtrOrdering());
+  ok &= Report("granularity estimator", CheckGranularityEstimator());
+  ok &= Report("scheduler metrics", CheckSchedulerMetrics());
+  ok &= Report("blocked reduce",
+               Close(scheduler_eval::BlockedReduce(values, 37), 1253.75));
   if (!ok)
     std::cerr << "scheduler evaluation correctness test failed\n";
   return ok ? 0 : 1;
