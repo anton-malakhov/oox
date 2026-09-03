@@ -102,16 +102,20 @@ bool CheckPrimaryWorkloads() {
   using scheduler_eval::PointKind;
   for (const auto kind : {PointKind::UniformSquare, PointKind::InDisk,
                           PointKind::OnCircle, PointKind::Kuzmin}) {
-    for (const auto size : std::array<std::size_t, 6>{0, 1, 2, 3, 17, 257}) {
+    for (const auto size :
+         std::array<std::size_t, 7>{0, 1, 2, 3, 17, 257, 4099}) {
       const auto points = scheduler_eval::MakePoints(kind, size, 29 + size);
       auto expected = scheduler_eval::ConvexHullSerial(points);
-      auto actual = scheduler_eval::ConvexHullParallel(points);
+      scheduler_eval::ConvexHullMetrics metrics;
+      auto actual = scheduler_eval::ConvexHullParallel(points, &metrics);
       const auto less = [](const auto &left, const auto &right) {
         return left.x < right.x || (left.x == right.x && left.y < right.y);
       };
       std::sort(expected.begin(), expected.end(), less);
       std::sort(actual.begin(), actual.end(), less);
-      if (expected.size() != actual.size())
+      if (expected.size() != actual.size() ||
+          metrics.hull_vertices != actual.size() ||
+          (size > 2048 && metrics.merge_passes == 0))
         return false;
       for (std::size_t i = 0; i < expected.size(); ++i)
         if (expected[i].x != actual[i].x || expected[i].y != actual[i].y)
@@ -123,12 +127,26 @@ bool CheckPrimaryWorkloads() {
     for (const auto size :
          std::array<std::size_t, 7>{0, 1, 2, 7, 255, 2047, 4099}) {
       const auto keys = scheduler_eval::MakeKeys(kind, size, 41 + size);
-      if (scheduler_eval::RemoveDuplicatesParallel(keys) !=
-              scheduler_eval::RemoveDuplicatesSerial(keys) ||
-          scheduler_eval::RadixSortParallel(keys) !=
-              scheduler_eval::RadixSortSerial(keys) ||
-          scheduler_eval::SampleSortParallel(keys) !=
-              scheduler_eval::SampleSortSerial(keys))
+      scheduler_eval::DedupMetrics dedup_metrics;
+      scheduler_eval::RadixSortMetrics radix_metrics;
+      scheduler_eval::SampleSortMetrics sample_metrics;
+      const auto dedup =
+          scheduler_eval::RemoveDuplicatesParallel(keys, &dedup_metrics);
+      const auto radix =
+          scheduler_eval::RadixSortParallel(keys, &radix_metrics);
+      const auto sample =
+          scheduler_eval::SampleSortParallel(keys, &sample_metrics);
+      if (dedup != scheduler_eval::RemoveDuplicatesSerial(keys) ||
+          radix != scheduler_eval::RadixSortSerial(keys) ||
+          sample != scheduler_eval::SampleSortSerial(keys) ||
+          dedup_metrics.unique_items != dedup.size() ||
+          dedup_metrics.hash_probes < keys.size() ||
+          (size > 0 && dedup_metrics.table_capacity < 2 * size) ||
+          radix_metrics.passes != (size == 0 ? 0u : 4u) ||
+          sample_metrics.buckets != (size == 0 ? 0u
+                                               : std::min<std::size_t>(
+                                                     256, (size + 2047) / 2048)) ||
+          sample_metrics.largest_bucket > size)
         return false;
     }
   }

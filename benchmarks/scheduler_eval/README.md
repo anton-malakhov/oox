@@ -76,8 +76,12 @@ see `THIRDPARTY.md` for the retained MIT notice.
 Eigen benchmark JSON includes scheduled/executed tasks, successful steals,
 failed steal rounds, worker sleeps, and observed sleeping time. BFS additionally
 records nested launches, sequentialized inner loops, and the learned sequential
-complexity limit. The counters are compiled only for scheduler-evaluation
-targets.
+complexity limit. Native primary workloads record hull vertices and merge
+passes, deduplication probe rate and table load, radix passes, and sample-sort
+bucket count, maximum bucket size, and imbalance. The counters are compiled
+only for scheduler-evaluation targets. Workload descriptors are collected in
+an untimed preflight invocation so probe accounting does not perturb the timed
+kernel or its scheduler counters.
 
 ## Startup and publication probes
 

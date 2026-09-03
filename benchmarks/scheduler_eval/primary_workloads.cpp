@@ -83,14 +83,17 @@ std::vector<Point> ConvexHullSerial(std::vector<Point> points) {
   return hull;
 }
 
-std::vector<Point> ConvexHullParallel(const std::vector<Point> &points) {
+std::vector<Point> ConvexHullParallel(const std::vector<Point> &points,
+                                      ConvexHullMetrics *metrics) {
   std::vector<Point> sorted = points, buffer(points.size());
   const auto blocks = (points.size() + block_size - 1) / block_size;
+  std::size_t merge_passes = 0;
   ParallelFor(0, blocks, [&](std::size_t block) {
     const auto begin = sorted.begin() + block * block_size;
     std::sort(begin, std::min(sorted.end(), begin + block_size), PointLess);
   });
   for (std::size_t width = block_size; width < sorted.size(); width *= 2) {
+    ++merge_passes;
     const auto merges = (sorted.size() + 2 * width - 1) / (2 * width);
     ParallelFor(0, merges, [&](std::size_t merge) {
       const auto begin = std::min(sorted.size(), merge * 2 * width);
@@ -104,8 +107,11 @@ std::vector<Point> ConvexHullParallel(const std::vector<Point> &points) {
   }
   sorted.erase(std::unique(sorted.begin(), sorted.end(), PointEqual),
                sorted.end());
-  if (sorted.size() < 3)
+  if (sorted.size() < 3) {
+    if (metrics)
+      *metrics = {sorted.size(), merge_passes};
     return sorted;
+  }
   std::vector<Point> hull(2 * sorted.size());
   std::size_t size = 0;
   for (const auto &point : sorted) {
@@ -121,6 +127,8 @@ std::vector<Point> ConvexHullParallel(const std::vector<Point> &points) {
     hull[size++] = sorted[i];
   }
   hull.resize(size - 1);
+  if (metrics)
+    *metrics = {hull.size(), merge_passes};
   return hull;
 }
 
@@ -158,22 +166,31 @@ RemoveDuplicatesSerial(std::vector<std::uint32_t> keys) {
 }
 
 std::vector<std::uint32_t>
-RemoveDuplicatesParallel(const std::vector<std::uint32_t> &keys) {
-  if (keys.empty())
+RemoveDuplicatesParallel(const std::vector<std::uint32_t> &keys,
+                         DedupMetrics *metrics) {
+  if (keys.empty()) {
+    if (metrics)
+      *metrics = {};
     return {};
+  }
   constexpr auto empty = std::numeric_limits<std::uint64_t>::max();
   const auto capacity = NextPowerOfTwo(keys.size() * 2);
   auto table = std::make_unique<std::atomic<std::uint64_t>[]>(capacity);
+  std::atomic<std::uint64_t> hash_probes{0};
   ParallelFor(0, capacity, [&](std::size_t i) { table[i].store(empty); });
   ParallelFor(0, keys.size(), [&](std::size_t i) {
     const auto key = static_cast<std::uint64_t>(keys[i]);
     auto slot = (key * 11400714819323198485ull) & (capacity - 1);
+    std::uint64_t probes = 0;
     while (true) {
+      ++probes;
       auto expected = empty;
       if (table[slot].compare_exchange_weak(expected, key) || expected == key)
         break;
       slot = (slot + 1) & (capacity - 1);
     }
+    if (metrics)
+      hash_probes.fetch_add(probes, std::memory_order_relaxed);
   });
   std::vector<std::uint32_t> result;
   result.reserve(keys.size());
@@ -181,6 +198,9 @@ RemoveDuplicatesParallel(const std::vector<std::uint32_t> &keys) {
     if (table[i].load() != empty)
       result.push_back(static_cast<std::uint32_t>(table[i].load()));
   std::sort(result.begin(), result.end());
+  if (metrics)
+    *metrics = {result.size(), hash_probes.load(std::memory_order_relaxed),
+                capacity};
   return result;
 }
 
@@ -190,9 +210,13 @@ std::vector<std::uint32_t> RadixSortSerial(std::vector<std::uint32_t> keys) {
 }
 
 std::vector<std::uint32_t>
-RadixSortParallel(const std::vector<std::uint32_t> &keys) {
-  if (keys.empty())
+RadixSortParallel(const std::vector<std::uint32_t> &keys,
+                  RadixSortMetrics *metrics) {
+  if (keys.empty()) {
+    if (metrics)
+      *metrics = {};
     return {};
+  }
   std::vector<std::uint32_t> input = keys, output(keys.size());
   const auto blocks = (keys.size() + block_size - 1) / block_size;
   using Counts = std::array<std::size_t, 256>;
@@ -218,6 +242,8 @@ RadixSortParallel(const std::vector<std::uint32_t> &keys) {
     });
     input.swap(output);
   }
+  if (metrics)
+    metrics->passes = 4;
   return input;
 }
 
@@ -227,9 +253,13 @@ std::vector<std::uint32_t> SampleSortSerial(std::vector<std::uint32_t> keys) {
 }
 
 std::vector<std::uint32_t>
-SampleSortParallel(const std::vector<std::uint32_t> &keys) {
-  if (keys.size() < block_size)
+SampleSortParallel(const std::vector<std::uint32_t> &keys,
+                   SampleSortMetrics *metrics) {
+  if (keys.size() < block_size) {
+    if (metrics)
+      *metrics = {keys.empty() ? 0u : 1u, keys.size()};
     return SampleSortSerial(keys);
+  }
   const auto buckets =
       std::min<std::size_t>(256, (keys.size() + block_size - 1) / block_size);
   std::vector<std::uint32_t> samples;
@@ -278,6 +308,13 @@ SampleSortParallel(const std::vector<std::uint32_t> &keys) {
     std::sort(output.begin() + bucket_starts[bucket],
               output.begin() + bucket_starts[bucket + 1]);
   });
+  if (metrics) {
+    std::size_t largest_bucket = 0;
+    for (std::size_t bucket = 0; bucket < buckets; ++bucket)
+      largest_bucket = std::max(largest_bucket, bucket_starts[bucket + 1] -
+                                                    bucket_starts[bucket]);
+    *metrics = {buckets, largest_bucket};
+  }
   return output;
 }
 
