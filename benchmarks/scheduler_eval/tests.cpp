@@ -4,6 +4,7 @@
 #include "common.h"
 #include "granularity_control.h"
 #include "graph_workloads.h"
+#include "primary_workloads.h"
 #include "synthetic_workloads.h"
 #include "workloads.h"
 
@@ -11,6 +12,7 @@
 #include "benchmarks/eigen/eigen_pool.h"
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -95,6 +97,44 @@ bool CheckSyntheticCosts() {
   return true;
 }
 
+bool CheckPrimaryWorkloads() {
+  using scheduler_eval::KeyKind;
+  using scheduler_eval::PointKind;
+  for (const auto kind : {PointKind::UniformSquare, PointKind::InDisk,
+                          PointKind::OnCircle, PointKind::Kuzmin}) {
+    for (const auto size : std::array<std::size_t, 6>{0, 1, 2, 3, 17, 257}) {
+      const auto points = scheduler_eval::MakePoints(kind, size, 29 + size);
+      auto expected = scheduler_eval::ConvexHullSerial(points);
+      auto actual = scheduler_eval::ConvexHullParallel(points);
+      const auto less = [](const auto &left, const auto &right) {
+        return left.x < right.x || (left.x == right.x && left.y < right.y);
+      };
+      std::sort(expected.begin(), expected.end(), less);
+      std::sort(actual.begin(), actual.end(), less);
+      if (expected.size() != actual.size())
+        return false;
+      for (std::size_t i = 0; i < expected.size(); ++i)
+        if (expected[i].x != actual[i].x || expected[i].y != actual[i].y)
+          return false;
+    }
+  }
+  for (const auto kind : {KeyKind::Uniform, KeyKind::Exponential,
+                          KeyKind::DuplicateHeavy, KeyKind::AlmostSorted}) {
+    for (const auto size :
+         std::array<std::size_t, 7>{0, 1, 2, 7, 255, 2047, 4099}) {
+      const auto keys = scheduler_eval::MakeKeys(kind, size, 41 + size);
+      if (scheduler_eval::RemoveDuplicatesParallel(keys) !=
+              scheduler_eval::RemoveDuplicatesSerial(keys) ||
+          scheduler_eval::RadixSortParallel(keys) !=
+              scheduler_eval::RadixSortSerial(keys) ||
+          scheduler_eval::SampleSortParallel(keys) !=
+              scheduler_eval::SampleSortSerial(keys))
+        return false;
+    }
+  }
+  return true;
+}
+
 bool CheckGranularityEstimator() {
   scheduler_eval::GranularityEstimator estimator(std::chrono::microseconds(20));
   if (!estimator.IsSmall(1) || estimator.IsSmall(2))
@@ -140,8 +180,9 @@ int main() {
       true;
 #endif
   const bool ok = CheckScan() && CheckSpmv() && bfs_ok &&
-                  CheckSyntheticCosts() && CheckIntrusivePtrOrdering() &&
-                  CheckGranularityEstimator() && CheckSchedulerMetrics() &&
+                  CheckSyntheticCosts() && CheckPrimaryWorkloads() &&
+                  CheckIntrusivePtrOrdering() && CheckGranularityEstimator() &&
+                  CheckSchedulerMetrics() &&
                   Close(scheduler_eval::BlockedReduce(values, 37), 1253.75);
   if (!ok)
     std::cerr << "scheduler evaluation correctness test failed\n";

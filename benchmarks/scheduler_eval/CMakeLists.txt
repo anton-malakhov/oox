@@ -41,6 +41,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   list(APPEND OOX_SCHEDULER_EVAL_TARGETS ${benchmark_target})
   add_executable(${benchmark_target} bench_scheduler_eval.cpp)
   target_sources(${benchmark_target} PRIVATE
+    bench_primary_workloads.cpp primary_workloads.cpp
     bench_synthetic_workloads.cpp synthetic_workloads.cpp
     scheduler_metrics.cpp)
   if(NOT mode IN_LIST OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES)
@@ -78,7 +79,8 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   set(test_target test_scheduler_eval_${mode})
   list(APPEND OOX_SCHEDULER_EVAL_TARGETS ${test_target})
   add_executable(${test_target} tests.cpp)
-  target_sources(${test_target} PRIVATE synthetic_workloads.cpp)
+  target_sources(${test_target} PRIVATE
+    primary_workloads.cpp synthetic_workloads.cpp)
   if(NOT mode IN_LIST OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES)
     target_sources(${test_target} PRIVATE
       graph_workloads.cpp granularity_control.cpp)

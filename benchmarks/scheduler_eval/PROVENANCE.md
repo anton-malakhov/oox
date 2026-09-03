@@ -21,6 +21,7 @@ backend abstraction. No runner clones the reference at execution time.
 | `bench_reduce.cpp` | Blocked reduction with tail handling | Exact scalar result |
 | `bench_scan.cpp` | Work-efficient exclusive tree scan | Exact prefix values |
 | Three `bench_spmv_*` files | Deterministic balanced, harmonic/hyperbolic, and triangular CSR generators | Each compared with a serial CSR oracle |
+| PBBS primary kernels | Independent native convex-hull, concurrent deduplication, stable radix-sort, and sample-sort workloads with deterministic point/key families | Exact comparison with monotone-chain, sort/unique, stable-sort, and sort serial oracles |
 | `bench_mmul.cpp` | Nested dense matrix multiplication | Compared elementwise with serial multiplication |
 | `bench_mtranspose.cpp` | Nested blocked transpose | Exact element mapping |
 | `bench_spin.cpp` | Relax, atomic, isolated distributed-read, and thread-local-read payload matrix | CMake smoke run per backend mode |
@@ -73,6 +74,9 @@ backend abstraction. No runner clones the reference at execution time.
     after initialization. First-touch variants expose portable locality effects;
     the runner supports explicit local, remote, or interleaved `numactl`
     placement and opt-in process-level `perf stat` counters on Linux.
+13. Native primary-kernel workloads are compact scheduler-focused analogues,
+    independently implemented under Apache-2.0. The pinned PBBS suite remains
+    the source of exact end-to-end application implementations and checkers.
 
 ## Evaluation rules
 

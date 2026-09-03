@@ -38,9 +38,10 @@ matrix multiplication and transpose; normalized reports use only cases present
 in every selected mode. Nested workloads and registrations live in separate
 sources that CMake attaches only to reentrant modes.
 
-The `test_scheduler_eval_*` executables validate scan, reduction, and all three
-sparse distributions for every built policy. Reentrant policies additionally
-validate nested multiplication and transpose.
+The `test_scheduler_eval_*` executables validate scan, reduction, all three
+sparse distributions, convex hull, remove-duplicates, radix sort, and sample
+sort for every built policy. Reentrant policies additionally validate nested
+multiplication, transpose, and BFS.
 The standard CI configuration keeps `OOX_BUILD_BENCHMARKS=OFF`; this research
 suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 
@@ -55,6 +56,10 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Balanced SpMV | Equal row work; isolates distribution overhead |
 | Hyperbolic SpMV | A few very heavy rows and a long light tail |
 | Triangular SpMV | Gradually changing row width and work |
+| Convex hull | Parallel block sorting and merging followed by a hull scan over square, disk, circle, and Kuzmin point distributions |
+| Remove duplicates | Concurrent open-addressing over uniform, exponential, duplicate-heavy, and almost-sorted keys |
+| Stable radix sort | Four parallel histogram/scatter passes over 32-bit keys |
+| Sample sort | Deterministic sampling, parallel bucket distribution, and parallel bucket sorting |
 | Flat/fixed/adaptive BFS | High-arity trees, parallel chains, dense/sparse phases, trunk-first, RMat, square/cube grids, and a small-world control |
 | Variable-cost loops | Constant, uniform, exponential, Pareto, linear, clustered, periodic, shuffled, and phase-changing costs |
 | Competing loops | Two simultaneous OOX loops contending for one worker pool |
