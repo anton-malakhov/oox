@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "common.h"
+#include "scheduler_metrics.h"
 #include "synthetic_workloads.h"
 
 #include <benchmark/benchmark.h>
@@ -13,6 +14,7 @@ namespace {
 
 template <scheduler_eval::CostKind Kind>
 void VariableCost(benchmark::State &state) {
+  scheduler_eval::SchedulerMetricsScope metrics(state);
   const auto costs = scheduler_eval::MakeIterationCosts(Kind, state.range(0));
   for (auto _ : state)
     benchmark::DoNotOptimize(scheduler_eval::RunCostLoop(costs));
@@ -36,6 +38,7 @@ REGISTER_COST(Shuffled);
 REGISTER_COST(PhaseChanging);
 
 void CompetingLoops(benchmark::State &state) {
+  scheduler_eval::SchedulerMetricsScope metrics(state);
   const auto costs = scheduler_eval::MakeIterationCosts(
       scheduler_eval::CostKind::Clustered, state.range(0));
   for (auto _ : state) {
@@ -50,6 +53,7 @@ void CompetingLoops(benchmark::State &state) {
 }
 
 template <bool ParallelTouch> void FirstTouch(benchmark::State &state) {
+  scheduler_eval::SchedulerMetricsScope metrics(state);
   std::vector<std::uint64_t> data(state.range(0)), output(data.size());
   for (auto _ : state) {
     state.PauseTiming();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "common.h"
+#include "scheduler_metrics.h"
 #include "workloads.h"
 
 #include <benchmark/benchmark.h>
@@ -17,6 +18,7 @@ using namespace scheduler_eval;
 void Setup(const benchmark::State &) { Initialize(); }
 
 void Launch(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   for (auto _ : state)
     ParallelFor(0, static_cast<std::size_t>(state.range(0)),
                 [](std::size_t i) { benchmark::DoNotOptimize(i); });
@@ -29,6 +31,7 @@ struct alignas(hardware_constructive_interference_size) IsolatedValue {
 };
 
 template <SpinPayload Payload> void Spin(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto tasks = static_cast<std::size_t>(state.range(0));
   const auto work = static_cast<std::size_t>(state.range(1));
   const auto calls = static_cast<std::size_t>(state.range(2));
@@ -66,6 +69,7 @@ template <SpinPayload Payload> void Spin(benchmark::State &state) {
 }
 
 void Reduce(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto size = (static_cast<std::size_t>(GetNumThreads()) << 19) +
                     (static_cast<std::size_t>(GetNumThreads()) << 3) + 3;
   const auto block_size = static_cast<std::size_t>(state.range(0)) +
@@ -79,6 +83,7 @@ void Reduce(benchmark::State &state) {
 }
 
 void Scan(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto size = std::size_t{1} << state.range(0);
   std::vector<std::uint64_t> data(size);
   for (auto _ : state) {
@@ -92,6 +97,7 @@ void Scan(benchmark::State &state) {
 }
 
 template <SparseKind Kind> void SpmvBenchmark(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto rows = (static_cast<std::size_t>(GetNumThreads()) << 9) +
                     (static_cast<std::size_t>(GetNumThreads()) << 4) + 7;
   const auto columns = static_cast<std::size_t>(state.range(0)) +

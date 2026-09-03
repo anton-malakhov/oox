@@ -22,6 +22,9 @@
 
 #include <atomic>
 #include <cassert>
+#ifdef OOX_EIGEN_ENABLE_STATS
+#include <chrono>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -94,6 +97,17 @@ class ThreadPoolTempl : public ThreadPoolInterface {
 public:
   using TaskPtr = Task *;
   using Queue = RunQueue<TaskPtr, 1024>;
+
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct Statistics {
+    uint64_t scheduled{};
+    uint64_t executed{};
+    uint64_t successful_steals{};
+    uint64_t failed_steal_rounds{};
+    uint64_t sleeps{};
+    uint64_t idle_nanoseconds{};
+  };
+#endif
 
   ThreadPoolTempl(int num_threads, Environment env = Environment())
       : ThreadPoolTempl(num_threads, true, false, env) {}
@@ -241,6 +255,24 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+#ifdef OOX_EIGEN_ENABLE_STATS
+  Statistics GetStatistics() const {
+    Statistics result;
+    for (const auto &data : thread_data_) {
+      result.scheduled += data.statistics.scheduled.load(std::memory_order_relaxed);
+      result.executed += data.statistics.executed.load(std::memory_order_relaxed);
+      result.successful_steals +=
+          data.statistics.successful_steals.load(std::memory_order_relaxed);
+      result.failed_steal_rounds +=
+          data.statistics.failed_steal_rounds.load(std::memory_order_relaxed);
+      result.sleeps += data.statistics.sleeps.load(std::memory_order_relaxed);
+      result.idle_nanoseconds +=
+          data.statistics.idle_nanoseconds.load(std::memory_order_relaxed);
+    }
+    return result;
+  }
+#endif
+
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
     if (ready()) {
@@ -374,6 +406,17 @@ private:
     bool owns_queue;
   };
 
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct AtomicStatistics {
+    std::atomic<uint64_t> scheduled{0};
+    std::atomic<uint64_t> executed{0};
+    std::atomic<uint64_t> successful_steals{0};
+    std::atomic<uint64_t> failed_steal_rounds{0};
+    std::atomic<uint64_t> sleeps{0};
+    std::atomic<uint64_t> idle_nanoseconds{0};
+  };
+#endif
+
   struct ThreadData {
     ThreadData()
         : thread(), outstanding_tasks(0), local_tasks(),
@@ -382,6 +425,9 @@ private:
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+#ifdef OOX_EIGEN_ENABLE_STATS
+    AtomicStatistics statistics;
+#endif
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
@@ -475,7 +521,20 @@ private:
         worker_event_.CancelWait();
         return processed_anything;
       }
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_begin = std::chrono::steady_clock::now();
+#endif
       worker_event_.Wait(token);
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_end = std::chrono::steady_clock::now();
+      auto &statistics = thread_data_[GetPerThread()->thread_id].statistics;
+      statistics.sleeps.fetch_add(1, std::memory_order_relaxed);
+      statistics.idle_nanoseconds.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(idle_end -
+                                                               idle_begin)
+              .count(),
+          std::memory_order_relaxed);
+#endif
     }
   }
 
@@ -517,6 +576,10 @@ private:
   }
 
   void PublishTask(TaskPtr task, int target, bool local) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[target].statistics.scheduled.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     auto &outstanding = thread_data_[target].outstanding_tasks;
     task->outstanding = &outstanding;
     outstanding.fetch_add(1, std::memory_order_relaxed);
@@ -560,6 +623,10 @@ private:
     if (!task) {
       return false;
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.executed.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     ExecuteTask(task);
     return true;
   }
@@ -639,6 +706,11 @@ private:
       assert(start + victim < limit);
       TaskPtr t = thread_data_[start + victim].PopBack(force);
       if (t) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+        if (static_cast<int>(start + victim) != pt->thread_id)
+          thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
+              1, std::memory_order_relaxed);
+#endif
         return t;
       }
       victim += inc;
@@ -646,6 +718,10 @@ private:
         victim -= size;
       }
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.failed_steal_rounds.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     return nullptr;
   }
 

@@ -24,7 +24,9 @@ backend abstraction. No runner clones the reference at execution time.
 | `bench_mmul.cpp` | Nested dense matrix multiplication | Compared elementwise with serial multiplication |
 | `bench_mtranspose.cpp` | Nested blocked transpose | Exact element mapping |
 | `bench_spin.cpp` | Relax, atomic, isolated distributed-read, and thread-local-read payload matrix | CMake smoke run per backend mode |
-| Nested BFS studies | Independent CSR generators for trees, parallel chains, phased graphs, and square grids; flat and nested adjacency traversal | Both variants compared with a serial level oracle |
+| Nested BFS studies | Independent CSR generators for high-arity trees, parallel chains, dense/sparse phases, trunk-first, RMat, square/cube grids, and a small-world control; flat, fixed-cutoff, and adaptive traversal | All variants compared with a serial level oracle |
+| SPTL-style granularity control | κ/α estimator adapted from `deepsea-inria/sptl` commit `911bc7af7c658020138a08d4923224332b08a27f` under MIT | Boundary and update tests plus adaptive BFS oracle checks |
+| Eigen scheduler instrumentation | Opt-in task, steal, failed-round, sleep, and idle-time counters | Scheduled/executed accounting check and benchmark JSON smoke |
 | Irregular loop studies | Nine deterministic cost distributions, competing loops, and serial/parallel first-touch variants | Parallel loop checksums compared with a serial oracle |
 | `scheduling_dist` | Spin, barrier, and multitask arrival/worker distributions | JSON smoke run per backend mode |
 | `timespan_tuner` | Warm baseline p99 publication-timespan estimator | Baseline JSON smoke test |
@@ -53,9 +55,10 @@ backend abstraction. No runner clones the reference at execution time.
 7. The pure adaptive-grainsize mode skips the same blocking distribution case.
    This prevents a methodological deadlock rather than masking it with a
    timeout; spin and multitask results still cover that policy.
-8. Trace JSON contains only events observable around the public `ParallelFor`
-   callback. Internal enqueue, mailbox publication, and steal-source events
-   require a separate instrumentation API and are not inferred.
+8. Trace JSON contains events observable around the public `ParallelFor`
+   callback. The opt-in Eigen instrumentation counts pool-level scheduling,
+   execution, successful cross-worker steals, failed steal rounds, and worker
+   sleeps; it does not yet distinguish mailbox sources in the trace.
 9. The report generator is Python-standard-library-only and emits SVG rather
    than depending on a plotting installation. Raw Google Benchmark and trace
    JSON remain available for external analysis.
@@ -68,7 +71,8 @@ backend abstraction. No runner clones the reference at execution time.
 12. Worker availability is stressed with competing submissions. Worker count
     remains a process-level parameter because an Eigen pool cannot be resized
     after initialization. First-touch variants expose portable locality effects;
-    controlled NUMA placement remains an external `numactl` runner concern.
+    the runner supports explicit local, remote, or interleaved `numactl`
+    placement and opt-in process-level `perf stat` counters on Linux.
 
 ## Evaluation rules
 

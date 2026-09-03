@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -51,7 +52,32 @@ def parse_args(root):
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--timeout", type=int, default=600,
                         help="maximum seconds for each subprocess")
+    parser.add_argument("--cpu-node", type=int)
+    parser.add_argument("--memory-node", type=int)
+    parser.add_argument("--interleave-memory", action="store_true")
+    parser.add_argument("--perf", action="store_true")
+    parser.add_argument("--perf-events",
+                        default="cycles,instructions,cache-misses,cpu-migrations")
     return parser.parse_args()
+
+
+def placement_prefix(args):
+    requested = (args.cpu_node is not None or args.memory_node is not None or
+                 args.interleave_memory)
+    if not requested:
+        return []
+    if args.interleave_memory and args.memory_node is not None:
+        raise ValueError("--interleave-memory and --memory-node are exclusive")
+    if platform.system() != "Linux" or not shutil.which("numactl"):
+        raise RuntimeError("NUMA placement requires numactl on Linux")
+    command = ["numactl"]
+    if args.cpu_node is not None:
+        command.append(f"--cpunodebind={args.cpu_node}")
+    if args.memory_node is not None:
+        command.append(f"--membind={args.memory_node}")
+    if args.interleave_memory:
+        command.append("--interleave=all")
+    return command
 
 
 def run_json(command, output, env, timeout):
@@ -65,6 +91,9 @@ def run_json(command, output, env, timeout):
 def main():
     root = Path(__file__).resolve().parents[2]
     args = parse_args(root)
+    placement = placement_prefix(args)
+    if args.perf and (platform.system() != "Linux" or not shutil.which("perf")):
+        raise RuntimeError("--perf requires perf on Linux")
     executable_dir = args.build.resolve() / "benchmarks/scheduler_eval"
     executables = sorted(executable_dir.glob("bench_scheduler_eval_*"))
     modes = args.mode or [path.name.removeprefix("bench_scheduler_eval_")
@@ -116,6 +145,8 @@ def main():
             "OMP_PROC_BIND": os.environ.get("OMP_PROC_BIND", "unspecified"),
             "OMP_PLACES": os.environ.get("OMP_PLACES", "unspecified"),
         },
+        "numa_command": placement,
+        "perf_events": args.perf_events.split(",") if args.perf else [],
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     env = os.environ.copy()
@@ -132,25 +163,30 @@ def main():
         command.append(f"--benchmark_min_time={benchmark_min_time}")
         if benchmark_filter:
             command.append(f"--benchmark_filter={benchmark_filter}")
+        command = placement + command
+        if args.perf:
+            command = ["perf", "stat", "-x", ";", "-e", args.perf_events,
+                       "-o", str(raw / f"perf_{mode}.csv"), "--"] + command
         subprocess.run(command, env=env, check=True, timeout=args.timeout)
         json.loads((raw / f"bench_scheduler_eval_{mode}.json").read_text())
         scenarios = ["spin"] if args.smoke else ["spin", "barrier", "multitask"]
         if not args.smoke and mode == "EIGEN_STEALING_GRAINSIZE":
             scenarios.remove("barrier")
         for scenario in scenarios:
-            run_json([str(executable_dir / f"scheduling_dist_{mode}"),
+            run_json(placement + [str(executable_dir / f"scheduling_dist_{mode}"),
                       "--scenario", scenario, "--iterations",
                       "1" if args.smoke else "10"],
                      raw / f"scheduling_dist_{scenario}_{mode}.json", env,
                      args.timeout)
-        run_json([str(executable_dir / f"trace_spin_{mode}"), "--tasks",
+        run_json(placement + [str(executable_dir / f"trace_spin_{mode}"), "--tasks",
                   "8" if args.smoke else str(args.threads * 4), "--work",
                   "8" if args.smoke else "10000", "--iterations",
                   "2" if args.smoke else "1024"],
                  traces / f"trace_spin_{mode}.json", env, args.timeout)
     tuner = executable_dir / "timespan_tuner_EIGEN_STEALING"
     if tuner.exists() and "EIGEN_STEALING" in modes:
-        run_json([str(tuner), "--iterations", "2" if args.smoke else "10000"],
+        run_json(placement + [str(tuner), "--iterations",
+                  "2" if args.smoke else "10000"],
                  raw / "timespan_tuner_EIGEN_STEALING.json", env, args.timeout)
     if not args.no_plot:
         subprocess.run([sys.executable, str(Path(__file__).with_name("plot.py")),

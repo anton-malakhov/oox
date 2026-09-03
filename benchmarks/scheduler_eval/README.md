@@ -55,7 +55,7 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Balanced SpMV | Equal row work; isolates distribution overhead |
 | Hyperbolic SpMV | A few very heavy rows and a long light tail |
 | Triangular SpMV | Gradually changing row width and work |
-| Flat/nested BFS | Trees, parallel chains, phased graphs, and square grids |
+| Flat/fixed/adaptive BFS | High-arity trees, parallel chains, dense/sparse phases, trunk-first, RMat, square/cube grids, and a small-world control |
 | Variable-cost loops | Constant, uniform, exponential, Pareto, linear, clustered, periodic, shuffled, and phase-changing costs |
 | Competing loops | Two simultaneous OOX loops contending for one worker pool |
 | First touch | Serial versus parallel page initialization before parallel reads |
@@ -65,6 +65,14 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 Inputs are deterministic and construction and validation stay outside measured
 regions. A full SpMV run intentionally has the same large scale as the research
 workload and can require several gigabytes; use `--smoke` before a full run.
+Adaptive BFS uses SPTL's κ/α estimator rule with its 20 µs and 1.8 defaults;
+see `THIRDPARTY.md` for the retained MIT notice.
+
+Eigen benchmark JSON includes scheduled/executed tasks, successful steals,
+failed steal rounds, worker sleeps, and observed sleeping time. BFS additionally
+records nested launches, sequentialized inner loops, and the learned sequential
+complexity limit. The counters are compiled only for scheduler-evaluation
+targets.
 
 ## Startup and publication probes
 
@@ -102,12 +110,22 @@ python3 benchmarks/scheduler_eval/run.py \
 
 python3 benchmarks/scheduler_eval/run.py \
   --build build-eval --threads 16 --repetitions 5 --timeout 1800
+
+python3 benchmarks/scheduler_eval/run.py \
+  --build build-eval --threads 16 --cpu-node 0 --memory-node 1 --perf
 ```
 
 Use `--filter REGEX` for a workload family and `--benchmark-min-time 9s` for
 long throughput-quality samples. The default is 0.5 seconds per benchmark
 case. A result's `complete` metadata field becomes true only after all selected
 commands and report generation succeed.
+
+On Linux, `--cpu-node` and `--memory-node` create explicit local or remote NUMA
+placements; `--interleave-memory` selects interleaved allocation. `--perf`
+records process-level cycles, instructions, cache misses, and CPU migrations,
+with `--perf-events` available for another event list. Placement and event names
+are retained in metadata. These options fail early when `numactl` or `perf` is
+unavailable rather than silently running an uncontrolled experiment.
 
 Each timestamped directory under `results/scheduler_eval` contains:
 

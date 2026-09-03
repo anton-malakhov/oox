@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "nested_workloads.h"
+#include "scheduler_metrics.h"
 
 #include <benchmark/benchmark.h>
 
@@ -12,6 +13,7 @@ using namespace scheduler_eval;
 void SetupNested(const benchmark::State &) { Initialize(); }
 
 void MatrixMultiply(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto size = (static_cast<std::size_t>(GetNumThreads()) << 3) +
                     static_cast<std::size_t>(GetNumThreads()) + 7;
   auto left = MakeDenseMatrix(size, size);
@@ -25,6 +27,7 @@ void MatrixMultiply(benchmark::State &state) {
 }
 
 void MatrixTranspose(benchmark::State &state) {
+  SchedulerMetricsScope metrics(state);
   const auto size = (static_cast<std::size_t>(GetNumThreads()) << 4) +
                     static_cast<std::size_t>(GetNumThreads());
   auto input = MakeDenseMatrix(size, size);
