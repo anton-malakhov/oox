@@ -319,7 +319,9 @@ TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
   std::atomic<size_t> ordinary{0};
   for (size_t task = 0; task < tasks; ++task) {
     harness.pool.Schedule(MakeTask([&] {
-      ordinary.fetch_add(1, std::memory_order_relaxed);
+      if (ordinary.fetch_add(1, std::memory_order_acq_rel) + 1 == tasks) {
+        harness.pool.NotifyTaskCompletion();
+      }
     }));
   }
   std::atomic<size_t> nested{0};
