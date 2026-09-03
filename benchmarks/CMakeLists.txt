@@ -31,6 +31,7 @@ FetchContent_MakeAvailable(benchmark)
 
 list(APPEND OOX_BENCHMARKS bench_fib bench_loops)
 option(OOX_BUILD_TASKBENCH "Build Task-Bench-style benchmarks" ON)
+option(OOX_BUILD_SCHEDULER_EVALS "Build composable-scheduler evaluation kernels" OFF)
 set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tasks: tbb, system, or jemalloc")
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
 set(OOX_BACKENDS)
@@ -94,14 +95,19 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
+  list(APPEND EIGEN_LOOP_MODES
+    EIGEN_STEALING_LOOP EIGEN_RAPID_LOOP EIGEN_RAPID_MAILBOX_LOOP
+    EIGEN_RAPID_LAZY_STEALING_LOOP EIGEN_RAPID_TIMESPAN_LAZY_STEALING_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
   foreach(mode IN LISTS OOX_BACKENDS)
     if("${bench}" MATCHES "loops")
       set(OOX_LOOP_MODES ${${mode}_LOOP_MODES})
+      set(OOX_LOOP_CTEST_FILTER "/64")
     else()
       set(OOX_LOOP_MODES exe)
+      set(OOX_LOOP_CTEST_FILTER ${OOX_BENCHMARK_CTEST_FILTER})
     endif()
     foreach(suffix IN LISTS OOX_LOOP_MODES)
       add_executable(${bench}_${mode}.${suffix} ${bench}.cpp)
@@ -111,7 +117,7 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
       add_test(NAME ${bench}_${mode}.${suffix}
                COMMAND ${bench}_${mode}.${suffix}
                        --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
-                       --benchmark_filter=${OOX_BENCHMARK_CTEST_FILTER})
+                       --benchmark_filter=${OOX_LOOP_CTEST_FILTER})
     endforeach()
   endforeach()
 endforeach()
@@ -157,8 +163,13 @@ if(TBB_FOUND)
                    --benchmark_repetitions=1
                    --benchmark_min_warmup_time=0
                    --benchmark_filter=/128/16)
+  set_tests_properties(bench_taskbench_alt_failures PROPERTIES TIMEOUT 60)
 endif()
 
 if(OOX_BUILD_TASKBENCH)
   add_subdirectory(taskbench)
+endif()
+
+if(OOX_BUILD_SCHEDULER_EVALS)
+  add_subdirectory(scheduler_eval)
 endif()

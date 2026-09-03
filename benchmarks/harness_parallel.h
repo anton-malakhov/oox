@@ -43,6 +43,11 @@
 
 #define TF_FOR_EACH 30
 #define FOLLY_FOR_EACH 40
+#define EIGEN_STEALING_LOOP 50
+#define EIGEN_RAPID_LOOP 51
+#define EIGEN_RAPID_MAILBOX_LOOP 52
+#define EIGEN_RAPID_LAZY_STEALING_LOOP 53
+#define EIGEN_RAPID_TIMESPAN_LAZY_STEALING_LOOP 54
 
 #ifndef PARALLEL
 #define PARALLEL TBB_SIMPLE
@@ -56,6 +61,9 @@
 #define __USE_TF__ 1
 #elif PARALLEL == FOLLY_FOR_EACH
 #define __USE_FOLLY__ 1
+#elif PARALLEL >= EIGEN_STEALING_LOOP && \
+    PARALLEL <= EIGEN_RAPID_TIMESPAN_LAZY_STEALING_LOOP
+#define __USE_EIGEN__ 1
 #else
 #error Unrecognized PARALLEL mode
 #endif
@@ -97,6 +105,40 @@
 #elif __USE_FOLLY__
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
+#elif __USE_EIGEN__
+#pragma push_macro("OMP_RUNTIME")
+#pragma push_macro("TBB_SIMPLE")
+#pragma push_macro("TBB_AUTO")
+#pragma push_macro("TBB_AFFINITY")
+#pragma push_macro("TBB_CONST_AFFINITY")
+#pragma push_macro("TBB_RAPID")
+#undef OMP_RUNTIME
+#undef TBB_SIMPLE
+#undef TBB_AUTO
+#undef TBB_AFFINITY
+#undef TBB_CONST_AFFINITY
+#undef TBB_RAPID
+#if PARALLEL == EIGEN_STEALING_LOOP
+#define EIGEN_MODE EIGEN_STEALING
+#include "eigen/parallel_for.h"
+#else
+#if PARALLEL == EIGEN_RAPID_LOOP
+#define EIGEN_MODE EIGEN_RAPID
+#elif PARALLEL == EIGEN_RAPID_MAILBOX_LOOP
+#define EIGEN_MODE EIGEN_RAPID_MAILBOX
+#elif PARALLEL == EIGEN_RAPID_LAZY_STEALING_LOOP
+#define EIGEN_MODE EIGEN_RAPID_LAZY_STEALING
+#else
+#define EIGEN_MODE EIGEN_RAPID_TIMESPAN_LAZY_STEALING
+#endif
+#include "scheduler_eval/rapid_start_adapter.h"
+#endif
+#pragma pop_macro("TBB_RAPID")
+#pragma pop_macro("TBB_CONST_AFFINITY")
+#pragma pop_macro("TBB_AFFINITY")
+#pragma pop_macro("TBB_AUTO")
+#pragma pop_macro("TBB_SIMPLE")
+#pragma pop_macro("OMP_RUNTIME")
 #endif
 
 #include <sys/syscall.h>
@@ -149,7 +191,9 @@ tf::Taskflow taskflow;
 #endif // __USE_TF__
 
 static int GetNumThreads() {
-#if HAVE_TBB
+#if __USE_EIGEN__
+    return ::GetNumThreads();
+#elif HAVE_TBB
     return ::tbb::info::default_concurrency(); //tbb::this_task_arena::max_concurrency();
 #elif HAVE_OMP
     return omp_get_max_threads();
@@ -273,6 +317,9 @@ static int InitParallel(int n = 0)
     for (int i = 0; i < nThreads; i++)
         executor.add([]{});
     executor.join();
+#elif __USE_EIGEN__
+    nThreads = n? n : GetNumThreads();
+    ::InitParallel(nThreads);
 #endif
     return nThreads;
 }
@@ -404,6 +451,11 @@ void parallel_for( Iter s, Iter e, Iter g, const Body &b) {
     for (int i = s; i < e; i++)
         executor.add([i, &b]{b(i);});
     executor.join();
+
+#elif __USE_EIGEN__
+    ::ParallelFor(size_t(s), size_t(e), [&](size_t i) {
+        executive_range(Iter(i));
+    }, size_t(g));
 
 #else // other TBB parallel_fors
 //  implied:  static tbb::task_group_context context(tbb::task_group_context::isolated, tbb::task_group_context::default_traits);

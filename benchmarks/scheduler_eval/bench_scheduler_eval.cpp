@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "common.h"
+#include "workloads.h"
+
+#include <benchmark/benchmark.h>
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace {
+
+using namespace scheduler_eval;
+
+void Setup(const benchmark::State &) { Initialize(); }
+
+void Launch(benchmark::State &state) {
+  for (auto _ : state)
+    ParallelFor(0, static_cast<std::size_t>(state.range(0)),
+                [](std::size_t i) { benchmark::DoNotOptimize(i); });
+}
+
+#ifdef EIGEN_MODE
+void MixedOrdinary(benchmark::State &state) {
+  const auto ordinary_tasks = static_cast<std::size_t>(state.range(0));
+  const auto ordinary_work = static_cast<std::size_t>(state.range(1));
+  const auto parallel_tasks = static_cast<std::size_t>(state.range(2));
+  const auto parallel_work = static_cast<std::size_t>(state.range(3));
+  for (auto _ : state) {
+    std::atomic<std::size_t> remaining{ordinary_tasks};
+    for (std::size_t task = 0; task < ordinary_tasks; ++task) {
+      EigenPool().Schedule(oox::detail::eigen_pool::MakeTask([&] {
+        for (std::size_t work = 0; work < ordinary_work; ++work)
+          CpuRelax();
+        if (remaining.fetch_sub(1, std::memory_order_release) == 1)
+          EigenPool().NotifyTaskCompletion();
+      }));
+    }
+    ParallelFor(0, parallel_tasks, [&](std::size_t) {
+      for (std::size_t work = 0; work < parallel_work; ++work)
+        CpuRelax();
+    });
+    EigenPool().Wait(
+        [&] { return remaining.load(std::memory_order_acquire) == 0; });
+  }
+  state.SetItemsProcessed(state.iterations() *
+                          (ordinary_tasks * ordinary_work +
+                           parallel_tasks * parallel_work));
+}
+#endif
+
+enum class SpinPayload { Relax, Atomic, DistributedRead, ThreadLocal };
+
+const SparseMatrix &CachedSparseMatrix(std::size_t rows, std::size_t columns,
+                                       SparseKind kind, RowOrder order) {
+  struct Cache {
+    SparseMatrix matrix;
+    SparseKind kind{};
+    RowOrder order{};
+    std::size_t rows{};
+    std::size_t columns{};
+  };
+  static Cache cache;
+  if (cache.rows != rows || cache.columns != columns || cache.kind != kind ||
+      cache.order != order) {
+    cache.rows = 0;
+    cache.columns = 0;
+    cache.matrix = {};
+    cache.matrix = MakeSparseMatrix(rows, columns, kind, 1, order);
+    cache.kind = kind;
+    cache.order = order;
+    cache.rows = rows;
+    cache.columns = columns;
+  }
+  return cache.matrix;
+}
+
+struct alignas(hardware_constructive_interference_size) IsolatedValue {
+  std::uint64_t value{1};
+};
+
+template <SpinPayload Payload> void Spin(benchmark::State &state) {
+  const auto tasks = static_cast<std::size_t>(state.range(0));
+  const auto work = static_cast<std::size_t>(state.range(1));
+  const auto calls = static_cast<std::size_t>(state.range(2));
+  alignas(hardware_constructive_interference_size)
+      std::atomic<std::uint64_t> shared{1};
+  std::vector<IsolatedValue> distributed(tasks);
+  for (auto _ : state) {
+    for (std::size_t call = 0; call < calls; ++call) {
+      ParallelFor(0, tasks, [&](std::size_t task) {
+        if constexpr (Payload == SpinPayload::Relax) {
+          for (std::size_t i = 0; i < work; ++i)
+            CpuRelax();
+        } else if constexpr (Payload == SpinPayload::Atomic) {
+          std::uint64_t value = 0;
+          for (std::size_t i = 0; i < work; ++i)
+            value += shared.load(std::memory_order_relaxed);
+          benchmark::DoNotOptimize(value);
+        } else if constexpr (Payload == SpinPayload::DistributedRead) {
+          std::uint64_t value = 0;
+          const volatile auto *source = &distributed[task].value;
+          for (std::size_t i = 0; i < work; ++i)
+            value = *source;
+          benchmark::DoNotOptimize(value);
+        } else {
+          static thread_local std::uint64_t local = 1;
+          volatile std::uint64_t value = 0;
+          for (std::size_t i = 0; i < work; ++i)
+            value = local;
+          benchmark::DoNotOptimize(value);
+        }
+      });
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * tasks * calls);
+}
+
+void Reduce(benchmark::State &state) {
+  const auto size = (static_cast<std::size_t>(GetNumThreads()) << 19) +
+                    (static_cast<std::size_t>(GetNumThreads()) << 3) + 3;
+  const auto block_size = static_cast<std::size_t>(state.range(0)) +
+                          static_cast<std::size_t>(GetNumThreads()) + 3;
+  std::vector<double> data(size, 1.0);
+  for (auto _ : state) {
+    auto sum = BlockedReduce(data, block_size);
+    benchmark::DoNotOptimize(sum);
+  }
+  state.SetItemsProcessed(state.iterations() * size);
+}
+
+void Scan(benchmark::State &state) {
+  const auto size = std::size_t{1} << state.range(0);
+  std::vector<std::uint64_t> data(size);
+  for (auto _ : state) {
+    state.PauseTiming();
+    std::fill(data.begin(), data.end(), 1);
+    state.ResumeTiming();
+    ExclusiveScan(data);
+    benchmark::DoNotOptimize(data.data());
+  }
+  state.SetItemsProcessed(state.iterations() * size);
+}
+
+template <SparseKind Kind, RowOrder Order = RowOrder::Sorted>
+void SpmvBenchmark(benchmark::State &state) {
+  const auto rows = (static_cast<std::size_t>(GetNumThreads()) << 9) +
+                    (static_cast<std::size_t>(GetNumThreads()) << 4) + 7;
+  const auto columns = static_cast<std::size_t>(state.range(0)) +
+                       (static_cast<std::size_t>(GetNumThreads()) << 2) + 3;
+  const auto &matrix = CachedSparseMatrix(rows, columns, Kind, Order);
+  std::vector<double> input(columns, 1.0), output;
+  for (auto _ : state) {
+    Spmv(matrix, input, output);
+    benchmark::DoNotOptimize(output.data());
+  }
+  state.SetItemsProcessed(state.iterations() * matrix.values.size());
+}
+
+#define SCHEDULER_SPIN_ARGS(scale)                                             \
+  ->ArgNames({"tasks", "work", "calls"})                                       \
+      ->Args({1 << 10, (1 << 10) * scale, 1})                                  \
+      ->Args({GetNumThreads(), (1 << 20) * scale, 1})                          \
+      ->Args({1 << 13, (1 << 13) * scale, 1})                                  \
+      ->Args({1 << 16, (1 << 10) * scale, 1})                                  \
+      ->Args({GetNumThreads(), 1, 1024})                                       \
+      ->Args({1 << 20, 1, 1})
+
+#define SCHEDULER_SPMV_RANGE                                                   \
+  ->Setup(Setup)->RangeMultiplier(2)->Range(1 << 12, 1 << 17)->UseRealTime()
+
+BENCHMARK(Launch)
+    ->Setup(Setup)
+    ->RangeMultiplier(4)
+    ->Range(64, 1 << 18)
+    ->UseRealTime();
+#ifdef EIGEN_MODE
+BENCHMARK(MixedOrdinary)
+    ->Setup(Setup)
+    ->ArgNames({"ordinary_tasks", "ordinary_work", "parallel_tasks",
+               "parallel_work"})
+    ->Args({1, 1 << 15, 1 << 13, 64})
+    ->Args({4, 1 << 15, 1 << 13, 64})
+    ->Args({8, 1 << 15, 1 << 13, 64})
+    ->UseRealTime();
+#endif
+BENCHMARK_TEMPLATE(Spin, SpinPayload::Relax)
+    ->Setup(Setup) SCHEDULER_SPIN_ARGS(1)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(Spin, SpinPayload::Atomic)
+    ->Setup(Setup) SCHEDULER_SPIN_ARGS(32)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(Spin, SpinPayload::DistributedRead)
+    ->Setup(Setup) SCHEDULER_SPIN_ARGS(32)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(Spin, SpinPayload::ThreadLocal)
+    ->Setup(Setup) SCHEDULER_SPIN_ARGS(32)
+    ->UseRealTime();
+BENCHMARK(Reduce)
+    ->Setup(Setup)
+    ->RangeMultiplier(2)
+    ->Range(1 << 12, 1 << 19)
+    ->UseRealTime();
+BENCHMARK(Scan)->Setup(Setup)->DenseRange(10, 24, 2)->UseRealTime();
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Balanced) SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic) SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle) SCHEDULER_SPMV_RANGE;
+// Same per-row cost multiset, different contiguous structure. A scheduler whose
+// time changes across these three has a spatial (not purely statistical)
+// balancing story; one that does not is explained by mu/sigma alone.
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shuffled)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shifted)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shuffled)
+SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shifted)
+SCHEDULER_SPMV_RANGE;
+} // namespace
+
+BENCHMARK_MAIN();

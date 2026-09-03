@@ -4,16 +4,62 @@ This directory contains OOX's private scheduler port. Its immediate source is
 [`EgorkaZ/pbbsbench`](https://github.com/EgorkaZ/pbbsbench/tree/396a299f03c58dbe9e7604daab38a65781227b75/parlaylib/include/parlay/internal/scheduler_plugins/eigen),
 pinned at commit `396a299f03c58dbe9e7604daab38a65781227b75`.
 The mailbox changes first appeared there in commit `e857cdd`, although OOX now
-adds a guarded overflow queue when the copied bounded publication paths fill.
+releases publication admission before executing work rejected by those bounded
+paths.
 
 All implementation symbols live in `oox::detail::eigen_pool`; none are part of
 Eigen's namespace or OOX's public API. Workers briefly spin only when requested,
 then park with C++20 atomic wait/notify. Queue publication advances a worker
 generation without taking a global mutex, and task completion only notifies
 registered waiters. Published-task accounting keeps workers alive during
-destructor draining and nested waits. Full local deques and mailboxes spill to an
-unbounded guarded queue, so nested spawning never falls back to recursive inline
-execution.
+destructor draining and nested waits. Local deques and mailboxes remain bounded;
+when one fills, the submitting thread executes the rejected task only after its
+publication guard is released. This provides finite queue storage without making
+reentrant cancellation wait on its own publication.
+
+Cancellation closes generic publication before draining either queue family.
+Ordinary submission uses one pool-wide admission state, while Rapid submission
+uses one state per target inbox. Cancellation is idempotent for concurrent and
+re-entrant callers. Mailbox batches avoid a synchronization operation per range
+task: a batch overlapping cancellation performs a final, serialized drain so no
+task can be stranded after cancellation's first drain.
+
+`rapid_start.h` builds a reentrant rapid-region layer on this pool, while
+`rapid_start_model.h` isolates the block-size and timespan calculations so they
+can be reviewed and tested independently. Workers keep
+their pool-lifetime, generation-stamped registrations; loop invocations do not
+register or trap workers. Immutable groups name contiguous domains, activation
+trees split both workers and iterations proportionally, and TLS region contexts
+propagate subdomains into nested loops. A per-worker atomic inbox with a bounded
+lock-free overflow is checked with a fairness budget before ordinary work. If
+that bounded rapid path fills, the activation's embedded ticket falls back to
+the ordinary queue. Descriptors come from a preallocated slab with an
+ABA-stamped free-list head. A completion ticket makes the transition to zero
+the unique descriptor-recycling claim, and completion follows the activation
+tree.
+Optional elastic lending leases one balanced topology subtree with one stamped
+CAS.
+
+Four parallel-for policies share that activation layer. `ParallelFor` keeps
+each proportional range inside Rapid Start for its whole lifetime.
+`ParallelForMailbox` uses Rapid Start to publish a bounded set of adaptive
+range blocks to the ordinary mailboxes, then lets the ordinary deques steal
+them freely. Ordinary tasks retain their logical proportional domain for
+nested calls without remaining registered in a Rapid region.
+`ParallelForLazyStealing` claims adaptive blocks directly from a shared range
+coordinator: one first block is reserved for every proportional owner before
+execution is published. Each worker starts with its protected block and leaves
+the Rapid domain once before taking otherwise idle later blocks.
+`ParallelForTimespanLazyStealing` adds a per-owner elapsed-time estimate to that
+lazy policy. It calibrates clock and atomic-claim overhead once on the running
+CPU, scales that cost by the effective domain, and derives each target from
+the projected owner-range time and live steal pressure. Blocks preserve at least
+four later steal opportunities; peer thieves consume the last published
+estimate without perturbing it. A nonzero target can still be supplied
+explicitly for experiments, but the default contains no duration constant. All
+hybrid policies run one-worker domains directly and preserve nested calls,
+exception propagation, pool cancellation, and caller-supplied minimum grain
+sizes.
 
 ## File provenance and license
 

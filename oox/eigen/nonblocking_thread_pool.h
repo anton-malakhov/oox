@@ -21,10 +21,11 @@
 #include "stl_thread_env.h"
 
 #include <atomic>
+#include <bit>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -34,24 +35,135 @@
 #include <utility>
 #include <vector>
 
+// Batch publication wakes parked workers once per batch with a count instead
+// of once per task. Set to 0 to restore per-task notification for A/B runs.
+#ifndef OOX_EIGEN_BATCHED_WAKE
+#define OOX_EIGEN_BATCHED_WAKE 1
+#endif
+
 namespace oox::detail::eigen_pool {
+
+namespace rapid {
+class RapidDomainState;
+}
+
+// ResidentBusy is an explicit pool-lifetime policy. Idle workers advertise a
+// bit and poll a command slot instead of entering the OS parking protocol.
+enum class WorkerIdleMode { Park, ResidentBusy };
+
+struct DomainId {
+  unsigned start = 0;
+  unsigned limit = 0;
+
+  bool IsEmpty() const noexcept { return start == limit; }
+  bool IsValidFor(size_t workers) const noexcept {
+    return start < limit && limit <= workers;
+  }
+  size_t Size() const noexcept {
+    return limit >= start ? limit - start : 0;
+  }
+  bool Contains(size_t worker) const noexcept {
+    return worker >= start && worker < limit;
+  }
+};
+
+struct RegionContext {
+  DomainId domain;
+  RegionContext *parent = nullptr;
+  bool leave_on_steal = false;
+  rapid::RapidDomainState *rapid_state = nullptr;
+};
+
+class ScopedRegionContext {
+public:
+  ScopedRegionContext(RegionContext *&current, RegionContext *replacement)
+      : current_(current), previous_(std::exchange(current, replacement)) {}
+  ScopedRegionContext(const ScopedRegionContext &) = delete;
+  ScopedRegionContext &operator=(const ScopedRegionContext &) = delete;
+  ~ScopedRegionContext() { current_ = previous_; }
+
+private:
+  RegionContext *&current_;
+  RegionContext *previous_;
+};
+
+struct Task;
+
+class RapidTask {
+public:
+  virtual void AddTickets(size_t count) noexcept = 0;
+  virtual bool TryRun() = 0;
+  virtual void Cancel() noexcept = 0;
+  virtual void ReleaseTicket() noexcept = 0;
+  virtual RegionContext *Context() noexcept = 0;
+  virtual Task *FallbackTicket() noexcept = 0;
+  virtual ~RapidTask() = default;
+};
+
+class ResidentTask {
+public:
+  virtual void Run(size_t slot) noexcept = 0;
+  virtual ~ResidentTask() = default;
+};
+
+class RapidTicketGuard {
+public:
+  explicit RapidTicketGuard(RapidTask &task) noexcept : task_(task) {}
+  RapidTicketGuard(const RapidTicketGuard &) = delete;
+  RapidTicketGuard &operator=(const RapidTicketGuard &) = delete;
+  ~RapidTicketGuard() { task_.ReleaseTicket(); }
+
+private:
+  RapidTask &task_;
+};
 
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
+  RegionContext *region_context = nullptr;
   virtual void operator()() = 0;
+  virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
 };
 
-template <typename F> struct UniqueTask : Task {
-
-  UniqueTask(F &&f) : f(std::move(f)) {}
-
-  void operator()() override {
-    f();
-    delete this; // really safe to do heere
+class RapidFallbackTask final : public Task {
+public:
+  void Bind(RapidTask *task) noexcept {
+    assert(rapid_ == nullptr);
+    rapid_ = task;
+    region_context = task->Context();
+  }
+  void operator()() final {
+    RapidTask *task = rapid_;
+    rapid_ = nullptr;
+    assert(task != nullptr);
+    RapidTicketGuard release(*task);
+    task->TryRun();
+  }
+  void Discard() noexcept final {
+    RapidTask *task = rapid_;
+    rapid_ = nullptr;
+    if (task) {
+      task->Cancel();
+      task->ReleaseTicket();
+    }
   }
 
-  std::decay_t<F> f;
+private:
+  RapidTask *rapid_ = nullptr;
+};
+
+template <typename F> struct UniqueTask : Task {
+  using Function = std::decay_t<F>;
+
+  explicit UniqueTask(F &&function)
+      : function_(std::forward<F>(function)) {}
+
+  void operator()() override {
+    std::unique_ptr<UniqueTask> self(this);
+    self->function_();
+  }
+
+  Function function_;
 };
 
 template <typename F> Task *MakeTask(F &&f) {
@@ -99,24 +211,41 @@ public:
 
   ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
                   Environment env = Environment())
+      : ThreadPoolTempl(num_threads, allow_spinning, use_main_thread,
+                        WorkerIdleMode::Park, env) {}
+
+  ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
+                  WorkerIdleMode idle_mode, Environment env = Environment())
       : env_(env), num_threads_(ValidateThreadCount(num_threads)),
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
         global_steal_partition_(EncodePartition(0, num_threads_)),
-        pool_generation_(NextPoolGeneration()), done_(false),
+        pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
+        resident_available_words_(
+            idle_mode_ == WorkerIdleMode::ResidentBusy
+                ? (static_cast<size_t>(num_threads_) + 63) / 64
+                : 0),
+        resident_available_(resident_available_words_ == 0
+                                ? nullptr
+                                : std::make_unique<std::atomic<uint64_t>[]>(
+                                      resident_available_words_)),
+        done_(false),
         cancelled_(false) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
     // operations. Iteration is based on the fact that if we take
     // a random starting thread index t and calculate num_threads - 1 subsequent
     // indices as (t + coprime) % num_threads, we will cover all threads without
-    // repetitions (effectively getting a presudo-random permutation of thread
+    // repetitions (effectively getting a pseudo-random permutation of thread
     // indices).
     for (int i = 1; i <= num_threads_; ++i) {
       all_coprimes_.emplace_back(i);
       ComputeCoprimes(i, &all_coprimes_.back());
     }
     thread_data_.resize(num_threads_);
+    for (size_t word = 0; word < resident_available_words_; ++word) {
+      resident_available_[word].store(0, std::memory_order_relaxed);
+    }
     for (int i = 0; i < num_threads_; i++) {
       SetStealPartition(i, EncodePartition(0, num_threads_));
     }
@@ -178,32 +307,76 @@ public:
     if (t == nullptr) {
       return;
     }
-    if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
-      return;
-    }
     threadIndex = threadIndex % num_threads_;
     PerThread *pt = GetPerThread();
     const bool local = IsRegistered(pt) && pt->owns_queue &&
                        threadIndex == static_cast<size_t>(pt->thread_id);
-    PublishTask(t, static_cast<int>(threadIndex), local);
+    PublishOrdinaryTask(t, static_cast<int>(threadIndex), local);
   }
+
+  template <typename F> void PublishOrdinaryBatch(F &&publisher) {
+    // Batch publication may overlap cancellation. The final reconciliation
+    // drains any tasks published after cancellation's own drain.
+    if ((ordinary_publication_state_.load(std::memory_order_acquire) &
+         kPublicationCancelled) != 0) {
+      return;
+    }
+    // Wake one worker on the first publication so a parked pool starts
+    // immediately, then defer the remaining notifications to one NotifyN at
+    // the end of the batch (including exceptional exits). Every mature parking
+    // protocol (Eigen EventCount, Rayon's jobs event counter, Tokio) tolerates
+    // a lost wake because the publishing worker will still pop the work.
+    size_t deferred = 0;
+    bool first_publication = true;
+    struct WakeDeferred {
+      ThreadPoolTempl *pool;
+      size_t &count;
+      ~WakeDeferred() {
+        if (count != 0) {
+          pool->worker_event_.NotifyN(count);
+        }
+      }
+    } wake_guard{this, deferred};
+    auto publish_one = [&](TaskPtr task, size_t thread_index) {
+      assert(task != nullptr);
+      thread_index %= static_cast<size_t>(num_threads_);
+      PerThread *pt = GetPerThread();
+      const bool local = IsRegistered(pt) && pt->owns_queue &&
+                         thread_index == static_cast<size_t>(pt->thread_id);
+#if OOX_EIGEN_BATCHED_WAKE
+      const bool wake_now = first_publication;
+      first_publication = false;
+      TaskPtr inline_task = PublishAdmittedTask(
+          task, static_cast<int>(thread_index), local, wake_now);
+      if (!wake_now && !inline_task) {
+        ++deferred;
+      }
+      if (inline_task) {
+        ExecuteTask(inline_task);
+      }
+#else
+      if (TaskPtr inline_task =
+              PublishAdmittedTask(task, static_cast<int>(thread_index), local)) {
+        ExecuteTask(inline_task);
+      }
+#endif
+    };
+    std::forward<F>(publisher)(publish_one);
+  }
+
+  // Pair with every PublishOrdinaryBatch call, including exceptional exits.
+  void FinishOrdinaryBatch() { ReconcileCancelledOrdinaryBatch(); }
 
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
     if (t == nullptr) {
       return;
     }
     AssertBounds(start, limit);
-    if (cancelled_.load(std::memory_order_acquire)) {
-      delete t;
-      return;
-    }
-
     PerThread *pt = GetPerThread();
     if (IsRegistered(pt) && pt->owns_queue && pt->thread_id >= start &&
         pt->thread_id < limit) {
       // Worker thread of this pool, push onto the thread's queue.
-      PublishTask(t, pt->thread_id, true);
+      PublishOrdinaryTask(t, pt->thread_id, true);
       return;
     }
 
@@ -212,22 +385,23 @@ public:
     }
     const int target =
         start + static_cast<int>(Rand(&pt->rand) % (limit - start));
-    PublishTask(t, target, false);
+    PublishOrdinaryTask(t, target, false);
   }
 
   void Cancel() override {
-    cancelled_.store(true, std::memory_order_release);
-    done_.store(true, std::memory_order_release);
-
-    // Let each thread know it's been cancelled.
-#ifdef OOX_EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
-    for (size_t i = 0; i < thread_data_.size(); i++) {
-      if (thread_data_[i].thread) {
-        thread_data_[i].thread->OnCancel();
-      }
+    if (ActiveCancellation() == this) {
+      return;
     }
-#endif
-    WakeAll();
+    std::call_once(cancellation_once_, [this] {
+      ThreadPoolTempl *&active = ActiveCancellation();
+      ThreadPoolTempl *previous = std::exchange(active, this);
+      struct RestoreCancellation {
+        ThreadPoolTempl *&active;
+        ThreadPoolTempl *previous;
+        ~RestoreCancellation() { active = previous; }
+      } restore{active, previous};
+      CancelOnce();
+    });
   }
 
   size_t NumThreads() const final { return num_threads_; }
@@ -258,6 +432,164 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+  RegionContext *CurrentRegionContext() const noexcept {
+    const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
+    return pt->region_context;
+  }
+
+  void NotifyRapidRegionStart() noexcept { UpdateRapidLinger(); }
+
+  template <typename F>
+  decltype(auto) ExecuteInRegion(RegionContext *context, F &&function) noexcept(
+      noexcept(std::forward<F>(function)())) {
+    PerThread *pt = GetPerThread();
+    ScopedRegionContext restore(pt->region_context, context);
+    return std::forward<F>(function)();
+  }
+
+  size_t WorkerRegistrationCount() const noexcept {
+    return registrations_started_.load(std::memory_order_acquire);
+  }
+
+  size_t RapidDeregistrationCount() const noexcept {
+    return rapid_deregistrations_.load(std::memory_order_acquire);
+  }
+
+  // Worker wake notifications that reached a parked worker. Diagnostic.
+  size_t WorkerWakeNotifications() const noexcept {
+    return worker_event_.Notifications();
+  }
+
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
+
+  bool UsesResidentBusyWait() const noexcept {
+    return idle_mode_ == WorkerIdleMode::ResidentBusy;
+  }
+
+  size_t ResidentAvailableWorkers(DomainId domain) const noexcept {
+    size_t available = 0;
+    for (size_t word = 0; word < resident_available_words_; ++word) {
+      available += std::popcount(
+          resident_available_[word].load(std::memory_order_acquire) &
+          ResidentDomainMask(word, domain));
+    }
+    return available;
+  }
+
+  size_t ClaimResidentWorkers(DomainId domain, unsigned *workers,
+                              size_t capacity) noexcept {
+    if (idle_mode_ != WorkerIdleMode::ResidentBusy || capacity == 0) {
+      return 0;
+    }
+    // The word index is worker / 64 and the bit is worker % 64. Rotating both
+    // starting positions avoids repeatedly favoring low-numbered workers.
+    const size_t ticket = resident_claim_cursor_.fetch_add(
+        std::max<size_t>(capacity, 1), std::memory_order_relaxed);
+    const size_t first_word = (ticket / 64) % resident_available_words_;
+    const unsigned first_bit = static_cast<unsigned>(ticket % 64);
+    size_t claimed = 0;
+    for (size_t offset = 0;
+         offset < resident_available_words_ && claimed < capacity; ++offset) {
+      const size_t word = (first_word + offset) % resident_available_words_;
+      const uint64_t allowed = ResidentDomainMask(word, domain);
+      uint64_t observed =
+          resident_available_[word].load(std::memory_order_acquire);
+      while (observed & allowed) {
+        const uint64_t candidates = observed & allowed;
+        uint64_t selected = 0;
+        for (unsigned step = 0;
+             step < 64 && std::popcount(selected) < capacity - claimed;
+             ++step) {
+          const unsigned bit = (first_bit + step) % 64;
+          selected |= candidates & (uint64_t{1} << bit);
+        }
+        if (resident_available_[word].compare_exchange_weak(
+                observed, observed & ~selected, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+          while (selected != 0) {
+            const unsigned bit = std::countr_zero(selected);
+            workers[claimed++] = static_cast<unsigned>(word * 64 + bit);
+            selected &= selected - 1;
+          }
+          break;
+        }
+      }
+    }
+    return claimed;
+  }
+
+  void PublishResident(ResidentTask &task, std::atomic<size_t> &completion,
+                       unsigned worker, size_t slot) noexcept {
+    assert(worker < static_cast<unsigned>(num_threads_));
+    ThreadData &data = thread_data_[worker];
+    assert(data.resident_task.load(std::memory_order_relaxed) == nullptr);
+    data.resident_slot = slot;
+    data.resident_completion = &completion;
+    data.resident_task.store(&task, std::memory_order_release);
+  }
+
+  void ScheduleRapid(RapidTask *rapid, size_t target) {
+    if (rapid == nullptr) {
+      return;
+    }
+    target %= static_cast<size_t>(num_threads_);
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(
+          thread_data_[target].rapid_publication_state);
+      if (!publication.IsAdmitted()) {
+        rapid->Cancel();
+        return;
+      }
+      if (cancelled_.load(std::memory_order_acquire)) {
+        rapid->Cancel();
+        return;
+      }
+      rapid->AddTickets(1);
+      if (thread_data_[target].PushRapid(rapid)) {
+        if (cancelled_.load(std::memory_order_acquire)) {
+          rapid->Cancel();
+        }
+        WakeOneWorker();
+        return;
+      }
+
+      TaskPtr fallback = rapid->FallbackTicket();
+      static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
+      try {
+        inline_task =
+            PublishAdmittedTask(fallback, static_cast<int>(target), false);
+      } catch (...) {
+        // Publication owns the extra ticket. On failure Discard cancels the
+        // activation and releases that ticket before the exception escapes.
+        fallback->Discard();
+        throw;
+      }
+    }
+    if (inline_task) {
+      ExecuteTask(inline_task);
+    }
+  }
+
+  template <typename Region> void HelpUntil(Region &region) {
+    const bool registered = IsRegistered(GetPerThread());
+    auto &event = registered ? worker_event_ : waiter_event_;
+    while (!region.IsComplete()) {
+      const uint64_t token = event.PrepareWait();
+      if (registered && TryExecuteOne()) {
+        event.CancelWait();
+        continue;
+      }
+      if (region.IsComplete()) {
+        event.CancelWait();
+        return;
+      }
+      event.Wait(token);
+    }
+  }
+
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
     if (ready()) {
@@ -279,22 +611,93 @@ public:
     }
   }
 
+  void NotifyTaskCompletion(bool worker_waiter) {
+    (worker_waiter ? worker_event_ : waiter_event_).NotifyAll();
+  }
+
   void NotifyTaskCompletion() {
     worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
   }
 
 private:
+  static ThreadPoolTempl *&ActiveCancellation() noexcept {
+    static thread_local ThreadPoolTempl *active = nullptr;
+    return active;
+  }
+
+  void CancelOnce() {
+    cancelled_.store(true, std::memory_order_release);
+    ordinary_publication_state_.fetch_or(kPublicationCancelled,
+                                         std::memory_order_seq_cst);
+    for (auto &data : thread_data_) {
+      // Admission and cancellation share one modification order per target:
+      // either this sets the stop bit first, or it observes the publisher.
+      data.rapid_publication_state.fetch_or(kPublicationCancelled,
+                                            std::memory_order_acq_rel);
+    }
+    while ((ordinary_publication_state_.load(std::memory_order_acquire) &
+            kPublicationPublisherMask) != 0) {
+      std::this_thread::yield();
+    }
+    for (auto &data : thread_data_) {
+      while ((data.rapid_publication_state.load(std::memory_order_acquire) &
+              kPublicationPublisherMask) != 0) {
+        std::this_thread::yield();
+      }
+    }
+    CancelRapidQueues();
+    DrainCancelledOrdinaryQueues();
+    done_.store(true, std::memory_order_release);
+
+    // Let each thread know it's been cancelled.
+#ifdef OOX_EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
+    for (size_t i = 0; i < thread_data_.size(); i++) {
+      if (thread_data_[i].thread) {
+        thread_data_[i].thread->OnCancel();
+      }
+    }
+#endif
+    WakeAll();
+  }
+
   // Create a single atomic<int> that encodes start and limit information for
   // each thread.
   // We expect num_threads_ < 65536, so we can store them in a single
   // std::atomic<unsigned>.
-  // Exposed publicly as static functions so that external callers can reuse
-  // this encode/decode logic for maintaining their own thread-safe copies of
-  // scheduling and steal domain(s).
-  static const int kMaxPartitionBits = 16;
-  static const int kMaxThreads = 1 << kMaxPartitionBits;
-  static const int kSpinCount = 64;
+  // The packed representation keeps each worker's steal domain in one atomic.
+  static constexpr int kMaxPartitionBits = 16;
+  static constexpr int kMaxThreads = 1 << kMaxPartitionBits;
+  static constexpr int kSpinCount = 64;
+  static constexpr unsigned kRapidFairness = 8;
+  static constexpr uint64_t kFrequentRapidIntervalNs = 50'000;
+  static constexpr uint64_t kOccasionalRapidIntervalNs = 500'000;
+  static constexpr unsigned kFrequentRapidLingerIterations = 256;
+  static constexpr unsigned kOccasionalRapidLingerIterations = 128;
+  static constexpr unsigned kInfrequentRapidLingerIterations = 32;
+  static constexpr size_t kPublicationCancelled =
+      size_t{1} << (sizeof(size_t) * 8 - 1);
+  static constexpr size_t kPublicationPublisherMask =
+      kPublicationCancelled - 1;
+
+  class PublicationGuard {
+  public:
+    explicit PublicationGuard(std::atomic<size_t> &state) noexcept
+        : state_(state), admitted_((state.fetch_add(
+                                        1, std::memory_order_relaxed) &
+                                    kPublicationCancelled) == 0) {}
+    PublicationGuard(const PublicationGuard &) = delete;
+    PublicationGuard &operator=(const PublicationGuard &) = delete;
+    ~PublicationGuard() noexcept {
+      state_.fetch_sub(1, std::memory_order_release);
+    }
+
+    bool IsAdmitted() const noexcept { return admitted_; }
+
+  private:
+    std::atomic<size_t> &state_;
+    bool admitted_;
+  };
 
   class EventCount {
   public:
@@ -317,12 +720,41 @@ private:
     void NotifyOne() { Notify(false); }
     void NotifyAll() { Notify(true); }
 
+    // Wake up to `count` waiters with one epoch advance. Falls back to a
+    // broadcast when the request covers every registered waiter.
+    void NotifyN(size_t count) {
+      if (count == 0) {
+        return;
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      const size_t waiters = waiters_.load(std::memory_order_seq_cst);
+      if (waiters == 0) {
+        return;
+      }
+      notifications_.fetch_add(1, std::memory_order_relaxed);
+      epoch_.fetch_add(1, std::memory_order_seq_cst);
+      if (count >= waiters) {
+        epoch_.notify_all();
+        return;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        epoch_.notify_one();
+      }
+    }
+
+    // Number of notifications that found at least one waiter (i.e. that
+    // actually reached the OS). Diagnostic only.
+    size_t Notifications() const noexcept {
+      return notifications_.load(std::memory_order_relaxed);
+    }
+
   private:
     void Notify(bool all) {
       std::atomic_thread_fence(std::memory_order_seq_cst);
       if (waiters_.load(std::memory_order_seq_cst) == 0) {
         return;
       }
+      notifications_.fetch_add(1, std::memory_order_relaxed);
       epoch_.fetch_add(1, std::memory_order_seq_cst);
       if (all) {
         epoch_.notify_all();
@@ -333,6 +765,7 @@ private:
 
     std::atomic<uint64_t> epoch_{0};
     std::atomic<size_t> waiters_{0};
+    std::atomic<size_t> notifications_{0};
   };
 
   static int ValidateThreadCount(int count) {
@@ -342,7 +775,8 @@ private:
     return count;
   }
 
-  inline unsigned EncodePartition(unsigned start, unsigned limit) {
+  static constexpr unsigned EncodePartition(unsigned start,
+                                             unsigned limit) noexcept {
     return (start << kMaxPartitionBits) | limit;
   }
 
@@ -352,13 +786,14 @@ private:
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
+    PerThread *pt = GetPerThread();
+    ScopedRegionContext restore(pt->region_context, p->region_context);
     (*p)();
   }
 
-  inline void DecodePartition(unsigned val, unsigned *start, unsigned *limit) {
-    *limit = val & (kMaxThreads - 1);
-    val >>= kMaxPartitionBits;
-    *start = val;
+  static constexpr DomainId DecodePartition(unsigned value) noexcept {
+    const unsigned limit = value & (kMaxThreads - 1);
+    return {value >> kMaxPartitionBits, limit};
   }
 
   void AssertBounds(int start, int end) {
@@ -396,23 +831,74 @@ private:
   struct PerThread {
     constexpr PerThread()
         : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
-          owns_queue(false) {}
+          owns_queue(false), rapid_streak(0), region_context(nullptr) {}
     ThreadPoolTempl *pool; // Parent pool, or null for normal threads.
     uint64_t pool_generation;
     uint64_t rand;         // Random generator state.
     int thread_id;         // Worker thread index in pool.
     bool owns_queue;
+    unsigned rapid_streak;
+    RegionContext *region_context;
   };
 
   struct ThreadData {
     ThreadData()
         : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
-          mailbox(1024) {}
+          mailbox(1024), rapid_publication_state(0), rapid_slot(nullptr),
+          rapid_overflow(1024), resident_task(nullptr),
+          resident_ordinary(false) {}
     std::unique_ptr<Thread> thread;
     std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+    // High bit rejects new publishers; the remaining bits count active ones.
+    std::atomic<size_t> rapid_publication_state;
+    std::atomic<RapidTask *> rapid_slot;
+    rigtorp::mpmc::Queue<RapidTask *> rapid_overflow;
+    std::atomic<ResidentTask *> resident_task;
+    size_t resident_slot = 0;
+    std::atomic<size_t> *resident_completion = nullptr;
+    std::atomic<bool> resident_ordinary;
+
+    bool PushRapid(RapidTask *task) {
+      RapidTask *empty = nullptr;
+      if (rapid_slot.compare_exchange_strong(empty, task,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed)) {
+        return true;
+      }
+      return rapid_overflow.try_push(task);
+    }
+
+    RapidTask *PopRapid() {
+      if (RapidTask *task =
+              rapid_slot.exchange(nullptr, std::memory_order_acquire)) {
+        return task;
+      }
+      RapidTask *task = nullptr;
+      rapid_overflow.try_pop(task);
+      return task;
+    }
+
+    RapidTask *StealRapid() {
+      // Do not take write ownership of an empty remote inbox.
+      RapidTask *task = rapid_slot.load(std::memory_order_relaxed);
+      if (task && rapid_slot.compare_exchange_strong(
+                      task, nullptr, std::memory_order_acquire,
+                      std::memory_order_relaxed)) {
+        return task;
+      }
+      task = nullptr;
+      rapid_overflow.try_pop(task);
+      return task;
+    }
+
+    void FlushRapid() {
+      while (RapidTask *task = PopRapid()) {
+        task->ReleaseTicket();
+      }
+    }
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
@@ -448,20 +934,35 @@ private:
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   unsigned global_steal_partition_;
   const uint64_t pool_generation_;
+  const WorkerIdleMode idle_mode_;
+  const size_t resident_available_words_;
+  std::unique_ptr<std::atomic<uint64_t>[]> resident_available_;
+  std::atomic<size_t> resident_claim_cursor_{0};
 
-  std::mutex overflow_mutex_;
-  std::deque<TaskPtr> overflow_tasks_;
+  std::once_flag cancellation_once_;
+  std::mutex ordinary_cancellation_mutex_;
   EventCount worker_event_;
   EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
+  std::atomic<size_t> registrations_started_{0};
+  std::atomic<size_t> rapid_deregistrations_{0};
+  std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
+  std::atomic<uint64_t> last_rapid_region_ns_{0};
 
   bool creator_registered_ = false;
   std::thread::id creator_thread_id_;
   PerThread creator_previous_registration_;
+  // Generic publication admission is written for every scheduled task. Keep
+  // it away from worker-loop counters so submissions do not invalidate a cache
+  // line that every worker is reading.
+  alignas(OOX_EIGEN_CACHE_LINE_SIZE) std::atomic<size_t>
+      ordinary_publication_state_{0};
 
   // Main worker thread loop. Returns true if processed some tasks
   bool WorkerLoop(bool external = false, bool once = false) {
+    PerThread *pt = GetPerThread();
+    assert(IsRegistered(pt));
     bool processed_anything = false;
     for (;;) {
       if (cancelled_.load(std::memory_order_acquire)) {
@@ -481,7 +982,9 @@ private:
 
       bool found_work = false;
       if (allow_spinning_) {
-        for (int i = 0; i < kSpinCount; ++i) {
+        const unsigned spin_count =
+            rapid_linger_iterations_.load(std::memory_order_relaxed);
+        for (unsigned i = 0; i < spin_count; ++i) {
           if (cancelled_.load(std::memory_order_acquire)) {
             return processed_anything;
           }
@@ -494,6 +997,13 @@ private:
         }
       }
       if (found_work) {
+        continue;
+      }
+
+      if (idle_mode_ == WorkerIdleMode::ResidentBusy) {
+        if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
+          processed_anything = true;
+        }
         continue;
       }
 
@@ -516,12 +1026,38 @@ private:
     return next.fetch_add(1, std::memory_order_relaxed);
   }
 
+  void UpdateRapidLinger() noexcept {
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const uint64_t previous =
+        last_rapid_region_ns_.exchange(now, std::memory_order_relaxed);
+    if (previous == 0) {
+      return;
+    }
+    const uint64_t interval = now - previous;
+    const unsigned target =
+        interval < kFrequentRapidIntervalNs
+            ? kFrequentRapidLingerIterations
+            : (interval < kOccasionalRapidIntervalNs
+                   ? kOccasionalRapidLingerIterations
+                   : kInfrequentRapidLingerIterations);
+    const unsigned current =
+        rapid_linger_iterations_.load(std::memory_order_relaxed);
+    rapid_linger_iterations_.store((current * 7 + target) / 8,
+                                   std::memory_order_relaxed);
+  }
+
   void RegisterThread(PerThread *pt, int thread_id, bool owns_queue) {
     pt->pool = this;
     pt->pool_generation = pool_generation_;
     pt->rand = GlobalThreadIdHash();
     pt->thread_id = thread_id;
     pt->owns_queue = owns_queue;
+    pt->rapid_streak = 0;
+    pt->region_context = nullptr;
+    registrations_started_.fetch_add(1, std::memory_order_release);
   }
 
   void RegisterCreator(bool owns_queue) {
@@ -548,54 +1084,197 @@ private:
     return pt->pool == this && pt->pool_generation == pool_generation_;
   }
 
-  void PublishTask(TaskPtr task, int target, bool local) {
+  void PublishOrdinaryTask(TaskPtr task, int target, bool local) {
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (!publication.IsAdmitted() ||
+          cancelled_.load(std::memory_order_acquire)) {
+        task->Discard();
+        return;
+      }
+      inline_task = PublishAdmittedTask(task, target, local);
+    }
+    if (inline_task) {
+      ExecuteTask(inline_task);
+    }
+  }
+
+  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local,
+                              bool wake = true) {
     auto &outstanding = thread_data_[target].outstanding_tasks;
     task->outstanding = &outstanding;
     outstanding.fetch_add(1, std::memory_order_relaxed);
-    try {
-      if (!thread_data_[target].PushTask(task, local)) {
-        std::lock_guard<std::mutex> lock(overflow_mutex_);
-        overflow_tasks_.push_back(task);
-      }
-    } catch (...) {
-      outstanding.fetch_sub(1, std::memory_order_relaxed);
-      throw;
+    if (!thread_data_[target].PushTask(task, local)) {
+      return task;
     }
-    WakeOneWorker();
-  }
-
-  TaskPtr PopOverflow() {
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    if (overflow_tasks_.empty()) {
-      return nullptr;
+    ReleaseOneResidentForOrdinary();
+    if (wake) {
+      WakeOneWorker();
     }
-    TaskPtr task = overflow_tasks_.front();
-    overflow_tasks_.pop_front();
-    return task;
+    return nullptr;
   }
 
   bool TryExecuteOne() {
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
+    // Preserve the fairness probe when ordinary work exists, but avoid its
+    // mutex-backed queues during Rapid-only regions.
+    if (pt->rapid_streak >= kRapidFairness && NoOutstandingTasks()) {
+      pt->rapid_streak = 0;
+    }
+    if (pt->rapid_streak < kRapidFairness && TryExecuteRapid()) {
+      ++pt->rapid_streak;
+      return true;
+    }
+
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
       task = thread_data_[pt->thread_id].PopFront();
     }
     if (!task) {
-      task = PopOverflow();
-    }
-    if (!task) {
       task = LocalSteal(true);
+    }
+    if (!task && pt->region_context && pt->region_context->leave_on_steal) {
+      pt->region_context = pt->region_context->parent;
+      rapid_deregistrations_.fetch_add(1, std::memory_order_relaxed);
     }
     if (!task) {
       task = GlobalSteal(true);
     }
     if (!task) {
+      if (TryExecuteRapid()) {
+        ++pt->rapid_streak;
+        return true;
+      }
       return false;
     }
+    pt->rapid_streak = 0;
     ExecuteTask(task);
     return true;
+  }
+
+  bool TryExecuteRapid() {
+    PerThread *pt = GetPerThread();
+    RapidTask *rapid = nullptr;
+    if (pt->owns_queue) {
+      rapid = thread_data_[pt->thread_id].PopRapid();
+    }
+    if (!rapid) {
+      unsigned start = 0;
+      unsigned limit = static_cast<unsigned>(num_threads_);
+      if (pt->region_context && pt->region_context->domain.Size() != 0) {
+        start = pt->region_context->domain.start;
+        limit = pt->region_context->domain.limit;
+      }
+      for (unsigned worker = start; worker < limit && !rapid; ++worker) {
+        if (worker != static_cast<unsigned>(pt->thread_id)) {
+          rapid = thread_data_[worker].StealRapid();
+        }
+      }
+    }
+    if (!rapid) {
+      return false;
+    }
+    ScopedRegionContext restore(pt->region_context, rapid->Context());
+    RapidTicketGuard release(*rapid);
+    rapid->TryRun();
+    return true;
+  }
+
+  static uint64_t ResidentDomainMask(size_t word, DomainId domain) noexcept {
+    const size_t word_begin = word * 64;
+    const size_t first = std::max(word_begin, static_cast<size_t>(domain.start));
+    const size_t last =
+        std::min(word_begin + 64, static_cast<size_t>(domain.limit));
+    if (first >= last) {
+      return 0;
+    }
+    const unsigned offset = static_cast<unsigned>(first - word_begin);
+    const unsigned count = static_cast<unsigned>(last - first);
+    const uint64_t bits = count == 64 ? ~uint64_t{0}
+                                      : (uint64_t{1} << count) - 1;
+    return bits << offset;
+  }
+
+  bool WithdrawResident(unsigned worker) noexcept {
+    const size_t word = worker / 64;
+    const uint64_t bit = uint64_t{1} << (worker % 64);
+    return (resident_available_[word].fetch_and(~bit,
+                                                std::memory_order_acq_rel) &
+            bit) != 0;
+  }
+
+  void ReleaseOneResidentForOrdinary() noexcept {
+    if (idle_mode_ != WorkerIdleMode::ResidentBusy) {
+      return;
+    }
+    unsigned worker = 0;
+    if (ClaimResidentWorkers({0, static_cast<unsigned>(num_threads_)}, &worker,
+                             1) == 1) {
+      thread_data_[worker].resident_ordinary.store(true,
+                                                   std::memory_order_release);
+    }
+  }
+
+  bool WaitResident(unsigned worker) noexcept {
+    ThreadData &data = thread_data_[worker];
+    const size_t word = worker / 64;
+    const uint64_t bit = uint64_t{1} << (worker % 64);
+    resident_available_[word].fetch_or(bit, std::memory_order_release);
+    bool processed = false;
+    if (!NoOutstandingTasks() && WithdrawResident(worker)) {
+      return processed;
+    }
+    for (;;) {
+      if (ResidentTask *task =
+              data.resident_task.exchange(nullptr, std::memory_order_acquire)) {
+        const size_t slot = data.resident_slot;
+        std::atomic<size_t> *completion = data.resident_completion;
+        assert(completion != nullptr);
+        task->Run(slot);
+        // A subsequent launch may claim this worker only after Run returned.
+        // Publishing availability before completion guarantees that a caller
+        // observing completion can immediately launch the next generation.
+        resident_available_[word].fetch_or(bit, std::memory_order_release);
+        completion->fetch_sub(1, std::memory_order_release);
+        processed = true;
+        if (!NoOutstandingTasks() && WithdrawResident(worker)) {
+          return processed;
+        }
+        continue;
+      }
+      if (data.resident_ordinary.exchange(false, std::memory_order_acquire)) {
+        return processed;
+      }
+      if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
+        if (WithdrawResident(worker)) {
+          return processed;
+        }
+      }
+      RelaxResidentWait();
+    }
+  }
+
+  static void RelaxResidentWait() noexcept {
+#if defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+  }
+
+  static void DiscardPublishedTask(TaskPtr task) noexcept {
+    assert(task != nullptr);
+    auto *outstanding = task->outstanding;
+    assert(outstanding != nullptr);
+    task->Discard();
+    const size_t previous =
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+    assert(previous > 0);
   }
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
@@ -630,6 +1309,39 @@ private:
     waiter_event_.NotifyAll();
   }
 
+  void CancelRapidQueues() {
+    for (auto &data : thread_data_) {
+      while (RapidTask *rapid = data.PopRapid()) {
+        rapid->Cancel();
+        rapid->ReleaseTicket();
+      }
+    }
+  }
+
+  void CancelOrdinaryQueues() {
+    for (auto &data : thread_data_) {
+      while (TaskPtr task = data.PopBack(true)) {
+        DiscardPublishedTask(task);
+      }
+    }
+  }
+
+  void DrainCancelledOrdinaryQueues() {
+    std::lock_guard<std::mutex> lock(ordinary_cancellation_mutex_);
+    CancelOrdinaryQueues();
+  }
+
+  void ReconcileCancelledOrdinaryBatch() {
+    // This load and cancellation's stop-bit update share the sequentially
+    // consistent order. Either cancellation follows and drains this batch, or
+    // this observes the stop bit and drains after the batch.
+    const size_t state =
+        ordinary_publication_state_.load(std::memory_order_seq_cst);
+    if ((state & kPublicationCancelled) != 0) {
+      DrainCancelledOrdinaryQueues();
+    }
+  }
+
   void JoinThreads() {
     for (auto &data : thread_data_) {
       data.thread.reset();
@@ -639,18 +1351,9 @@ private:
   void FlushQueues() {
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
-        auto *outstanding = task->outstanding;
-        delete task;
-        outstanding->fetch_sub(1, std::memory_order_relaxed);
+        DiscardPublishedTask(task);
       }
-    }
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    while (!overflow_tasks_.empty()) {
-      TaskPtr task = overflow_tasks_.front();
-      overflow_tasks_.pop_front();
-      auto *outstanding = task->outstanding;
-      delete task;
-      outstanding->fetch_sub(1, std::memory_order_relaxed);
+      data.FlushRapid();
     }
     assert(NoOutstandingTasks());
   }
@@ -687,15 +1390,18 @@ private:
   TaskPtr LocalSteal(bool force) {
     PerThread *pt = GetPerThread();
     unsigned partition = GetStealPartition(pt->thread_id);
+    if (pt->region_context && pt->region_context->domain.Size() != 0) {
+      partition = EncodePartition(pt->region_context->domain.start,
+                                  pt->region_context->domain.limit);
+    }
     // If thread steal partition is the same as global partition, there is no
     // need to go through the steal loop twice.
     if (global_steal_partition_ == partition)
       return nullptr;
-    unsigned start, limit;
-    DecodePartition(partition, &start, &limit);
-    AssertBounds(start, limit);
+    const DomainId domain = DecodePartition(partition);
+    AssertBounds(domain.start, domain.limit);
 
-    return Steal(start, limit, force);
+    return Steal(domain.start, domain.limit, force);
   }
 
   // Steals work from any other thread in the pool.
