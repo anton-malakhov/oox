@@ -20,13 +20,8 @@ jobs:
       run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
     - name: Initialize PBBS
       run: git submodule update --init thirdparty/pbbsbench
-    - name: Compile application benchmark suite
-      run: >
-        python3 benchmarks/pbbs/run.py --compile-only
-        --backend oox --mode EIGEN_STEALING --threads 2
-        --compiler clang++-19
-    - name: Run checker-backed application smoke
-      timeout-minutes: 20
+    - name: Compile and run checker-backed application suite
+      timeout-minutes: 35
       run: >
         python3 benchmarks/pbbs/run.py --ci-smoke --timeout 900
         --output cmake-build-pbbs/ci-smoke-results

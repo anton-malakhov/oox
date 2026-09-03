@@ -365,37 +365,47 @@ def main():
                 })
                 if args.ci_smoke:
                     env["PBBS_ROUNDS"] = "1"
-                command = [sys.executable, "runall", "-force", "-par"]
-                if not args.numa:
-                    command.append("-nonuma")
-                if args.compile_only:
-                    command.append("-notime")
-                if benchmarks:
-                    command.extend(["-only", *benchmarks, "-ext"])
-                if not args.full:
-                    command.append("-small")
-                output = args.output / f"{backend}_{mode}.txt"
-                print(f"Writing {output}", flush=True)
-                try:
-                    with output.open("w") as stream:
-                        subprocess.run(command, cwd=source, env=env, stdout=stream,
-                                       stderr=subprocess.STDOUT, check=True,
-                                       timeout=args.timeout)
-                except subprocess.TimeoutExpired as error:
-                    raise failure(
-                        f"PBBS timed out after {args.timeout}s. Log tail:\n"
-                        f"{log_tail(output)}"
-                    ) from error
-                except subprocess.CalledProcessError as error:
-                    raise failure(
-                        f"PBBS exited with status {error.returncode}. Log tail:\n"
-                        f"{log_tail(output)}"
-                    ) from error
-                log = output.read_text(errors="replace")
-                if "TEST TERMINATED ABNORMALLY" in log or "make: ***" in log:
-                    raise failure(
-                        f"PBBS reported a failure. Log tail:\n{log_tail(output)}"
-                    )
+                phases = [(benchmarks, args.compile_only, True, "")]
+                if args.ci_smoke:
+                    phases = [(DEFAULT_BENCHMARKS, True, True, "_compile"),
+                              (benchmarks, False, False, "")]
+                for selected, compile_only, force_compile, suffix in phases:
+                    command = [sys.executable, "runall", "-par"]
+                    if force_compile:
+                        command.append("-force")
+                    if not args.numa:
+                        command.append("-nonuma")
+                    if compile_only:
+                        command.append("-notime")
+                    if selected:
+                        command.extend(["-only", *selected, "-ext"])
+                    if not args.full:
+                        command.append("-small")
+                    output = args.output / f"{backend}_{mode}{suffix}.txt"
+                    print(f"Writing {output}", flush=True)
+                    try:
+                        with output.open("w") as stream:
+                            subprocess.run(
+                                command, cwd=source, env=env, stdout=stream,
+                                stderr=subprocess.STDOUT, check=True,
+                                timeout=args.timeout)
+                    except subprocess.TimeoutExpired as error:
+                        raise failure(
+                            f"PBBS timed out after {args.timeout}s. Log tail:\n"
+                            f"{log_tail(output)}"
+                        ) from error
+                    except subprocess.CalledProcessError as error:
+                        raise failure(
+                            f"PBBS exited with status {error.returncode}. "
+                            f"Log tail:\n{log_tail(output)}"
+                        ) from error
+                    log = output.read_text(errors="replace")
+                    if ("TEST TERMINATED ABNORMALLY" in log or
+                            "make: ***" in log):
+                        raise failure(
+                            f"PBBS reported a failure. Log tail:\n"
+                            f"{log_tail(output)}"
+                        )
     finally:
         restore_checkout(source)
 
