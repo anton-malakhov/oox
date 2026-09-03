@@ -25,8 +25,16 @@ DEFAULT_BENCHMARKS = [
     "spanningForest/ndST",
 ]
 CI_SMOKE_BENCHMARKS = [
+    "removeDuplicates/parlayhash",
     "integerSort/parallelRadixSort",
     "comparisonSort/sampleSort",
+    "suffixArray/parallelRange",
+    "nearestNeighbors/octTree",
+    "delaunayTriangulation/incrementalDelaunay",
+    "delaunayRefine/incrementalRefine",
+    "rayCast/kdTree",
+    "minSpanningForest/parallelFilterKruskal",
+    "spanningForest/ndST",
 ]
 BACKENDS = ["reference", "oox"]
 REFERENCE_MODES = [

@@ -26,9 +26,9 @@ jobs:
         --backend oox --mode EIGEN_STEALING --threads 2
         --compiler clang++-19
     - name: Run checker-backed application smoke
-      timeout-minutes: 15
+      timeout-minutes: 20
       run: >
-        python3 benchmarks/pbbs/run.py --ci-smoke --timeout 600
+        python3 benchmarks/pbbs/run.py --ci-smoke --timeout 900
         --output cmake-build-pbbs/ci-smoke-results
         --backend oox --mode EIGEN_STEALING --threads 2
         --compiler clang++-19

@@ -46,10 +46,14 @@ PBBS behavior. Two stale success-return defects in the pinned deduplication
 driver and suffix-array checker are corrected while the checkout is active;
 their actual PBBS validators still decide correctness.
 
-`--ci-smoke` runs the small radix-sort and sample-sort suites, including PBBS's
-real output checkers. It complements `--compile-only` without making CI execute
-every multi-million-element application. `--timeout` bounds each backend/mode
-suite invocation and reports the retained log when the limit is exceeded.
+`--ci-smoke` runs the small deduplication, radix-sort, sample-sort, suffix-array,
+nearest-neighbor, Delaunay triangulation/refinement, ray-casting, minimum-
+spanning-forest, and spanning-forest suites, including PBBS's real output
+checkers. Flat BFS and convex hull remain compile-covered but are excluded from
+this portable runtime profile: their pinned small suites fail under both OOX
+and the untouched reference scheduler on macOS. `--timeout` bounds each
+backend/mode suite invocation and reports the retained log when the limit is
+exceeded.
 
 Add `--full` for paper-scale inputs. Full runs generate or download large
 datasets and can take hours; use an otherwise idle Linux machine with fixed
