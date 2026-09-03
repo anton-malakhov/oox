@@ -15,8 +15,21 @@ struct Point {
   double y{};
 };
 
+struct KeyValue {
+  std::uint32_t key{};
+  std::uint32_t value{};
+
+  bool operator==(const KeyValue &) const = default;
+};
+
 enum class PointKind { UniformSquare, InDisk, OnCircle, Kuzmin };
-enum class KeyKind { Uniform, Exponential, DuplicateHeavy, AlmostSorted };
+enum class KeyKind {
+  Uniform,
+  Exponential,
+  DuplicateHeavy,
+  AlmostSorted,
+  ReverseSorted
+};
 
 struct ConvexHullMetrics {
   std::size_t hull_vertices{};
@@ -56,6 +69,12 @@ std::vector<std::uint32_t> RadixSortSerial(std::vector<std::uint32_t> keys);
 std::vector<std::uint32_t>
 RadixSortParallel(const std::vector<std::uint32_t> &keys,
                   RadixSortMetrics *metrics = nullptr);
+std::vector<KeyValue> MakeKeyValues(KeyKind kind, std::size_t size,
+                                    std::uint64_t seed = 1);
+std::vector<KeyValue> RadixSortPairsSerial(std::vector<KeyValue> pairs);
+std::vector<KeyValue>
+RadixSortPairsParallel(const std::vector<KeyValue> &pairs,
+                       RadixSortMetrics *metrics = nullptr);
 std::vector<std::uint32_t> SampleSortSerial(std::vector<std::uint32_t> keys);
 std::vector<std::uint32_t>
 SampleSortParallel(const std::vector<std::uint32_t> &keys,

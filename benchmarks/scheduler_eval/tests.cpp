@@ -123,26 +123,34 @@ bool CheckPrimaryWorkloads() {
     }
   }
   for (const auto kind : {KeyKind::Uniform, KeyKind::Exponential,
-                          KeyKind::DuplicateHeavy, KeyKind::AlmostSorted}) {
+                          KeyKind::DuplicateHeavy, KeyKind::AlmostSorted,
+                          KeyKind::ReverseSorted}) {
     for (const auto size :
          std::array<std::size_t, 7>{0, 1, 2, 7, 255, 2047, 4099}) {
       const auto keys = scheduler_eval::MakeKeys(kind, size, 41 + size);
+      const auto pairs =
+          scheduler_eval::MakeKeyValues(kind, size, 41 + size);
       scheduler_eval::DedupMetrics dedup_metrics;
       scheduler_eval::RadixSortMetrics radix_metrics;
+      scheduler_eval::RadixSortMetrics pair_metrics;
       scheduler_eval::SampleSortMetrics sample_metrics;
       const auto dedup =
           scheduler_eval::RemoveDuplicatesParallel(keys, &dedup_metrics);
       const auto radix =
           scheduler_eval::RadixSortParallel(keys, &radix_metrics);
+      const auto radix_pairs =
+          scheduler_eval::RadixSortPairsParallel(pairs, &pair_metrics);
       const auto sample =
           scheduler_eval::SampleSortParallel(keys, &sample_metrics);
       if (dedup != scheduler_eval::RemoveDuplicatesSerial(keys) ||
           radix != scheduler_eval::RadixSortSerial(keys) ||
+          radix_pairs != scheduler_eval::RadixSortPairsSerial(pairs) ||
           sample != scheduler_eval::SampleSortSerial(keys) ||
           dedup_metrics.unique_items != dedup.size() ||
           dedup_metrics.hash_probes < keys.size() ||
           (size > 0 && dedup_metrics.table_capacity < 2 * size) ||
           radix_metrics.passes != (size == 0 ? 0u : 4u) ||
+          pair_metrics.passes != (size == 0 ? 0u : 4u) ||
           sample_metrics.buckets != (size == 0 ? 0u
                                                : std::min<std::size_t>(
                                                      256, (size + 2047) / 2048)) ||

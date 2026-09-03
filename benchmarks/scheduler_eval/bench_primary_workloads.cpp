@@ -53,6 +53,19 @@ void RadixSort(benchmark::State &state) {
 }
 
 template <scheduler_eval::KeyKind Kind>
+void RadixSortPairs(benchmark::State &state) {
+  const auto pairs = scheduler_eval::MakeKeyValues(Kind, state.range(0));
+  scheduler_eval::RadixSortMetrics workload_metrics;
+  benchmark::DoNotOptimize(
+      scheduler_eval::RadixSortPairsParallel(pairs, &workload_metrics));
+  scheduler_eval::SchedulerMetricsScope metrics(state);
+  for (auto _ : state)
+    benchmark::DoNotOptimize(scheduler_eval::RadixSortPairsParallel(pairs));
+  state.counters["radix_passes"] = workload_metrics.passes;
+  state.SetItemsProcessed(state.iterations() * pairs.size());
+}
+
+template <scheduler_eval::KeyKind Kind>
 void SampleSort(benchmark::State &state) {
   const auto keys = scheduler_eval::MakeKeys(Kind, state.range(0));
   scheduler_eval::SampleSortMetrics workload_metrics;
@@ -89,11 +102,13 @@ REGISTER_POINT(Kuzmin);
 #define REGISTER_KEY_FAMILY(kind)                                              \
   REGISTER_KEYS(RemoveDuplicates, kind);                                       \
   REGISTER_KEYS(RadixSort, kind);                                              \
+  REGISTER_KEYS(RadixSortPairs, kind);                                         \
   REGISTER_KEYS(SampleSort, kind)
 
 REGISTER_KEY_FAMILY(Uniform);
 REGISTER_KEY_FAMILY(Exponential);
 REGISTER_KEY_FAMILY(DuplicateHeavy);
 REGISTER_KEY_FAMILY(AlmostSorted);
+REGISTER_KEY_FAMILY(ReverseSorted);
 
 } // namespace

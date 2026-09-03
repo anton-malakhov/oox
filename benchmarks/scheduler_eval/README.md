@@ -57,9 +57,9 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Hyperbolic SpMV | A few very heavy rows and a long light tail |
 | Triangular SpMV | Gradually changing row width and work |
 | Convex hull | Parallel block sorting and merging followed by a hull scan over square, disk, circle, and Kuzmin point distributions |
-| Remove duplicates | Concurrent open-addressing over uniform, exponential, duplicate-heavy, and almost-sorted keys |
-| Stable radix sort | Four parallel histogram/scatter passes over 32-bit keys |
-| Sample sort | Deterministic sampling, parallel bucket distribution, and parallel bucket sorting |
+| Remove duplicates | Concurrent open-addressing over uniform, exponential, duplicate-heavy, almost-sorted, and reverse-sorted keys |
+| Stable radix sort | Four parallel histogram/scatter passes over 32-bit scalar keys and key-value records |
+| Sample sort | Deterministic sampling, parallel bucket distribution, and parallel bucket sorting, including reverse-sorted input |
 | Flat/fixed/adaptive BFS | High-arity trees, parallel chains, dense/sparse phases, trunk-first, RMat, square/cube grids, and a small-world control |
 | Variable-cost loops | Constant, uniform, exponential, Pareto, linear, clustered, periodic, shuffled, and phase-changing costs |
 | Competing loops | Two simultaneous OOX loops contending for one worker pool |

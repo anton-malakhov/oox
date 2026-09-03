@@ -21,7 +21,7 @@ backend abstraction. No runner clones the reference at execution time.
 | `bench_reduce.cpp` | Blocked reduction with tail handling | Exact scalar result |
 | `bench_scan.cpp` | Work-efficient exclusive tree scan | Exact prefix values |
 | Three `bench_spmv_*` files | Deterministic balanced, harmonic/hyperbolic, and triangular CSR generators | Each compared with a serial CSR oracle |
-| PBBS primary kernels | Independent native convex-hull, concurrent deduplication, stable radix-sort, and sample-sort workloads with deterministic point/key families | Exact comparison with monotone-chain, sort/unique, stable-sort, and sort serial oracles; workload-metric accounting invariants |
+| PBBS primary kernels | Independent native convex-hull, concurrent deduplication, stable scalar/pair radix-sort, and sample-sort workloads with deterministic point/key families | Exact comparison with monotone-chain, sort/unique, stable-sort, and sort serial oracles; workload-metric accounting invariants |
 | `bench_mmul.cpp` | Nested dense matrix multiplication | Compared elementwise with serial multiplication |
 | `bench_mtranspose.cpp` | Nested blocked transpose | Exact element mapping |
 | `bench_spin.cpp` | Relax, atomic, isolated distributed-read, and thread-local-read payload matrix | CMake smoke run per backend mode |

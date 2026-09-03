@@ -34,6 +34,45 @@ std::size_t NextPowerOfTwo(std::size_t value) {
   return result;
 }
 
+template <typename Value, typename Key>
+std::vector<Value> RadixSortParallelImpl(const std::vector<Value> &values,
+                                         Key key,
+                                         RadixSortMetrics *metrics) {
+  if (values.empty()) {
+    if (metrics)
+      *metrics = {};
+    return {};
+  }
+  std::vector<Value> input = values, output(values.size());
+  const auto blocks = (values.size() + block_size - 1) / block_size;
+  using Counts = std::array<std::size_t, 256>;
+  std::vector<Counts> counts(blocks), offsets(blocks);
+  for (unsigned shift = 0; shift < 32; shift += 8) {
+    ParallelFor(0, blocks, [&](std::size_t block) {
+      counts[block].fill(0);
+      const auto end = std::min(input.size(), (block + 1) * block_size);
+      for (auto i = block * block_size; i < end; ++i)
+        ++counts[block][(key(input[i]) >> shift) & 255];
+    });
+    std::size_t total = 0;
+    for (std::size_t bucket = 0; bucket < 256; ++bucket)
+      for (std::size_t block = 0; block < blocks; ++block) {
+        offsets[block][bucket] = total;
+        total += counts[block][bucket];
+      }
+    ParallelFor(0, blocks, [&](std::size_t block) {
+      auto positions = offsets[block];
+      const auto end = std::min(input.size(), (block + 1) * block_size);
+      for (auto i = block * block_size; i < end; ++i)
+        output[positions[(key(input[i]) >> shift) & 255]++] = input[i];
+    });
+    input.swap(output);
+  }
+  if (metrics)
+    metrics->passes = 4;
+  return input;
+}
+
 } // namespace
 
 std::vector<Point> MakePoints(PointKind kind, std::size_t size,
@@ -136,6 +175,11 @@ std::vector<std::uint32_t> MakeKeys(KeyKind kind, std::size_t size,
                                     std::uint64_t seed) {
   std::mt19937_64 random(seed);
   std::vector<std::uint32_t> keys(size);
+  if (kind == KeyKind::ReverseSorted) {
+    for (std::size_t i = 0; i < size; ++i)
+      keys[i] = static_cast<std::uint32_t>(size - i);
+    return keys;
+  }
   if (kind == KeyKind::AlmostSorted) {
     for (std::size_t i = 0; i < size; ++i)
       keys[i] = static_cast<std::uint32_t>(i);
@@ -156,6 +200,15 @@ std::vector<std::uint32_t> MakeKeys(KeyKind kind, std::size_t size,
       key = static_cast<std::uint32_t>(random());
   }
   return keys;
+}
+
+std::vector<KeyValue> MakeKeyValues(KeyKind kind, std::size_t size,
+                                    std::uint64_t seed) {
+  const auto keys = MakeKeys(kind, size, seed);
+  std::vector<KeyValue> pairs(size);
+  for (std::size_t i = 0; i < size; ++i)
+    pairs[i] = {keys[i], static_cast<std::uint32_t>(i)};
+  return pairs;
 }
 
 std::vector<std::uint32_t>
@@ -212,39 +265,23 @@ std::vector<std::uint32_t> RadixSortSerial(std::vector<std::uint32_t> keys) {
 std::vector<std::uint32_t>
 RadixSortParallel(const std::vector<std::uint32_t> &keys,
                   RadixSortMetrics *metrics) {
-  if (keys.empty()) {
-    if (metrics)
-      *metrics = {};
-    return {};
-  }
-  std::vector<std::uint32_t> input = keys, output(keys.size());
-  const auto blocks = (keys.size() + block_size - 1) / block_size;
-  using Counts = std::array<std::size_t, 256>;
-  std::vector<Counts> counts(blocks), offsets(blocks);
-  for (unsigned shift = 0; shift < 32; shift += 8) {
-    ParallelFor(0, blocks, [&](std::size_t block) {
-      counts[block].fill(0);
-      const auto end = std::min(input.size(), (block + 1) * block_size);
-      for (auto i = block * block_size; i < end; ++i)
-        ++counts[block][(input[i] >> shift) & 255];
-    });
-    std::size_t total = 0;
-    for (std::size_t bucket = 0; bucket < 256; ++bucket)
-      for (std::size_t block = 0; block < blocks; ++block) {
-        offsets[block][bucket] = total;
-        total += counts[block][bucket];
-      }
-    ParallelFor(0, blocks, [&](std::size_t block) {
-      auto positions = offsets[block];
-      const auto end = std::min(input.size(), (block + 1) * block_size);
-      for (auto i = block * block_size; i < end; ++i)
-        output[positions[(input[i] >> shift) & 255]++] = input[i];
-    });
-    input.swap(output);
-  }
-  if (metrics)
-    metrics->passes = 4;
-  return input;
+  return RadixSortParallelImpl(
+      keys, [](std::uint32_t key) { return key; }, metrics);
+}
+
+std::vector<KeyValue> RadixSortPairsSerial(std::vector<KeyValue> pairs) {
+  std::stable_sort(pairs.begin(), pairs.end(),
+                   [](const KeyValue &left, const KeyValue &right) {
+                     return left.key < right.key;
+                   });
+  return pairs;
+}
+
+std::vector<KeyValue>
+RadixSortPairsParallel(const std::vector<KeyValue> &pairs,
+                       RadixSortMetrics *metrics) {
+  return RadixSortParallelImpl(
+      pairs, [](const KeyValue &pair) { return pair.key; }, metrics);
 }
 
 std::vector<std::uint32_t> SampleSortSerial(std::vector<std::uint32_t> keys) {
