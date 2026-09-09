@@ -1,35 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-set(stage "${BINARY_DIR}/demand-install")
-execute_process(COMMAND "${CMAKE_COMMAND}" --install "${BINARY_DIR}" --prefix "${stage}"
-                RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE error)
-if (NOT result EQUAL 0)
-  message(FATAL_ERROR "Install failed: ${error}")
-endif ()
+# Consume the exact build-tree export. Source-Folly builds disable install().
 set(consumer "${BINARY_DIR}/demand-consumer")
 file(MAKE_DIRECTORY "${consumer}")
-file(WRITE "${consumer}/main.cpp" "#include <oox/oox.h>\nint main() { auto x = oox::run([]() noexcept { return 7; }); return oox::wait_and_get(x) != 7; }\n")
+file(WRITE "${consumer}/main.cpp" "#include <oox/oox.h>\n#include <type_traits>\n#if !OOX_SERIAL_DEBUG\nstatic_assert(std::is_same_v<oox::internal::eigen_thread_pool, oox::detail::eigen_pool::DemandThreadPool>);\n#endif\nint main() { auto x = oox::run([]() noexcept { return 7; }); return oox::wait_and_get(x) != 7; }\n")
 file(WRITE "${consumer}/CMakeLists.txt" "
 cmake_minimum_required(VERSION 3.18)
 project(DemandConsumer LANGUAGES CXX)
-find_package(OOX CONFIG REQUIRED)
+find_package(Threads REQUIRED)
+include(\"${BINARY_DIR}/OOXTargets.cmake\")
 add_executable(consumer main.cpp)
 target_link_libraries(consumer PRIVATE OOX::eigen_demand)
 ")
 execute_process(COMMAND "${CMAKE_COMMAND}" -S "${consumer}" -B "${consumer}/build"
-                "-DCMAKE_PREFIX_PATH=${stage}" "-DCMAKE_CXX_COMPILER=${COMPILER}"
+                "-DCMAKE_CXX_COMPILER=${COMPILER}"
                 "-DCMAKE_CXX_FLAGS=${FLAGS}"
                 RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE error)
 if (NOT result EQUAL 0)
-  message(FATAL_ERROR "Installed consumer configure failed: ${error}")
+  message(FATAL_ERROR "Exported consumer configure failed: ${error}")
 endif ()
 execute_process(COMMAND "${CMAKE_COMMAND}" --build "${consumer}/build"
                 RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE error)
 if (NOT result EQUAL 0)
-  message(FATAL_ERROR "Installed consumer build failed: ${error}")
+  message(FATAL_ERROR "Exported consumer build failed: ${error}")
 endif ()
 execute_process(COMMAND "${consumer}/build/consumer" RESULT_VARIABLE result TIMEOUT 15)
 if (NOT result EQUAL 0)
-  message(FATAL_ERROR "Installed consumer failed: ${result}")
+  message(FATAL_ERROR "Exported consumer failed: ${result}")
 endif ()
 
 # Both Eigen variants must be rejected rather than selected by include order.
