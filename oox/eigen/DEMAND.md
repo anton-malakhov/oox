@@ -45,8 +45,10 @@ Deliberate differences from TBB's algorithm-level partitioner:
   default for source-comparison tests.
 - Remaining spans live in a mutex-protected worker registry, accessible to
   nested helping and other workers.
-- A scheduler resume can migrate a group's remaining work. No running callback
-  is preempted, and execution returns to a scheduler checkpoint after one task.
+- A scheduler resume can migrate a group's remaining work. It preserves the
+  group's stolen-initialization state and attributes new offers to the current
+  worker. No running callback is preempted, and execution returns to a scheduler
+  checkpoint after one task.
 - The adapter retains singleton and partial-group progress; it never waits for
   a group to fill. Optional metadata allocation failure falls back to ordinary
   task execution without abandoning extracted work.

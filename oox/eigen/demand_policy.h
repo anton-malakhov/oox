@@ -162,9 +162,8 @@ public:
       group = victim.Remove(victim.head_.get());
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    // A ready remainder may migrate after earlier callbacks started. Treat
-    // this scheduler resume as a new start; no opaque callback is preempted.
-    group->started = false;
+    // A ready remainder may migrate after earlier callbacks started. Preserve
+    // its initialization state when resuming the same logical group.
     Append(std::move(group));
     remote_groups_.fetch_add(1, std::memory_order_relaxed);
     return TakeOne(worker, true);
@@ -267,9 +266,9 @@ private:
         group.branch->parent->stolen.store(true, std::memory_order_relaxed);
         feedback_.fetch_add(1, std::memory_order_relaxed);
       }
-      group.origin = worker;
       group.started = true;
     }
+    group.origin = worker;
 
     if (!group.ranges) {
       while (group.range.IsDivisible()) {

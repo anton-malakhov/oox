@@ -274,4 +274,42 @@ TEST(EigenDemand, CancellationDiscardsGroupedAndQueuedWork) {
   EXPECT_EQ(disposed.load(), count);
 }
 
+TEST(EigenDemand, ResumingGroupDoesNotRepeatStolenInitialization) {
+  using Registry = DemandRegistry<std::size_t, DemandPolicy>;
+  Registry owner, first_thief, second_thief, receiver;
+  std::size_t next = 1;
+  auto pop = [&] { return next <= 64 ? next++ : std::size_t{0}; };
+  auto no_work = [] { return std::size_t{0}; };
+  std::vector<unsigned> visits(65);
+  // Hold the executing branches alive while the remaining group migrates.
+  auto original = owner.AcquireLocal(0, pop);
+  auto initial = first_thief.AcquireRemote(owner, 1);
+  auto balancing = second_thief.AcquireRemote(owner, 2);
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(initial);
+  ASSERT_TRUE(balancing);
+  EXPECT_EQ(second_thief.Statistics().feedback, 1u);
+  auto resumed = receiver.AcquireRemote(owner, 3);
+  ASSERT_TRUE(resumed);
+  ++visits[original.task];
+  ++visits[initial.task];
+  ++visits[balancing.task];
+  ++visits[resumed.task];
+  // This descriptor was already initialized by worker 0. Resuming it must
+  // not repeat check_being_stolen without repeating TBB's execute phase.
+  EXPECT_EQ(receiver.Statistics().feedback, 0u);
+  while (auto local = receiver.AcquireLocal(3, no_work))
+    ++visits[local.task];
+  // Work offered during the resume belongs to worker 3. Executing that work
+  // locally must not be mistaken for a steal from the original worker 0.
+  EXPECT_EQ(receiver.Statistics().feedback, 0u);
+  auto record = [&](std::size_t id) { ++visits[id]; };
+  owner.Drain(record);
+  first_thief.Drain(record);
+  second_thief.Drain(record);
+  receiver.Drain(record);
+  for (std::size_t id = 1; id <= 64; ++id)
+    EXPECT_EQ(visits[id], 1u) << id;
+}
+
 } // namespace
