@@ -64,6 +64,13 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     gtest_discover_tests(${unittest}_eigen)
   endif ()
 
+  if (OOX_ENABLE_EIGEN_DEMAND)
+    add_executable(${unittest}_eigen_demand ${unittest}.cpp)
+    target_link_libraries(${unittest}_eigen_demand PRIVATE
+            ${PROJECT_NAME}::eigen_demand ${OOX_GTEST_LIB})
+    gtest_discover_tests(${unittest}_eigen_demand)
+  endif ()
+
   if (Taskflow_FOUND)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
@@ -133,4 +140,44 @@ endif ()
 
 if (OOX_BUILD_TWIST_TESTS)
   add_subdirectory(twist)
+endif ()
+
+if (OOX_ENABLE_EIGEN_DEMAND)
+  add_executable(eigen_demand_pool_test eigen_pool_test.cpp)
+  target_link_libraries(eigen_demand_pool_test PRIVATE OOX::eigen_demand ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_demand_pool_test TEST_PREFIX Demand.
+          DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30)
+
+  add_executable(eigen_demand_test eigen_demand_test.cpp)
+  target_link_libraries(eigen_demand_test PRIVATE OOX::eigen_demand GTest::gtest_main)
+  gtest_discover_tests(eigen_demand_test DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30)
+
+  add_executable(eigen_demand_instantiation eigen_pool_instantiation.cpp)
+  target_link_libraries(eigen_demand_instantiation PRIVATE OOX::eigen_demand)
+  add_test(NAME EigenDemandExplicitInstantiation COMMAND eigen_demand_instantiation)
+
+  foreach (include_order IN ITEMS oox_first upstream_first)
+    add_executable(eigen_demand_include_${include_order} eigen_include_${include_order}.cpp)
+    target_link_libraries(eigen_demand_include_${include_order} PRIVATE
+            OOX::eigen_demand ${OOX_UPSTREAM_EIGEN_TARGET})
+    add_test(NAME EigenDemandIncludeOrder_${include_order}
+             COMMAND eigen_demand_include_${include_order})
+  endforeach ()
+endif ()
+
+if (OOX_ENABLE_EIGEN_DEMAND)
+  foreach (backend IN ITEMS eigen eigen_demand)
+    add_executable(${backend}_dag_test eigen_demand_oox_test.cpp)
+    target_link_libraries(${backend}_dag_test PRIVATE OOX::${backend} GTest::gtest_main)
+    gtest_discover_tests(${backend}_dag_test TEST_PREFIX ${backend}.
+            DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+  endforeach ()
+endif ()
+
+if (OOX_ENABLE_EIGEN_DEMAND)
+  add_test(NAME EigenDemandInstalledConsumer
+    COMMAND ${CMAKE_COMMAND}
+      -DSOURCE_DIR=${PROJECT_SOURCE_DIR} -DBINARY_DIR=${PROJECT_BINARY_DIR}
+      -DCOMPILER=${CMAKE_CXX_COMPILER} -DFLAGS=${CMAKE_CXX_FLAGS}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/eigen_demand_integration.cmake)
 endif ()

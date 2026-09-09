@@ -19,6 +19,12 @@ one-worker fallback. Set the CMake cache variable `OOX_EIGEN_THREADS` to a
 positive fixed count, or define `OOX_EIGEN_NUM_THREADS` for a direct header
 build.
 
+Enable the optional `OOX_ENABLE_EIGEN_DEMAND` CMake option and link
+`OOX::eigen_demand` to try the TBB-derived alternative Eigen backend. It groups
+already-ready tasks without changing the OOX task API. See
+[the backend documentation](oox/eigen/DEMAND.md) for source provenance, semantics,
+and comparison instructions.
+
 ## Continuation-focus design
 With nested parallelism, blocking style programming is deadlock-prone and has latency problems. OOX provides semantic way out of these issues.
 

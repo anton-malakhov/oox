@@ -19,6 +19,7 @@
 #include "max_size_vector.h"
 #include "run_queue.h"
 #include "stl_thread_env.h"
+#include "demand_policy.h"
 
 #include <atomic>
 #include <cassert>
@@ -47,8 +48,8 @@ template <typename F> struct UniqueTask : Task {
   UniqueTask(F &&f) : f(std::move(f)) {}
 
   void operator()() override {
+    std::unique_ptr<UniqueTask> self(this);
     f();
-    delete this; // really safe to do heere
   }
 
   std::decay_t<F> f;
@@ -88,7 +89,7 @@ public:
   virtual ~ThreadPoolInterface() {}
 };
 
-template <typename Environment>
+template <typename Environment, typename SchedulingPolicy = SingleTaskPolicy>
 class ThreadPoolTempl : public ThreadPoolInterface {
 public:
   using TaskPtr = Task *;
@@ -258,6 +259,21 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+  DemandStatistics GetDemandStatistics() const {
+    DemandStatistics result;
+    if constexpr (SchedulingPolicy::enabled) {
+      for (const auto &data : thread_data_) {
+        const auto value = data.groups.Statistics();
+        result.groups += value.groups;
+        result.offers += value.offers;
+        result.remote_groups += value.remote_groups;
+        result.feedback += value.feedback;
+        result.grouped_tasks += value.grouped_tasks;
+      }
+    }
+    return result;
+  }
+
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
     if (ready()) {
@@ -352,7 +368,16 @@ private:
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
-    (*p)();
+    if constexpr (SchedulingPolicy::enabled) {
+      try {
+        (*p)();
+      } catch (...) {
+        // Original tasks are fire-and-forget. An exception must not strand
+        // other ready tasks in this worker's group.
+      }
+    } else {
+      (*p)();
+    }
   }
 
   inline void DecodePartition(unsigned val, unsigned *start, unsigned *limit) {
@@ -413,6 +438,7 @@ private:
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+    [[no_unique_address]] DemandRegistry<TaskPtr, SchedulingPolicy> groups;
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
@@ -578,6 +604,54 @@ private:
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
+    if constexpr (SchedulingPolicy::enabled) {
+      auto &registry = thread_data_[pt->thread_id].groups;
+      auto acquired = registry.AcquireLocal(pt->thread_id, [&]() -> TaskPtr {
+        return pt->owns_queue ? thread_data_[pt->thread_id].PopFront() : nullptr;
+      });
+      if (acquired) {
+        if (acquired.published_group)
+          WakeOneWorker();
+        ExecuteTask(acquired.task);
+        return true;
+      }
+      auto overflow = registry.AcquireLocal(pt->thread_id, [&]() {
+        return PopOverflow();
+      });
+      if (overflow) {
+        if (overflow.published_group)
+          WakeOneWorker();
+        ExecuteTask(overflow.task);
+        return true;
+      }
+      // The group registry is visible to thieves and to nested Wait(), even
+      // while its owner is inside a user callback. Transfers are not Schedule().
+      const unsigned first = static_cast<unsigned>(Rand(&pt->rand) % num_threads_);
+      for (unsigned i = 0; i < static_cast<unsigned>(num_threads_); ++i) {
+        const unsigned victim = (first + i) % num_threads_;
+        auto remote = registry.AcquireRemote(thread_data_[victim].groups,
+                                             pt->thread_id);
+        if (remote) {
+          if (remote.published_group)
+            WakeOneWorker();
+          ExecuteTask(remote.task);
+          return true;
+        }
+        // Collect raw stolen work too: a producer can remain inside a callback
+        // while publishing its entire fan-out. Owner-only collection would
+        // leave almost all of that workload on the single-task fallback.
+        auto queued = registry.AcquireLocal(pt->thread_id, [&]() {
+          return thread_data_[victim].PopBack(true);
+        });
+        if (queued) {
+          if (queued.published_group)
+            WakeOneWorker();
+          ExecuteTask(queued.task);
+          return true;
+        }
+      }
+    }
+
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
       task = thread_data_[pt->thread_id].PopFront();
@@ -600,7 +674,9 @@ private:
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
     assert(outstanding != nullptr);
-    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
+    const size_t previous = outstanding->fetch_sub(
+        1, SchedulingPolicy::enabled ? std::memory_order_seq_cst
+                                     : std::memory_order_release);
     assert(previous > 0);
     if (previous == 1 && done_.load(std::memory_order_acquire) &&
         NoOutstandingTasks()) {
@@ -638,6 +714,13 @@ private:
 
   void FlushQueues() {
     for (auto &data : thread_data_) {
+      if constexpr (SchedulingPolicy::enabled) {
+        data.groups.Drain([](TaskPtr task) {
+          auto *outstanding = task->outstanding;
+          delete task;
+          outstanding->fetch_sub(1, std::memory_order_relaxed);
+        });
+      }
       while (TaskPtr task = data.PopFront()) {
         auto *outstanding = task->outstanding;
         delete task;
@@ -722,6 +805,7 @@ private:
 };
 
 typedef ThreadPoolTempl<StlThreadEnvironment> ThreadPool;
+using DemandThreadPool = ThreadPoolTempl<StlThreadEnvironment, DemandPolicy>;
 
 } // namespace oox::detail::eigen_pool
 

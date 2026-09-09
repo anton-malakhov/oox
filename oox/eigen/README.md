@@ -33,3 +33,6 @@ remain in every Eigen-derived file.
 `OOX_EIGEN_CACHE_LINE_SIZE` can override the stable 64-byte cache-line layout
 constant used by the vendored MPMC queue. Its value must be a power of two no
 greater than 128, matching the vendored aligned allocator's supported range.
+
+The opt-in [demand backend](DEMAND.md) shares this runtime and adds
+Apache-2.0 TBB-derived partitioning helpers with a separate ready-task adapter.

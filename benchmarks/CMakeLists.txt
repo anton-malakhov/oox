@@ -96,6 +96,11 @@ if(OOX_ENABLE_EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
 endif()
 
+if(OOX_ENABLE_EIGEN_DEMAND)
+  list(APPEND OOX_BACKENDS EIGEN_DEMAND)
+  list(APPEND EIGEN_DEMAND_LIBS ${PROJECT_NAME}::eigen_demand)
+endif()
+
 foreach(bench IN LISTS OOX_BENCHMARKS)
   foreach(mode IN LISTS OOX_BACKENDS)
     if("${bench}" MATCHES "loops")
@@ -161,4 +166,13 @@ endif()
 
 if(OOX_BUILD_TASKBENCH)
   add_subdirectory(taskbench)
+endif()
+
+if(OOX_ENABLE_EIGEN_DEMAND)
+  add_executable(bench_eigen_demand bench_eigen_demand.cpp)
+  target_link_libraries(bench_eigen_demand PRIVATE OOX::OOX)
+  foreach(policy IN ITEMS legacy fixed demand)
+    add_test(NAME bench_eigen_demand_${policy}_smoke
+             COMMAND bench_eigen_demand ${policy} 2 4096 4)
+  endforeach()
 endif()

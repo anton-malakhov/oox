@@ -1,0 +1,66 @@
+name: Eigen demand backend
+
+on:
+  pull_request:
+    paths:
+      - 'oox/**'
+      - 'tests/**'
+      - 'benchmarks/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/eigen-demand.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        exceptions: ['OFF', 'ON']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build libgtest-dev libeigen3-dev libbenchmark-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build-demand -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_BUILD_TYPE=Debug
+          -DOOX_ENABLE_EIGEN_DEMAND=ON -DOOX_EIGEN_THREADS=2
+          -DOOX_ENABLE_TBB=OFF -DOOX_ENABLE_TF=OFF
+          -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=OFF
+          -DOOX_BUILD_BENCHMARKS=ON
+          -DOOX_EXCEPTIONS_ENABLED=${{ matrix.exceptions }}
+      - name: Build
+        run: cmake --build build-demand -j 4
+      - name: Test
+        run: ctest --test-dir build-demand --output-on-failure --timeout 120
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ['address,undefined', 'thread']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build libgtest-dev libeigen3-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitize -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_BUILD_TYPE=Debug
+          -DOOX_ENABLE_EIGEN_DEMAND=ON -DOOX_EIGEN_THREADS=4
+          -DOOX_ENABLE_TBB=OFF -DOOX_ENABLE_TF=OFF
+          -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=OFF
+          -DOOX_BUILD_BENCHMARKS=OFF -DOOX_EXCEPTIONS_ENABLED=ON
+          -DOOX_SANITIZE=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build-sanitize -j 4
+      - name: Test alternative backend
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: >-
+          ctest --test-dir build-sanitize --output-on-failure --timeout 120
+          -R 'EigenDemand|TbbPartition|Demand.EigenPool|OOX_EIGEN_DEMAND|eigen_demand.EigenBackendDag'

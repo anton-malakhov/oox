@@ -18,7 +18,11 @@ namespace internal {
 #define OOX_USING_EIGEN
 #define TASK_EXECUTE_METHOD void* execute() override
 
+#if HAVE_EIGEN_DEMAND
+using eigen_thread_pool = detail::eigen_pool::DemandThreadPool;
+#else
 using eigen_thread_pool = detail::eigen_pool::ThreadPool;
+#endif
 
 inline int resolved_eigen_thread_count() {
     constexpr long long build_threads = OOX_EIGEN_NUM_THREADS;

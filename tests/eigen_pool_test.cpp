@@ -15,7 +15,11 @@
 namespace {
 
 using oox::detail::eigen_pool::MakeTask;
+#if HAVE_EIGEN_DEMAND
+using ThreadPool = oox::detail::eigen_pool::DemandThreadPool;
+#else
 using oox::detail::eigen_pool::ThreadPool;
+#endif
 using namespace std::chrono_literals;
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
