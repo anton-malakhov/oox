@@ -102,9 +102,9 @@ engines*. It compares ordinary work stealing, proactive mailbox publication,
 adaptive timespan splitting, their combined Eigen policy, oneTBB partitioners,
 and available OpenMP schedules through one shared workload layer.
 
-The historical thesis repository is pinned as optional reference material at
-`thirdparty/composable-parallel-scheduler-thesis`. The runner never clones or
-downloads it. See `docs/PROVENANCE.md` for the clean-room implementation policy and
+The historical thesis is cited at its original revision without a repository
+checkout dependency. The runner never clones or downloads its code.
+See `docs/PROVENANCE.md` for the clean-room implementation policy and
 the intentional differences from that source.
 
 ## Build and verify

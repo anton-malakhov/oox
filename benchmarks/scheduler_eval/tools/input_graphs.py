@@ -64,7 +64,7 @@ def main():
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--threads", type=int, default=2)
-    parser.add_argument("--source", type=Path, default=root / "thirdparty/pbbsbench")
+    parser.add_argument("--source", type=Path, default=root / "benchmarks/pbbs/vendor")
     parser.add_argument("--compiler", default=shutil.which("clang++") or "c++")
     parser.add_argument("--output", type=Path, default=root / "results/pbbs-graphs")
     parser.add_argument("--timeout", type=int, default=900)
@@ -87,14 +87,12 @@ def main():
     spec.loader.exec_module(driver)
     source = args.source.resolve()
     driver.validate_source(source)
-    if subprocess.check_output(
-            ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"], text=True):
-        raise RuntimeError("PBBS has tracked changes; finish the other PBBS operation first")
     args.output.mkdir(parents=True, exist_ok=True)
     target = args.output / f"{args.kind}_{profile}_seed{args.seed}.adj"
     record = target.with_suffix(".json")
     if target.exists() or record.exists():
         raise FileExistsError(f"refusing to replace {target} or its metadata")
+    source = driver.snapshot.build_copy(source, args.output)
     generator_dir = source / "testData/graphData"
     env = dict(os.environ, EIGEN="1", EIGEN_MODE="EIGEN_STEALING",
                BENCH_NUM_THREADS=str(args.threads), PARLAY_NUM_THREADS=str(args.threads))
@@ -125,7 +123,7 @@ def main():
             stream.write("\n")
         print(target.resolve())
     finally:
-        driver.restore_checkout(source)
+        driver.validate_source(args.source)
 
 
 if __name__ == "__main__":

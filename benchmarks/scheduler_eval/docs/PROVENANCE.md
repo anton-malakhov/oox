@@ -2,17 +2,18 @@
 
 ## Historical reference
 
-The research implementation is tracked at
-`thirdparty/composable-parallel-scheduler-thesis`.
+The research implementation is cited as historical reference material only.
+OOX does not require or initialize a checkout of it.
 
 - Repository: `https://github.com/lejabque/composable-parallel-scheduler-thesis`
 - Pinned commit: `f58844b4fb6f0a1394968771c1a932c8cf2c75d4`
-- Submodule path: `thirdparty/composable-parallel-scheduler-thesis`
 
 No explicit license file is present at the pinned revision. Its files are
-therefore reference material, not vendored OOX source. The files in this
-directory are independently implemented under Apache-2.0 and use OOX's public
-backend abstraction. No runner clones the reference at execution time.
+therefore reference material, not vendored OOX source. Native scheduler-evaluation
+implementations use OOX's backend abstraction and are independently written,
+apart from explicitly attributed adaptations. The separate
+[vendored PBBS snapshot](../../pbbs/VENDORING.md) retains its upstream licenses.
+No runner clones the historical thesis reference at execution time.
 
 ## Implemented coverage
 
@@ -75,13 +76,14 @@ backend abstraction. No runner clones the reference at execution time.
     the runner supports explicit local, remote, or interleaved `numactl`
     placement and opt-in process-level `perf stat` counters on Linux.
 13. Native primary-kernel workloads are compact scheduler-focused analogues,
-    independently implemented under Apache-2.0. The pinned PBBS suite remains
+    independently implemented under Apache-2.0. The vendored PBBS snapshot remains
     the source of exact end-to-end application implementations and checkers.
 
 ## Evaluation rules
 
-1. Keep both research submodules optional for normal OOX builds and pinned by
-   gitlink. Benchmark execution must remain network-free.
+1. Keep research code isolated to benchmarks. PBBS sources are vendored with
+   licenses and a checksum manifest; do not add research submodule dependencies.
+   Dataset acquisition is separate from network-free benchmark execution.
 2. Construct inputs and validate outputs outside timed regions.
 3. Compare modes from one build/result directory with identical thread count,
    affinity, allocator, compiler, power policy, and machine state.

@@ -43,7 +43,28 @@ def copy_stream(origin, destination, limit):
     return size
 
 
-def acquire(name, entry, output, pbbs, gateways, ipfs, timeout, limit):
+def prepare_archive(entry, archives, timeout, limit):
+    archive = archives / entry["archive"]
+    # Accept an explicitly supplied old checkout as a data-only cache.
+    legacy = archives / "testData/data" / entry["archive"]
+    if not archive.exists() and legacy.is_file():
+        archive = legacy
+    if not archive.exists():
+        archives.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="archive_", dir=archives) as directory:
+            temporary = Path(directory) / "payload"
+            url = CATALOG["archive_base_url"] + entry["archive"]
+            with urllib.request.urlopen(url, timeout=timeout) as origin, temporary.open("wb") as destination:
+                copy_stream(origin, destination, limit)
+            if digest(temporary) != entry["sha256"]:
+                raise ValueError("original archive checksum mismatch: " + url)
+            os.link(temporary, archive)
+    if digest(archive) != entry["sha256"]:
+        raise ValueError(f"original archive checksum mismatch: {archive}")
+    return archive
+
+
+def acquire(name, entry, output, archives, gateways, ipfs, timeout, limit):
     target = output / entry["file"]
     record = output / (entry["file"] + ".metadata.json")
     if record.exists() and target.is_file():
@@ -60,15 +81,10 @@ def acquire(name, entry, output, pbbs, gateways, ipfs, timeout, limit):
     with tempfile.TemporaryDirectory(prefix="dataset_", dir=output) as directory:
         temporary = Path(directory) / "payload"
         if "archive" in entry:
-            revision = subprocess.check_output(["git", "-C", str(pbbs), "rev-parse", "HEAD"], text=True).strip()
-            if revision != CATALOG["pbbs_revision"]:
-                raise ValueError("PBBS checkout is not at the catalogued revision")
-            archive = pbbs / "testData/data" / entry["archive"]
-            if digest(archive) != entry["sha256"]:
-                raise ValueError(f"original archive checksum mismatch: {archive}")
+            archive = prepare_archive(entry, archives, timeout, limit)
             with bz2.open(archive, "rb") as origin, temporary.open("wb") as destination:
                 copy_stream(origin, destination, limit)
-            metadata.update(transport="pinned PBBS archive", pbbs_revision=revision,
+            metadata.update(transport="checksum-verified PBBS data archive", pbbs_revision=CATALOG["pbbs_revision"],
                             archive_sha256=entry["sha256"])
         elif "url" in entry:
             archive = Path(directory) / "archive.bz2"
@@ -131,7 +147,10 @@ def main():
     selection.add_argument("--all", action="store_true")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--output", type=Path, default=root / "results/original-datasets")
-    parser.add_argument("--pbbs", type=Path, default=root / "thirdparty/pbbsbench")
+    parser.add_argument("--archives", "--pbbs", dest="archives", type=Path,
+                        default=root / "results/pbbs-archives")
+    parser.add_argument("--archives-only", action="store_true",
+                        help="prepare compressed originals for the vendored PBBS runner")
     parser.add_argument("--gateway", action="append")
     parser.add_argument("--ipfs", help="IPFS executable using an initialized online node")
     parser.add_argument("--timeout", type=int, default=60)
@@ -146,8 +165,10 @@ def main():
         if args.bundled else args.dataset or [])
     if not selected:
         parser.error("choose --bundled, --all, or --dataset")
+    if args.archives_only and any("archive" not in CATALOG["datasets"][name] for name in selected):
+        parser.error("--archives-only requires PBBS archive datasets")
     args.output.mkdir(parents=True, exist_ok=True)
-    report = args.output / "acquisition-report.json"
+    report = args.output / ("archive-acquisition-report.json" if args.archives_only else "acquisition-report.json")
     results = json.loads(report.read_text()) if report.exists() else {}
     for name in selected:
         print(f"Acquiring original {name}", flush=True)
@@ -155,7 +176,12 @@ def main():
             free = shutil.disk_usage(args.output).free
             if free < 1024 ** 3:
                 raise RuntimeError("less than 1 GiB free; acquisition stopped")
-            results[name] = acquire(name, CATALOG["datasets"][name], args.output, args.pbbs,
+            if args.archives_only:
+                archive = prepare_archive(CATALOG["datasets"][name], args.archives, args.timeout,
+                                          min(int(args.max_gib * 1024 ** 3), free - 1024 ** 3))
+                results[name] = dict(complete=True, archive=str(archive), sha256=digest(archive))
+                continue
+            results[name] = acquire(name, CATALOG["datasets"][name], args.output, args.archives,
                                     args.gateway or ["https://ipfs.io", "https://dweb.link"],
                                     args.ipfs, args.timeout, min(int(args.max_gib * 1024 ** 3), free - 1024 ** 3))
         except Exception as error:

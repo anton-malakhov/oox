@@ -160,6 +160,9 @@ if(OOX_ENABLE_EIGEN OR TBB_FOUND)
 endif()
 
 if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
+  add_test(NAME scheduler_eval_pbbs_snapshot
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/benchmarks/pbbs/tests_snapshot.py)
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_pbbs_snapshot)
   add_test(NAME scheduler_eval_dataset_integrity
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tests/tests_datasets.py)
   list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_dataset_integrity)

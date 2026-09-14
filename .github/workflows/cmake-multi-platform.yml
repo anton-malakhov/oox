@@ -46,8 +46,11 @@ jobs:
     - uses: actions/checkout@v5
     - name: Dependencies
       run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
-    - name: Initialize PBBS
-      run: git submodule update --init thirdparty/pbbsbench
+    - name: Verify vendored PBBS sources
+      run: python3 benchmarks/pbbs/tests_snapshot.py
+    - name: Acquire checksum-verified original data (no code checkout)
+      run: >
+        python3 benchmarks/scheduler_eval/tools/datasets.py --archives-only --bundled
     - name: Compile and run checker-backed application suite
       timeout-minutes: 35
       run: >

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the pinned PBBS submodule with historical or OOX Eigen."""
+"""Run the in-tree PBBS snapshot in an isolated build directory."""
 
 import argparse
 import ast
@@ -9,6 +9,9 @@ import platform
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import snapshot
 
 COMMIT = "396a299f03c58dbe9e7604daab38a65781227b75"
 DEFAULT_BENCHMARKS = [
@@ -147,22 +150,22 @@ template <typename... Fs> void execute_with_scheduler(Fs...) {
 '''
 
 
-def git_file(source: Path, path: str) -> bytes:
-    return subprocess.check_output(["git", "show", f"{COMMIT}:{path}"], cwd=source)
+def upstream_file(source: Path, path: str) -> bytes:
+    # Read pristine bytes even when source is a patched build copy.
+    return (snapshot.VENDOR / path).read_bytes()
 
 
 def restore_reference_file(source: Path, path: str):
+    if source.resolve() == snapshot.VENDOR.resolve():
+        raise ValueError("cannot patch the checked-in PBBS snapshot")
     destination = source / path
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(git_file(source, path))
+    destination.write_bytes(upstream_file(source, path))
 
 
 def restore_reference_tree(source: Path, prefix: str):
-    paths = subprocess.check_output(
-        ["git", "ls-tree", "-r", "--name-only", COMMIT, prefix],
-        cwd=source,
-        text=True,
-    ).splitlines()
+    paths = [path for path in snapshot.manifest()["files"]
+             if path == prefix or path.startswith(prefix + "/")]
     for path in paths:
         restore_reference_file(source, path)
 
@@ -239,25 +242,16 @@ def select_backend(source: Path, backend: str):
 
 
 def validate_source(source: Path):
-    if not (source / ".git").exists():
-        raise RuntimeError(
-            "PBBS submodule is not initialized; run: "
-            "git submodule update --init thirdparty/pbbsbench"
-        )
-    actual = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=source, text=True
-    ).strip()
-    if actual != COMMIT:
-        raise RuntimeError(
-            f"{source} is at {actual}; expected pinned eigen-mailbox commit {COMMIT}"
-        )
+    snapshot.validate(source)
+    if snapshot.manifest()["revision"] != COMMIT:
+        raise ValueError("unexpected PBBS snapshot revision")
 
 
 def configure_checkout(source: Path, root: Path, compiler: str):
+    if source.resolve() == snapshot.VENDOR.resolve():
+        raise ValueError("cannot configure the checked-in PBBS snapshot")
     runall = source / "runall"
-    runall_text = subprocess.check_output(
-        ["git", "show", f"{COMMIT}:runall"], cwd=source, text=True
-    )
+    runall_text = upstream_file(source, "runall").decode()
     runall_text = runall_text.replace(
         '    # ["nearestNeighbors/octTree",True,0],',
         '    ["nearestNeighbors/octTree",True,0],',
@@ -276,7 +270,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
     runall.write_text(runall_text)
 
     neighbors = source / "benchmarks/nearestNeighbors/octTree/neighbors.h"
-    neighbors_text = git_file(
+    neighbors_text = upstream_file(
         source, "benchmarks/nearestNeighbors/octTree/neighbors.h"
     ).decode()
     neighbors_text = neighbors_text.replace(
@@ -303,7 +297,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
     neighbors.write_text(neighbors_text)
 
     dedup_time = source / "benchmarks/removeDuplicates/bench/dedupTime.C"
-    dedup_text = git_file(
+    dedup_text = upstream_file(
         source, "benchmarks/removeDuplicates/bench/dedupTime.C"
     ).decode()
     dedup_text = dedup_text.replace(
@@ -312,7 +306,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
     dedup_time.write_text(dedup_text)
 
     suffix_check = source / "benchmarks/suffixArray/bench/SACheck.C"
-    suffix_text = git_file(
+    suffix_text = upstream_file(
         source, "benchmarks/suffixArray/bench/SACheck.C"
     ).decode()
     marker = "  return 0;\n}\n\nint main"
@@ -320,9 +314,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
     suffix_check.write_text(suffix_text)
 
     runner = source / "common/runTests.py"
-    runner_text = subprocess.check_output(
-        ["git", "show", f"{COMMIT}:common/runTests.py"], cwd=source, text=True
-    )
+    runner_text = upstream_file(source, "common/runTests.py").decode()
     runner_text = runner_text.replace(
         "if (len(err) > 0):", "if process.returncode != 0:"
     )
@@ -333,9 +325,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
         compiler = f"{compiler} -isysroot {sdk}"
 
     defs = source / "common/parallelDefs"
-    text = subprocess.check_output(
-        ["git", "show", f"{COMMIT}:common/parallelDefs"], cwd=source, text=True
-    )
+    text = upstream_file(source, "common/parallelDefs").decode()
     text = text.replace(
         "CCFLAGS = -O2 -g -std=c++17", "CCFLAGS = -O2 -g -std=c++20", 1
     )
@@ -352,7 +342,7 @@ def configure_checkout(source: Path, root: Path, compiler: str):
             "EIGENFLAGS = -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION",
         )
     defs.write_text(text)
-    sequential = git_file(source, "common/seqDefs").decode()
+    sequential = upstream_file(source, "common/seqDefs").decode()
     sequential = sequential.replace("CC = g++", f"CC = {compiler}")
     sequential = sequential.replace("-std=c++17", "-std=c++20")
     if platform.machine() not in ("x86_64", "AMD64"):
@@ -362,30 +352,14 @@ def configure_checkout(source: Path, root: Path, compiler: str):
     (source / "common/seqDefs").write_text(sequential)
 
 
-def restore_checkout(source: Path):
-    restore_reference_tree(
-        source, "parlaylib/include/parlay/internal/scheduler_plugins/eigen"
-    )
-    for path in [
-        "parlaylib/include/parlay/parallel.h",
-        "parlaylib/include/parlay/internal/scheduler_plugins/eigen.h",
-        "parlaylib/include/parlay/internal/scheduler_plugins/common/initialization.h",
-        "common/runTests.py",
-        "common/parallelDefs",
-        "common/seqDefs",
-        "runall",
-        "benchmarks/nearestNeighbors/octTree/neighbors.h",
-        "benchmarks/removeDuplicates/bench/dedupTime.C",
-        "benchmarks/suffixArray/bench/SACheck.C",
-    ]:
-        restore_reference_file(source, path)
-
-
 def parse_args():
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path,
-                        default=root / "thirdparty/pbbsbench")
+                        default=snapshot.VENDOR)
+    parser.add_argument("--archives", type=Path,
+                        default=root / "results/pbbs-archives",
+                        help="checksum-verified original data archives, prepared separately")
     parser.add_argument("--output", type=Path,
                         default=root / "cmake-build-pbbs/results")
     parser.add_argument("--compiler", default=shutil.which("clang++") or "c++")
@@ -398,7 +372,7 @@ def parse_args():
                         help="Mode for a single selected backend")
     parser.add_argument("--benchmark", action="append")
     parser.add_argument("--all-benchmarks", action="store_true",
-                        help="Run PBBS's complete default application suite")
+                        help="Run all vendored implementations for the selected backend")
     parser.add_argument("--ci-smoke", action="store_true",
                         help="Run the bounded checker-backed CI workload set")
     parser.add_argument("--full", action="store_true",
@@ -420,9 +394,12 @@ def main():
     source = args.source.resolve()
     validate_source(source)
     if args.prepare_only:
-        print(f"PBBS submodule is ready at {source}")
+        print(f"PBBS snapshot verified at {source}")
         return
 
+    source = snapshot.build_copy(source, args.output, args.archives,
+                                 require_archives=args.ci_smoke)
+    print(f"PBBS build copy: {source}", flush=True)
     try:
         compiler = args.compiler
         if "oox-tasks" in (args.backend or []):
@@ -436,6 +413,7 @@ def main():
                     for target in statement.targets):
                 registered = {entry[0] for entry in ast.literal_eval(statement.value)}
                 break
+        registered &= set(snapshot.manifest()["applications"])
         unknown_benchmarks = set(args.benchmark or []) - registered
         if unknown_benchmarks:
             raise ValueError(f"unregistered PBBS benchmark(s): {sorted(unknown_benchmarks)}")
@@ -452,7 +430,7 @@ def main():
         if args.timeout is not None and args.timeout <= 0:
             raise ValueError("--timeout must be positive")
         if args.all_benchmarks:
-            benchmarks = None
+            benchmarks = DEFAULT_BENCHMARKS
         elif args.ci_smoke:
             benchmarks = CI_SMOKE_BENCHMARKS
         else:
@@ -478,7 +456,7 @@ def main():
                 if args.ci_smoke:
                     env["PBBS_ROUNDS"] = "1"
                 phases = [(benchmarks, args.compile_only, True, "")]
-                if backend == "serial" and not args.benchmark and not args.all_benchmarks:
+                if backend == "serial" and not args.benchmark:
                     phases = [(SERIAL_BENCHMARKS, args.compile_only, True, "")]
                 if args.ci_smoke:
                     full_suite = SERIAL_BENCHMARKS if backend == "serial" else DEFAULT_BENCHMARKS
@@ -525,7 +503,8 @@ def main():
                             f"{log_tail(output)}"
                         )
     finally:
-        restore_checkout(source)
+        # Keep the isolated copy and logs for inspection; never rewrite vendor/.
+        validate_source(snapshot.VENDOR)
 
 
 if __name__ == "__main__":

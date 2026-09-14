@@ -1,5 +1,9 @@
 # PBBS eigen-mailbox reproduction
 
+The required original benchmark sources now live in-tree under `vendor/`.
+See [vendoring and license policy](VENDORING.md) and `vendor_manifest.json`.
+No research submodule or upstream checkout is needed to build the suite.
+
 `--backend serial --mode SERIAL` selects the original serial BFS, hull, hash
 deduplication, radix/comparison sort, divsufsort, MST and spanning-forest
 implementations. It uses the pinned sequential Parlay plugin and one execution
@@ -25,26 +29,26 @@ All application families remain available under this adapter. Compilation
 coverage is distinct from runtime checker coverage; the portable CI runtime
 set still excludes the pinned BFS and hull cases described below.
 
-OOX tracks the original `EgorkaZ/pbbsbench` `eigen-mailbox` experiment as the
-`thirdparty/pbbsbench` submodule, pinned at commit `396a299`. `run.py` uses that
-explicit checkout and never clones PBBS itself. It can run either the untouched
+OOX vendors the selected sources from the original `EgorkaZ/pbbsbench`
+`eigen-mailbox` experiment at commit `396a299`. `run.py` verifies their hashes
+and builds in a separate working copy. It can run either the untouched
 historical Eigen plugin (`reference`) or the integrated OOX Eigen port (`oox`).
 This preserves the original mailbox implementation as an experimental baseline
-without duplicating its source tree inside OOX. On
+without depending on a separately maintained repository. On
 non-Linux hosts, the driver only disables the reference plugin's Linux-specific
 thread-affinity calls; its scheduling and mailbox code remains unchanged.
 
-The `oox` backend does **not** obtain Eigen from the downloaded repository. It
+The `oox` backend does **not** obtain Eigen from the historical snapshot. It
 combines the runtime mailbox scheduler in `oox/eigen` with the experimental
-parallel-for layer in `benchmarks/eigen`. The external clone provides the PBBS
+parallel-for layer in `benchmarks/eigen`. The vendored source provides the PBBS
 applications, inputs, validators, and—only for the explicit `reference`
 backend—the untouched historical Eigen snapshot.
 
-Initialize the dependency after cloning OOX, then run one small workload:
+Verify the snapshot, acquire originals separately, then run the suite:
 
 ```sh
-git submodule update --init thirdparty/pbbsbench
 python3 benchmarks/pbbs/run.py --prepare-only
+python3 benchmarks/scheduler_eval/tools/datasets.py --archives-only --bundled
 python3 benchmarks/pbbs/run.py --compile-only --threads 2
 python3 benchmarks/pbbs/run.py --ci-smoke --timeout 600 --threads 2
 python3 benchmarks/pbbs/run.py --backend oox --threads 8 \
@@ -80,22 +84,25 @@ and the untouched reference scheduler on macOS. `--timeout` bounds each
 backend/mode suite invocation and reports the retained log when the limit is
 exceeded.
 
-Add `--full` for paper-scale inputs. Full runs generate or download large
-datasets and can take hours; use an otherwise idle Linux machine with fixed
-affinity. Use `--all-benchmarks --full` for every benchmark in the pinned PBBS
-tree, beyond the porting-plan set.
+Add `--full` for paper-scale inputs after preparing all required original data
+archives (`datasets.py --bundled --archives-only`). Runs generate large inputs
+and can take hours. Use `--archives <directory>` to select the archive cache.
+`--all-benchmarks` selects all vendored implementations for the chosen backend;
+unrelated upstream applications are intentionally not included.
 
 Raw logs are written below `cmake-build-pbbs/results` with the backend in each
 filename. They retain PBBS's
 per-input repetitions and geometric-mean summaries, allowing comparison with
 the logs committed to the reference branch.
 
-The driver temporarily adapts files in the submodule checkout and restores the
-pinned versions when it exits, including after a benchmark error. PBBS leaves
-some generated inputs and build products untracked in its checkout; the parent
-repository ignores those while still reporting modifications to tracked files.
+Each run gets a unique `pbbs-build-*/source` directory below its output directory.
+Only this copy is adapted. Its build products and generated inputs remain there
+for inspection, including after an error; checked-in sources are never rewritten.
+The original archive cache defaults to `results/pbbs-archives`; archives are
+hash-checked before copying into a build. Missing archives fail the upstream
+input recipe rather than initiating a code checkout or substituting data.
 
 This split is intentional: scheduler microbenchmarks and the flat-versus-nested
 BFS graph families are native CMake targets under `benchmarks/scheduler_eval`,
-while PBBS remains the pinned upstream application suite so its algorithms,
+while PBBS remains a pinned, attributed in-tree source snapshot so its algorithms,
 generators, validators, and run protocol are not silently changed.

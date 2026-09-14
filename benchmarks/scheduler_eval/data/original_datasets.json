@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "pbbs_revision": "396a299f03c58dbe9e7604daab38a65781227b75",
+  "archive_base_url": "https://raw.githubusercontent.com/EgorkaZ/pbbsbench/396a299f03c58dbe9e7604daab38a65781227b75/testData/data/",
   "graph_catalog": "http://deepsea.inria.fr/graph/",
   "source_vertex_reference": "https://github.com/deepsea-inria/pasl/blob/d2147d5986866d6060b6dee562fa65df432f90b7/graph/bench/graph.ml",
   "datasets": {

@@ -7,8 +7,9 @@ hardware experiments or building historical runtimes is explicitly excluded.
 
 [`data/original_datasets.json`](../data/original_datasets.json) records original dataset identities, not substitutes:
 
-- Seven text/mesh archives are in the pinned PBBS checkout. Their compressed
-  SHA-256 values are pinned in the catalogue. Acquisition verifies each archive,
+- Seven original PBBS text/mesh archives have immutable source URLs and compressed
+  SHA-256 values pinned in the catalogue. No PBBS checkout is needed.
+  Acquisition caches and verifies each archive in `results/pbbs-archives`,
   decompresses it, and records the extracted file's SHA-256 and size.
 - `w3c2` comes from the original corpus author's HTTPS server. Its published
   payload MD5 is checked for historical identity, and modern SHA-256 hashes are
@@ -21,6 +22,7 @@ hardware experiments or building historical runtimes is explicitly excluded.
 
 ```sh
 python3 benchmarks/scheduler_eval/tools/datasets.py --bundled
+python3 benchmarks/scheduler_eval/tools/datasets.py --bundled --archives-only
 python3 benchmarks/scheduler_eval/tools/datasets.py --dataset w3c2
 python3 benchmarks/scheduler_eval/tools/datasets.py --dataset livejournal --dataset twitter \
   --dataset wikipedia --dataset europe --ipfs /path/to/ipfs

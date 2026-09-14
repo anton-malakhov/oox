@@ -4,6 +4,11 @@ This MR adds an opt-in scheduler-evaluation suite and PBBS application driver,
 plus scheduler fixes needed by the benchmarks. It is not a claim of reproduced
 paper results or production readiness for every experimental scheduler policy.
 
+The selected original PBBS implementations are now vendored under
+`benchmarks/pbbs/vendor/` with licenses and a checksum manifest, not replaced
+with native approximations. Builds use isolated copies. The two research
+submodules have been removed; dataset acquisition remains a separate operation.
+
 ## Suggested review order
 
 1. Runtime changes in `oox/eigen/nonblocking_thread_pool.h` and

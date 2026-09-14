@@ -11,11 +11,36 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from datasets import CATALOG, acquire, copy_stream, graph_dimensions
+from datasets import acquire, copy_stream, graph_dimensions, prepare_archive
 
 
 
 class DatasetTests(unittest.TestCase):
+    def test_archive_download_is_bounded_verified_and_reusable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            payload = bz2.compress(b"original fixture")
+            entry = dict(archive="fixture.bz2", sha256=hashlib.sha256(payload).hexdigest())
+            with patch("datasets.urllib.request.urlopen", return_value=io.BytesIO(payload)) as download:
+                archive = prepare_archive(entry, cache, 1, 1024)
+                self.assertEqual(archive.read_bytes(), payload)
+                self.assertEqual(prepare_archive(entry, cache, 1, 1024), archive)
+                self.assertEqual(download.call_count, 1)
+            archive.write_bytes(b"corrupt cached data")
+            with self.assertRaises(ValueError):
+                prepare_archive(entry, cache, 1, 1024)
+            self.assertEqual(archive.read_bytes(), b"corrupt cached data")
+
+    def test_failed_archive_download_is_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            entry = dict(archive="fixture.bz2", sha256="0" * 64)
+            for limit in (2, 1024):
+                with patch("datasets.urllib.request.urlopen", return_value=io.BytesIO(b"wrong data")):
+                    with self.assertRaises(ValueError):
+                        prepare_archive(entry, cache, 1, limit)
+                self.assertFalse((cache / "fixture.bz2").exists())
+
     def test_original_archive_integrity_and_reuse(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -28,7 +53,7 @@ class DatasetTests(unittest.TestCase):
             archive.write_bytes(bz2.compress(payload))
             entry = dict(file="fixture", archive="fixture.bz2", format="text",
                          sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
-            with patch("datasets.subprocess.check_output", return_value=CATALOG["pbbs_revision"]):
+            with patch("datasets.subprocess.check_output", side_effect=AssertionError("must not require Git")):
                 record = acquire("fixture", entry, output, root, [], None, 1, 100000)
                 self.assertEqual((output / "fixture").read_bytes(), payload)
                 self.assertEqual(record["sha256"], hashlib.sha256(payload).hexdigest())
@@ -44,7 +69,7 @@ class DatasetTests(unittest.TestCase):
             (root / "testData/data").mkdir(parents=True)
             (root / "testData/data/a.bz2").write_bytes(bz2.compress(b"wrong"))
             entry = dict(file="a", archive="a.bz2", format="text", sha256="0" * 64)
-            with patch("datasets.subprocess.check_output", return_value=CATALOG["pbbs_revision"]):
+            with patch("datasets.subprocess.check_output", side_effect=AssertionError("must not require Git")):
                 with self.assertRaises(ValueError):
                     acquire("a", entry, root, root, [], None, 1, 1024)
             self.assertFalse((root / "a").exists())
