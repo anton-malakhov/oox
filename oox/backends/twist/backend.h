@@ -4,6 +4,9 @@
 #define OOX_BACKENDS_TWIST_BACKEND_H
 
 #include <mutex>
+#include <twist/ed/std/condition_variable.hpp>
+#include <twist/ed/std/mutex.hpp>
+#include <twist/ed/std/thread.hpp>
 
 namespace oox {
 namespace internal {

@@ -3,7 +3,9 @@
 #ifndef OOX_BACKENDS_TBB_BACKEND_H
 #define OOX_BACKENDS_TBB_BACKEND_H
 
+#ifndef TBB_USE_ASSERT
 #define TBB_USE_ASSERT 0
+#endif
 #include <oneapi/tbb/detail/_task.h>
 #include <oneapi/tbb/task_group.h>
 
@@ -25,7 +27,7 @@ struct task : public tbb_task, task_life {
 #if TBB_USE_ASSERT
     std::atomic<bool> is_spawned{false};
     virtual ~task() {
-        if(!is_spawned.load(std::memory_order_acquire);)
+        if(!is_spawned.load(std::memory_order_acquire))
             waiter.release();
     }
 #else

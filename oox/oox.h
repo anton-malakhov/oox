@@ -630,7 +630,7 @@ struct task_node : public task, arc_list {
     virtual void on_ready(int) { __OOX_ASSERT(false, "not implemented"); }
 };
 
-bool arc_list::add_arc( arc* i ) {
+inline bool arc_list::add_arc( arc* i ) {
     __OOX_ASSERT(
 #if OOX_EXCEPTIONS_ENABLED
         i->kind == arc::exception_signal ||
@@ -650,24 +650,24 @@ bool arc_list::add_arc( arc* i ) {
 }
 
 #if OOX_EXCEPTIONS_ENABLED
-bool task_node::has_start_failure() const noexcept {
+inline bool task_node::has_start_failure() const noexcept {
     return (start_count.load(std::memory_order_relaxed) & start_failure_bits_mask) != 0;
 }
 
-bool task_node::has_non_user_start_failure() const noexcept {
+inline bool task_node::has_non_user_start_failure() const noexcept {
     const auto bits = start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
     return (bits & (start_dependency_cancelled_bit | start_exception_bit)) != 0;
 }
 
-void task_node::set_exception(std::exception_ptr ep) noexcept {
+inline void task_node::set_exception(std::exception_ptr ep) noexcept {
     try_set_exception(std::move(ep));
 }
 
-void task_node::cancel() noexcept {
+inline void task_node::cancel() noexcept {
     mark_failure(start_user_cancelled_bit);
 }
 
-void task_node::throw_failure_for_port(int port) const {
+inline void task_node::throw_failure_for_port(int port) const {
     if (port > 0) {
         throw cancelled_by_exception{};
     }
@@ -683,15 +683,15 @@ void task_node::throw_failure_for_port(int port) const {
     throw cancelled_by_exception{};
 }
 
-std::uint32_t task_node::failure_bits() const noexcept {
+inline std::uint32_t task_node::failure_bits() const noexcept {
     return start_count.load(std::memory_order_relaxed) & start_failure_bits_mask;
 }
 
-bool task_node::has_failure() const noexcept {
+inline bool task_node::has_failure() const noexcept {
     return failure_bits() != 0u;
 }
 
-void task_node::try_set_exception(std::exception_ptr eptr) noexcept {
+inline void task_node::try_set_exception(std::exception_ptr eptr) noexcept {
     if (eptr) {
         if (store_exception_control(new exception_control_struct(std::move(eptr)))) {
             mark_failure(start_exception_bit);
@@ -701,7 +701,7 @@ void task_node::try_set_exception(std::exception_ptr eptr) noexcept {
     mark_failure(start_dependency_cancelled_bit);
 }
 
-bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
+inline bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
     __OOX_ASSERT_EX(failure_bit != 0 && (failure_bit & ~start_failure_bits_mask) == 0,
                     "mark_failure expects exactly one failure bit");
     if (details::is_done_arc_head(head.load(std::memory_order_acquire))) {
@@ -721,7 +721,7 @@ bool task_node::mark_failure(std::uint32_t failure_bit) noexcept {
     }
 }
 
-bool task_node::store_exception_control(exception_control control) noexcept {
+inline bool task_node::store_exception_control(exception_control control) noexcept {
     __OOX_ASSERT_EX(control, "exception control is required");
     // Real-exception path only: cancellation never creates exception controls
     // or signal arcs. The signal shares the payload until completion installs
@@ -734,7 +734,7 @@ bool task_node::store_exception_control(exception_control control) noexcept {
     return false;
 }
 
-exception_control task_node::local_exception_control_handle() const noexcept {
+inline exception_control task_node::local_exception_control_handle() const noexcept {
     // Exception-path lookup only. exception_signal currently lives in the same
     // lock-free stack as successor arcs, so late consumers can be pushed above
     // it. Normal success/cancellation paths must not call this scan.
@@ -751,14 +751,14 @@ exception_control task_node::local_exception_control_handle() const noexcept {
     return {};
 }
 
-std::exception_ptr task_node::local_exception() const noexcept {
+inline std::exception_ptr task_node::local_exception() const noexcept {
     if (auto control = local_exception_control_handle()) {
         return control->exception;
     }
     return std::exception_ptr{};
 }
 
-void task_node::publish_failure_from(task_node* source, int source_port) noexcept {
+inline void task_node::publish_failure_from(task_node* source, int source_port) noexcept {
     if (!source) {
         mark_failure(start_user_cancelled_bit);
         return;
@@ -793,7 +793,7 @@ void task_node::publish_failure_from(task_node* source, int source_port) noexcep
 
 #endif
 
-int task_node::assign_prerequisite( task_node *n, int req_port ) {
+inline int task_node::assign_prerequisite( task_node *n, int req_port ) {
     arc* j = new arc( this, req_port ); // TODO: embed into the task
     __OOX_ASSERT_EX(j && n, "");
     if( n->add_arc(j) ) {
@@ -913,7 +913,7 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
     } while( r );
 }
 
-int task_node::do_notify_out( int port, int count ) {
+inline int task_node::do_notify_out( int port, int count ) {
     task_node* null = nullptr;
     if( out(port).next_writer.load(std::memory_order_acquire)==nullptr
         && out(port).next_writer.compare_exchange_strong( null, details::next_writer_ready_marker()) ) {
@@ -968,7 +968,7 @@ int task_node::notify_successors( int output_slots, int *count ) {
     return refs;
 }
 
-void task_node::remove_prerequisite( int n ) {
+inline void task_node::remove_prerequisite( int n ) {
     const auto previous = start_count.fetch_sub(static_cast<std::uint32_t>(n), std::memory_order_acq_rel);
     const auto previous_count = start_prerequisite_count(previous);
     __OOX_ASSERT(previous_count >= static_cast<std::uint32_t>(n),
@@ -989,7 +989,7 @@ void task_node::remove_prerequisite( int n ) {
     }
 }
 
-int task_node::notify_next_writer( task_node* d ) {
+inline int task_node::notify_next_writer( task_node* d ) {
     if( details::is_tagged_next_writer(d) ) {
         if( details::is_next_writer_no_owner_marker(d) )
             return 1;
@@ -1004,7 +1004,7 @@ int task_node::notify_next_writer( task_node* d ) {
     return 1; // the last, release the node
 }
 
-int task_node::remove_back_arc( int output_port, int n ) {
+inline int task_node::remove_back_arc( int output_port, int n ) {
     int k = out(output_port).countdown -= n;
     __OOX_ASSERT(k>=0,"invalid countdown detected while removing back_arc");
     __OOX_TRACE("%p remove_back_arc port %d: %d (next_writer is %p)",this,output_port,k,out(output_port).next_writer.load(std::memory_order_acquire));
@@ -1015,7 +1015,7 @@ int task_node::remove_back_arc( int output_port, int n ) {
     return 0;
 }
 
-void task_node::set_next_writer( int output_port, task_node* d ) {
+inline void task_node::set_next_writer( int output_port, task_node* d ) {
     __OOX_ASSERT( !details::is_next_writer_ready_marker(d), "" );
     task_node* o = out(output_port).next_writer.exchange(d);
     __OOX_TRACE("%p set_next_writer(%d, %p): next_writer was %p",this,output_port,d,o);
@@ -2098,7 +2098,7 @@ wait_status wait_for_all_status(internal::oox_var_base& on) {
 #endif
 }
 
-void wait_for_all(internal::oox_var_base& on ) {
+inline void wait_for_all(internal::oox_var_base& on ) {
     wait_for_all_status<true>(on);
 }
 

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <future>
 #include <memory>
 #include <thread>
@@ -17,6 +18,39 @@ namespace {
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
+
+struct MoveAwareCallable {
+  bool *moved_from;
+  bool *ran;
+
+  MoveAwareCallable(bool &moved, bool &called)
+      : moved_from(&moved), ran(&called) {}
+  MoveAwareCallable(const MoveAwareCallable &) = default;
+  MoveAwareCallable(MoveAwareCallable &&other) noexcept : ran(other.ran) {
+    *other.moved_from = true;
+    moved_from = other.moved_from;
+  }
+  void operator()() { *ran = true; }
+};
+
+TEST(EigenPool, MakeTaskCopiesLvalueCallable) {
+  bool moved_from = false;
+  bool ran = false;
+  MoveAwareCallable callable(moved_from, ran);
+  (*MakeTask(callable))();
+  EXPECT_FALSE(moved_from);
+  EXPECT_TRUE(ran);
+}
+
+TEST(EigenPoolDeathTest, UnhandledTaskExceptionFailsFast) {
+  EXPECT_EXIT({
+    std::set_terminate([] { std::_Exit(86); });
+    ThreadPool pool(1, false, false);
+    pool.Schedule(MakeTask([] { throw std::bad_alloc{}; }));
+    std::this_thread::sleep_for(2s);
+    std::_Exit(0);
+  }, testing::ExitedWithCode(86), "");
+}
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
@@ -59,12 +93,16 @@ TEST(EigenPool, SurvivesCreatorThreadExit) {
 
 TEST(EigenPool, NestedWaitsMakeProgressWithAllWorkersOccupied) {
   ThreadPool pool(2, false, false);
+  std::atomic<int> parents_started{0};
   std::atomic<int> parents_completed{0};
   std::promise<void> completed;
   auto result = completed.get_future();
 
   for (int i = 0; i < 2; ++i) {
     pool.Schedule(MakeTask([&] {
+      parents_started.fetch_add(1);
+      while (parents_started.load() != 2)
+        std::this_thread::yield();
       auto child_done = std::make_shared<std::atomic<bool>>(false);
       pool.Schedule(MakeTask([&, child_done] {
         child_done->store(true, std::memory_order_release);
