@@ -1,0 +1,141 @@
+suite,workers,workload,mode,samples,median_ms,iqr_pct
+native,8,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",block_end,7,1.5212013903591366,2.5510593318629895
+native,8,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",coarse,7,1.476486110024982,2.716252091001286
+native,8,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",fine,7,4.5697778308143215,3.0557047308476766
+native,8,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",patent,7,1.513506945533057,2.58436939844906
+native,8,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",static,7,1.5190393896773458,4.784384643692743
+native,8,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",block_end,7,3.7227761349640787,11.369874705328174
+native,8,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",coarse,7,3.9031486958265305,12.605960423746929
+native,8,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",fine,7,6.4447292243130505,7.46669390664824
+native,8,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",patent,7,3.6564948968589306,7.84496809118229
+native,8,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",static,7,2.1660673038031044,10.890387581252721
+native,8,ChangingWorkerAvailability/262144,block_end,7,6.47063524229452,1.8964699457967162
+native,8,ChangingWorkerAvailability/262144,coarse,7,6.54968770686537,1.4510102123500719
+native,8,ChangingWorkerAvailability/262144,fine,7,29.38562398776412,3.5273065761181095
+native,8,ChangingWorkerAvailability/262144,patent,7,6.4081253367476165,0.878446605257635
+native,8,ChangingWorkerAvailability/262144,static,7,11.350978864356875,0.7766416872895462
+native,8,Launch/262144,block_end,7,0.04335333029797047,1.3663515930722356
+native,8,Launch/262144,coarse,7,0.09152981803749506,2.8156965184368086
+native,8,Launch/262144,fine,7,30.57774994522333,5.923086252451031
+native,8,Launch/262144,patent,7,0.09760080398255606,1.7182943914038735
+native,8,Launch/262144,static,7,0.023243933732950743,2.779687533807883
+native,8,MatrixTranspose,block_end,7,0.07407338079798409,4.282917571609483
+native,8,MatrixTranspose,coarse,7,0.04396818888684114,4.766768358157128
+native,8,MatrixTranspose,fine,7,0.043568535739805465,4.984815210801435
+native,8,MatrixTranspose,patent,7,0.07416752524693142,6.8601732081904805
+native,8,MatrixTranspose,static,7,0.03873824811818306,5.7866423258834105
+native,8,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,block_end,7,0.12633736996136047,3.697029145659717
+native,8,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,coarse,7,0.11420487371004617,3.5079046548457566
+native,8,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,fine,7,0.11573001227485455,4.258197201704968
+native,8,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,patent,7,0.12561411852330231,4.436605026335903
+native,8,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,static,7,0.12382322990887866,1.7004323250237758
+native,8,Scan/16,block_end,7,0.47596173438554007,4.523031616070267
+native,8,Scan/16,coarse,7,0.3988933849281498,8.076161671327235
+native,8,Scan/16,fine,7,15.368312015198171,3.953819021860722
+native,8,Scan/16,patent,7,0.38809444374916413,6.402213284992997
+native,8,Scan/16,static,7,0.20128455944359303,9.105687995000656
+native,8,Scan/20,block_end,7,1.0409582302802138,5.70165994771667
+native,8,Scan/20,coarse,7,0.8316313438681942,7.148468829964504
+native,8,Scan/20,fine,7,240.64770783297718,2.13349544911894
+native,8,Scan/20,patent,7,0.9477083055701638,5.148090492413628
+native,8,Scan/20,static,7,0.5511874915100634,5.171705152096567
+native,8,SpmvBenchmark<SparseKind::Balanced>/4096,block_end,7,0.12971781044139116,2.3452496660298783
+native,8,SpmvBenchmark<SparseKind::Balanced>/4096,coarse,7,0.11564062539643298,2.3034631994423362
+native,8,SpmvBenchmark<SparseKind::Balanced>/4096,fine,7,0.30428148686972467,6.861011082761492
+native,8,SpmvBenchmark<SparseKind::Balanced>/4096,patent,7,0.12808694976241622,2.020508348752894
+native,8,SpmvBenchmark<SparseKind::Balanced>/4096,static,7,0.11890886371281552,1.5930378843680524
+native,8,SpmvBenchmark<SparseKind::Hyperbolic>/4096,block_end,7,0.10614559389793553,2.3449529935080964
+native,8,SpmvBenchmark<SparseKind::Hyperbolic>/4096,coarse,7,0.11587723008828399,3.141622106252268
+native,8,SpmvBenchmark<SparseKind::Hyperbolic>/4096,fine,7,0.2695801887520642,3.1437810846916685
+native,8,SpmvBenchmark<SparseKind::Hyperbolic>/4096,patent,7,0.09524785270242346,2.135443741063779
+native,8,SpmvBenchmark<SparseKind::Hyperbolic>/4096,static,7,0.3178304612593747,2.4172034302534557
+native,8,VariableCost<scheduler_eval::CostKind::Exponential>/262144,block_end,7,0.40987255873487277,1.5500415421137081
+native,8,VariableCost<scheduler_eval::CostKind::Exponential>/262144,coarse,7,0.3934305568691343,1.2067032788563916
+native,8,VariableCost<scheduler_eval::CostKind::Exponential>/262144,fine,7,31.85583301819861,2.7609432821622892
+native,8,VariableCost<scheduler_eval::CostKind::Exponential>/262144,patent,7,0.41555534394930543,0.6525199290337685
+native,8,VariableCost<scheduler_eval::CostKind::Exponential>/262144,static,7,0.40560688121595245,2.599462231000757
+native,8,VariableCost<scheduler_eval::CostKind::Linear>/262144,block_end,7,2.0898601339597787,0.5079904523546689
+native,8,VariableCost<scheduler_eval::CostKind::Linear>/262144,coarse,7,2.0912628477582564,0.7725894905553008
+native,8,VariableCost<scheduler_eval::CostKind::Linear>/262144,fine,7,31.349292024970055,4.459300299224213
+native,8,VariableCost<scheduler_eval::CostKind::Linear>/262144,patent,7,2.078169640818877,0.7635742607298008
+native,8,VariableCost<scheduler_eval::CostKind::Linear>/262144,static,7,4.1706111902991925,4.264104563659376
+native,8,VariableCost<scheduler_eval::CostKind::Periodic>/262144,block_end,7,0.9372513215508191,1.3822264257335821
+native,8,VariableCost<scheduler_eval::CostKind::Periodic>/262144,coarse,7,0.9419555698210994,0.9363640293765638
+native,8,VariableCost<scheduler_eval::CostKind::Periodic>/262144,fine,7,31.536374939605594,2.556175206785905
+native,8,VariableCost<scheduler_eval::CostKind::Periodic>/262144,patent,7,0.9579805346826712,2.053862011745893
+native,8,VariableCost<scheduler_eval::CostKind::Periodic>/262144,static,7,0.9304596817180995,2.2902597740081916
+native,8,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,block_end,7,2.142961531017835,0.7553797180016362
+native,8,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,coarse,7,2.157592931045935,0.3011867422300194
+native,8,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,fine,7,31.326542142778635,3.9187348008837453
+native,8,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,patent,7,2.1749070773904142,1.714190138178594
+native,8,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,static,7,2.1363461676698465,0.6630532122287166
+native,12,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",block_end,7,1.6170514692716738,2.2464605273434635
+native,12,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",coarse,7,1.588249989949605,3.3287798596189786
+native,12,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",fine,7,4.998854167448978,6.142270038933805
+native,12,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",patent,7,1.6407401794019867,5.875441782153271
+native,12,"Bfs<scheduler_eval::GraphKind::Rmat, BfsPolicy::Flat>/16384",static,7,1.6285882413606434,3.9978044965736634
+native,12,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",block_end,7,5.646466789767146,2.580077244396488
+native,12,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",coarse,7,5.941433412954211,2.5868473911989196
+native,12,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",fine,7,8.44340305775404,1.6662438430912951
+native,12,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",patent,7,5.633674981072545,1.45649507639753
+native,12,"Bfs<scheduler_eval::GraphKind::SquareGrid, BfsPolicy::Flat>/16384",static,7,3.6200052418280393,2.6214070990004203
+native,12,ChangingWorkerAvailability/262144,block_end,7,4.705513943918049,6.049856221957649
+native,12,ChangingWorkerAvailability/262144,coarse,7,4.817249796663721,1.4989457592985873
+native,12,ChangingWorkerAvailability/262144,fine,7,33.00654189661145,2.8193842443749637
+native,12,ChangingWorkerAvailability/262144,patent,7,4.80486797944953,3.711729733294181
+native,12,ChangingWorkerAvailability/262144,static,7,7.8321872861124575,2.771413985674792
+native,12,Launch/262144,block_end,7,0.056167635813990764,0.6648999423066198
+native,12,Launch/262144,coarse,7,0.08272740490321863,5.846953269692297
+native,12,Launch/262144,fine,7,33.573166001588106,4.573222215788063
+native,12,Launch/262144,patent,7,0.09773187012526026,1.202870960987021
+native,12,Launch/262144,static,7,0.022285804506603755,1.947979237164321
+native,12,MatrixTranspose,block_end,7,0.07936138963929902,1.0043151390673006
+native,12,MatrixTranspose,coarse,7,0.05520921291679773,1.5345374941187084
+native,12,MatrixTranspose,fine,7,0.05514124548153454,0.6707033371343184
+native,12,MatrixTranspose,patent,7,0.07869287232018035,1.2470727868736804
+native,12,MatrixTranspose,static,7,0.06238725419868441,1.4960447456270398
+native,12,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,block_end,7,0.12239270824162911,2.3688611554441192
+native,12,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,coarse,7,0.11437148581367419,11.157605243530512
+native,12,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,fine,7,0.11200620792806149,3.126989343759926
+native,12,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,patent,7,0.1282187496227297,6.120435464946514
+native,12,SampleSort<scheduler_eval::KeyKind::ReverseSorted>/65536,static,7,0.11829201182716809,3.991800449923429
+native,12,Scan/16,block_end,7,0.7340405673648303,2.82814560706213
+native,12,Scan/16,coarse,7,0.7044787172419139,2.3550243120514742
+native,12,Scan/16,fine,7,17.253354541026056,5.408733096500867
+native,12,Scan/16,patent,7,0.6388703412893745,2.9564653705058395
+native,12,Scan/16,static,7,0.37350212586680787,3.384107795137717
+native,12,Scan/20,block_end,7,1.4570373061456177,2.4390872835116317
+native,12,Scan/20,coarse,7,1.1980834761229546,2.5719956812364217
+native,12,Scan/20,fine,7,270.97545797005296,3.214574683038314
+native,12,Scan/20,patent,7,1.2906590815294872,0.8794441012950301
+native,12,Scan/20,static,7,0.7175031874794513,1.3535226960922038
+native,12,SpmvBenchmark<SparseKind::Balanced>/4096,block_end,7,0.12589611113071442,8.881339835327637
+native,12,SpmvBenchmark<SparseKind::Balanced>/4096,coarse,7,0.10253309605788465,4.041516420448407
+native,12,SpmvBenchmark<SparseKind::Balanced>/4096,fine,7,0.29983197885524965,3.285586423840734
+native,12,SpmvBenchmark<SparseKind::Balanced>/4096,patent,7,0.11945185310230785,5.209588025468977
+native,12,SpmvBenchmark<SparseKind::Balanced>/4096,static,7,0.12282550755680212,14.86538521074003
+native,12,SpmvBenchmark<SparseKind::Hyperbolic>/4096,block_end,7,0.09960362711763249,2.8463112810436875
+native,12,SpmvBenchmark<SparseKind::Hyperbolic>/4096,coarse,7,0.08664091965600625,5.268769643400875
+native,12,SpmvBenchmark<SparseKind::Hyperbolic>/4096,fine,7,0.2854796333445443,2.2639997479185117
+native,12,SpmvBenchmark<SparseKind::Hyperbolic>/4096,patent,7,0.09006480217681496,3.7114768135440666
+native,12,SpmvBenchmark<SparseKind::Hyperbolic>/4096,static,7,0.29292456854723004,0.2231612506764498
+native,12,VariableCost<scheduler_eval::CostKind::Exponential>/262144,block_end,7,0.36018166691064835,6.038635596864608
+native,12,VariableCost<scheduler_eval::CostKind::Exponential>/262144,coarse,7,0.3157868266625459,3.237131745666327
+native,12,VariableCost<scheduler_eval::CostKind::Exponential>/262144,fine,7,33.96841697394848,2.169416828360245
+native,12,VariableCost<scheduler_eval::CostKind::Exponential>/262144,patent,7,0.3623749995957824,3.5308322124040243
+native,12,VariableCost<scheduler_eval::CostKind::Exponential>/262144,static,7,0.3860787654372111,6.724974979678608
+native,12,VariableCost<scheduler_eval::CostKind::Linear>/262144,block_end,7,1.5646666676426928,8.36558385784915
+native,12,VariableCost<scheduler_eval::CostKind::Linear>/262144,coarse,7,1.5471544089343616,5.769481383380508
+native,12,VariableCost<scheduler_eval::CostKind::Linear>/262144,fine,7,34.11675011739135,5.1663291870380466
+native,12,VariableCost<scheduler_eval::CostKind::Linear>/262144,patent,7,1.5539387651883503,2.114948257850309
+native,12,VariableCost<scheduler_eval::CostKind::Linear>/262144,static,7,3.076504657251967,3.6148390034687017
+native,12,VariableCost<scheduler_eval::CostKind::Periodic>/262144,block_end,7,0.7426392679151735,1.834938294503019
+native,12,VariableCost<scheduler_eval::CostKind::Periodic>/262144,coarse,7,0.6991890202299124,2.785043201966088
+native,12,VariableCost<scheduler_eval::CostKind::Periodic>/262144,fine,7,33.52937498129904,2.1322098007223493
+native,12,VariableCost<scheduler_eval::CostKind::Periodic>/262144,patent,7,0.7374497691694742,2.1237619797338536
+native,12,VariableCost<scheduler_eval::CostKind::Periodic>/262144,static,7,0.8555196691304445,10.912906082305549
+native,12,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,block_end,7,1.6294778014222782,4.440086117040259
+native,12,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,coarse,7,1.5822013891819449,4.6372913225836
+native,12,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,fine,7,33.29908289015293,2.745761400667181
+native,12,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,patent,7,1.6154289546915714,1.4724318005895534
+native,12,VariableCost<scheduler_eval::CostKind::Shuffled>/262144,static,7,1.914738062103944,14.97449566919133

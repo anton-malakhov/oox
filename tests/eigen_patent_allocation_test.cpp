@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <new>
@@ -24,16 +25,14 @@ void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 int main() {
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(8, true, true);
-  rapid::RapidDomainState state(pool);
-  rapid::RapidStartGroup group{&state, {0, 8}};
-  rapid::ParallelForPatent(group, 0, 4097, [](std::size_t) {});
+  ParallelForPatent(pool, 0, 4097, [](std::size_t) {});
   unsigned hits = 0;
   for (int ordinal = 0; ordinal < 32; ++ordinal) {
     injected = false;
     fail_after = ordinal;
     bool caught = false;
     try {
-      rapid::ParallelForPatent(group, 0, 4097, [](std::size_t i) {
+      ParallelForPatent(pool, 0, 4097, [](std::size_t i) {
         if (i % 64 == 0)
           std::this_thread::yield();
       });
@@ -48,7 +47,7 @@ int main() {
     }
     hits += injected;
     std::array<std::atomic<unsigned>, 257> visits{};
-    rapid::ParallelForPatent(group, 0, visits.size(),
+    ParallelForPatent(pool, 0, visits.size(),
                              [&](std::size_t i) { visits[i].fetch_add(1); });
     for (auto &v : visits)
       if (v != 1)

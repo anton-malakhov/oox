@@ -35,8 +35,8 @@ struct IndexRange {
   bool IsDivisible() const noexcept { return end - begin > 1; }
 };
 
-// This is an owner-only range buffer, NOT a concurrent work queue. The Eigen
-// adapter serializes access to a group's buffer with its registry mutex.
+// This is an owner-only range buffer, not a concurrent work queue. The range
+// policy transfers work by copying a range into an ordinary Eigen task.
 template <typename Range, std::size_t Capacity = 8> class RangePool {
   static_assert(Capacity > 1);
   static_assert(std::is_nothrow_copy_constructible_v<Range>);

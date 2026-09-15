@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-#include "rapid_start.h"
+#include "nonblocking_thread_pool.h"
+#include <algorithm>
+#include <exception>
 #include "tbb_partitioning.h"
 
-namespace oox::detail::eigen_pool::rapid {
+namespace oox::detail::eigen_pool {
 namespace patent_detail {
 
 struct Metrics {
@@ -18,17 +20,15 @@ struct Metrics {
 class Region {
 public:
   explicit Region(ThreadPool &pool, Metrics *metrics)
-      : pool(pool), worker_waiter(pool.CurrentThreadId() < pool.NumThreads()),
-        metrics(metrics) {}
+      : pool(pool), metrics(metrics) {}
   void AddTask() noexcept { remaining.fetch_add(1, std::memory_order_relaxed); }
   void TaskComplete() noexcept {
     // Copy notification state before publishing completion. The caller may
     // destroy the region as soon as it observes complete=true.
     ThreadPool *saved_pool = &pool;
-    const bool saved_worker = worker_waiter;
     if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       complete.store(true, std::memory_order_release);
-      saved_pool->NotifyTaskCompletion(saved_worker);
+      saved_pool->NotifyTaskCompletion();
     }
   }
   bool IsComplete() const noexcept {
@@ -49,7 +49,6 @@ public:
   }
 
   ThreadPool &pool;
-  const bool worker_waiter;
   Metrics *const metrics;
 
 private:
@@ -119,40 +118,37 @@ inline void Arm(Region &region, Signal &signal) {
   signal.pending.store(true, std::memory_order_release);
   auto probe =
       std::make_unique<Probe>(region, signal, std::this_thread::get_id());
-  region.pool.Schedule(probe.get());
-  probe.release();
+  region.pool.Schedule(probe.release());
 }
 
 template <bool Feedback, bool Interruptible, typename F>
-void Process(Region &, RapidDomainState &, F &, DomainId, LoopRange, unsigned,
-             unsigned) noexcept;
+void Process(Region &, F &, LoopRange, size_t, unsigned) noexcept;
 
 template <bool Feedback, bool Interruptible, typename F>
 class Work final : public Task {
 public:
-  Work(Region &region, RapidDomainState &state, F &function, DomainId domain,
-       LoopRange range, unsigned depth, unsigned initial_depth) noexcept
-      : region_(region), state_(state), function_(function), domain_(domain),
-        range_(range), depth_(depth), initial_depth_(initial_depth) {
+  Work(Region &region, F &function, LoopRange range, size_t budget,
+       unsigned initial_depth) noexcept
+      : region_(region), function_(function), range_(range), budget_(budget),
+        initial_depth_(initial_depth) {
     region_.AddTask();
     if (region_.metrics)
       region_.metrics->range_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   ~Work() override { region_.TaskComplete(); }
   void operator()() final {
-    Process<Feedback, Interruptible>(region_, state_, function_, domain_,
-                                     range_, depth_, initial_depth_);
+    Process<Feedback, Interruptible>(region_, function_, range_, budget_,
+                                     initial_depth_);
     delete this;
   }
   void Discard() noexcept final { delete this; }
 
 private:
   Region &region_;
-  RapidDomainState &state_;
   F &function_;
-  DomainId domain_;
   LoopRange range_;
-  unsigned depth_, initial_depth_;
+  size_t budget_;
+  unsigned initial_depth_;
 };
 
 struct OwnerSignal {
@@ -166,13 +162,27 @@ struct OwnerSignal {
 // The range pool belongs exclusively to this running invocation. A stolen
 // probe requests work; only this owner removes and publishes its FIFO range.
 template <bool Feedback, bool Interruptible, typename F>
-void Process(Region &region, RapidDomainState &state, F &function,
-             DomainId domain, LoopRange range, unsigned base_depth,
+void Process(Region &region, F &function, LoopRange range, size_t budget,
              unsigned initial_depth) noexcept {
-  ScopedMailboxDomainContext nested_context({&state, domain});
   OwnerSignal signal;
   size_t chunks = 0;
   try {
+    // Initial subdivision is a tree of ordinary Eigen tasks. The budget is
+    // split with the range, so this creates at most P initial owners.
+    while (budget > 1 && range.IsDivisible() && !region.IsCancelled()) {
+      const size_t left_budget = budget / 2;
+      const size_t size = range.end - range.begin;
+      const size_t middle = range.begin + (size / budget) * left_budget +
+                            std::min(left_budget, size % budget);
+      auto child = std::make_unique<Work<Feedback, Interruptible, F>>(
+          region, function, LoopRange{middle, range.end, range.grain},
+          budget - left_budget, initial_depth);
+      range.end = middle;
+      budget = left_budget;
+      region.pool.Schedule(child.release());
+    }
+    if (region.metrics)
+      region.metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
     partitioning::RangePool<LoopRange> ranges(range);
     unsigned limit = initial_depth;
     if constexpr (Feedback) {
@@ -213,10 +223,8 @@ void Process(Region &region, RapidDomainState &state, F &function,
               ++limit;
             if (ranges.Size() > 1) {
               auto child = std::make_unique<Work<Feedback, Interruptible, F>>(
-                  region, state, function, domain, ranges.Front(),
-                  base_depth + ranges.FrontDepth(), initial_depth);
-              region.pool.Schedule(child.get());
-              child.release();
+                  region, function, ranges.Front(), 1, initial_depth);
+              region.pool.Schedule(child.release());
               ranges.PopFront();
               if (region.metrics)
                 region.metrics->donated_ranges.fetch_add(
@@ -237,28 +245,19 @@ void Process(Region &region, RapidDomainState &state, F &function,
 
 } // namespace patent_detail
 
-// Initial sharing is proportional to the effective worker domain. Each owner
-// then applies private splitting, stolen-signal feedback, FIFO donation, and
-// LIFO local processing from WO2013021223A1 / US9262230B2.
-// U=1 and V=2^initial_depth describe the initial private split density.
-// Early checkpoints stop a divisible remainder when a stolen probe requests
-// work.
+// Worker-count-based initial subdivision, private range buffering,
+// stolen-signal feedback, FIFO donation, and LIFO local processing from
+// WO2013021223A1 / US9262230B2. U=1 and V=2^initial_depth.
+// Only ordinary Eigen task submission, cancellation, and waiting are used.
 template <bool Feedback = true, bool Interruptible = true, typename F>
-void ParallelForPatent(RapidStartGroup group, size_t begin, size_t end,
+void ParallelForPatent(ThreadPool &pool, size_t begin, size_t end,
                        F &&function, size_t grain = 1,
                        unsigned initial_depth = 3,
                        patent_detail::Metrics *metrics = nullptr) {
-  if (group.IsEmpty() || begin >= end)
+  if (begin >= end || pool.IsCancelled())
     return;
-  group.Validate();
-  ThreadPool &pool = group.state->Pool();
-  RegionContext *parent = CompatibleParentContext(pool, *group.state);
-  DomainId domain = current_mailbox_context.state == group.state
-                        ? current_mailbox_context.domain
-                    : parent ? parent->domain
-                             : group.domain;
   grain = std::max<size_t>(grain, 1);
-  if (domain.Size() == 1 || end - begin <= grain) {
+  if (pool.NumThreads() == 1 || end - begin <= grain) {
     if (metrics) {
       metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
       metrics->private_chunks.fetch_add(1, std::memory_order_relaxed);
@@ -269,36 +268,17 @@ void ParallelForPatent(RapidStartGroup group, size_t begin, size_t end,
   }
   initial_depth =
       std::min(initial_depth, partitioning::AutoPartition::max_depth);
-  group.domain = domain;
-  const size_t size = end - begin;
-  const size_t slots = std::min(domain.Size(), (size - 1) / grain + 1);
-  using Function = std::remove_reference_t<F>;
-  Function &callable = function;
+  const size_t budget =
+      std::min(pool.NumThreads(), (end - begin - 1) / grain + 1);
   patent_detail::Region region(pool, metrics);
-  try {
-    ParallelForRanges(
-        group, 0, slots,
-        [&](size_t first, size_t last) {
-          for (size_t slot = first; slot < last; ++slot) {
-            const size_t low =
-                begin + slot * (size / slots) + std::min(slot, size % slots);
-            const size_t high = begin + (slot + 1) * (size / slots) +
-                                std::min(slot + 1, size % slots);
-            RegionContext *active = pool.CurrentRegionContext();
-            const DomainId owner_domain = active ? active->domain : domain;
-            if (metrics)
-              metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
-            patent_detail::Process<Feedback, Interruptible>(
-                region, *group.state, callable, owner_domain,
-                {low, high, grain}, 0, initial_depth);
-          }
-        },
-        true);
-  } catch (...) {
-    region.Fail(std::current_exception());
-  }
+  patent_detail::Process<Feedback, Interruptible>(
+      region, function, {begin, end, grain}, budget, initial_depth);
   region.TaskComplete();
-  pool.HelpUntil(region);
+  // Wait may return early on pool cancellation. Published tasks still own
+  // references to the callback and region, so retain both until all tasks
+  // have either completed or been discarded by the pool.
+  while (!region.IsComplete())
+    pool.Wait([&] { return region.IsComplete(); });
   region.Rethrow();
 }
-} // namespace oox::detail::eigen_pool::rapid
+} // namespace oox::detail::eigen_pool

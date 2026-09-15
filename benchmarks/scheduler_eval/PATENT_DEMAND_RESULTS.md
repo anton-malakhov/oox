@@ -1,6 +1,10 @@
-# Patent demand range results
+# Historical Rapid + patent range results
 
-The implementation is described in [PATENT.md](../../oox/eigen/PATENT.md).
+> Historical results from the Rapid-based launcher in commit 51b92c1.
+> See [PATENT_ONLY_RESULTS.md](PATENT_ONLY_RESULTS.md) for the ordinary-Eigen port.
+> The measurements below must not be attributed to the current implementation.
+
+The historical implementation is described in [PATENT.md](../../oox/eigen/PATENT.md).
 
 This comparison uses the same pool instance for every policy within each worker-count run. Five policies were interleaved by case for seven repetitions. The original workload code and inputs were shared; only the range provider changed.
 

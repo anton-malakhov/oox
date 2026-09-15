@@ -1,6 +1,10 @@
-# Patent-based work-demand range policy
+# Historical Rapid + patent range experiment
 
-The Eigen backend now provides `rapid::ParallelForPatent` in
+> This describes commit 51b92c1 and the superseded hybrid experiment.
+> For the current implementation, see [PATENT_ONLY.md](PATENT_ONLY.md).
+> These measurements are not evidence for the patent-only implementation.
+
+The experiment provided `rapid::ParallelForPatent` in
 `oox/eigen/patent_parallel_for.h`. It is built on the existing Rapid worker
 domain and activation machinery. Ordinary OOX task scheduling and dependency
 handling are unchanged.

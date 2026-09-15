@@ -82,4 +82,4 @@ greater than 128, matching the vendored aligned allocator's supported range.
 
 ## Patent work-demand ranges
 
-The optional range operation and existing benchmark modes are described in [PATENT.md](PATENT.md).
+The patent-only range operation and existing benchmark modes are described in [PATENT_ONLY.md](PATENT_ONLY.md).

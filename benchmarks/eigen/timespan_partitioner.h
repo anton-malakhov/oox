@@ -7,6 +7,9 @@
 #include "modes.h"
 #include "num_threads.h"
 #include "oox/eigen/stack_depth.h"
+#if EIGEN_MODE == EIGEN_PATENT_DEMAND
+#include "oox/eigen/patent_parallel_for.h"
+#endif
 #include "thread_index.h"
 #include "util.h"
 
@@ -333,7 +336,12 @@ void ParallelFor(size_t from, size_t to, F&& func, size_t grainsize) {
 template <typename Func>
 void ParallelFor(size_t from, size_t to, Func&& func, size_t grainsize = 1) {
   grainsize = std::max(grainsize, size_t{1});
+#if EIGEN_MODE == EIGEN_PATENT_DEMAND
+  return oox::detail::eigen_pool::ParallelForPatent(
+      EigenPool(), from, to, std::forward<Func>(func), grainsize);
+#else
   return ParallelFor<EIGEN_MODE>(from, to, std::forward<Func>(func), grainsize);
+#endif
 }
 
 } // namespace EigenPartitioner

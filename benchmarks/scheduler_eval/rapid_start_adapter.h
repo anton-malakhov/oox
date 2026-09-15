@@ -6,9 +6,6 @@
 #include "benchmarks/eigen/thread_index.h"
 #include "benchmarks/eigen/util.h"
 #include "oox/eigen/rapid_start.h"
-#if EIGEN_MODE == EIGEN_PATENT_DEMAND
-#include "oox/eigen/patent_parallel_for.h"
-#endif
 
 #include <cstddef>
 #include <stdexcept>
@@ -81,8 +78,6 @@ public:
     rapid::ParallelForResident(group_, from, to, std::forward<F>(func));
 #elif EIGEN_MODE == EIGEN_RAPID
     rapid::ParallelFor(group_, from, to, std::forward<F>(func));
-#elif EIGEN_MODE == EIGEN_PATENT_DEMAND
-    rapid::ParallelForPatent(group_, from, to, std::forward<F>(func), grain);
 #elif EIGEN_MODE == EIGEN_RAPID_MAILBOX
     rapid::ParallelForMailbox(group_, from, to, std::forward<F>(func), grain);
 #elif EIGEN_MODE == EIGEN_RAPID_LAZY_STEALING ||                               \
