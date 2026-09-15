@@ -8,13 +8,27 @@
 #include <utility>
 #include <type_traits>
 #include <limits>
+#include <memory>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <new>
 #include <string>
 #ifndef OOX_EXCEPTIONS_ENABLED
 #define OOX_EXCEPTIONS_ENABLED 0
+#endif
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#define OOX_COMPILER_EXCEPTIONS_AVAILABLE 1
+#else
+#define OOX_COMPILER_EXCEPTIONS_AVAILABLE 0
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define OOX_COLD_ATTRIBUTE [[gnu::cold]]
+#else
+#define OOX_COLD_ATTRIBUTE
 #endif
 
 #if HAVE_TWIST
@@ -65,6 +79,12 @@ struct cancelled_by_exception final : std::exception {
 struct cancelled_by_user final : std::exception {
     [[nodiscard]] const char* what() const noexcept override {
         return "oox::cancelled_by_user";
+    }
+};
+
+struct empty_forwarded_var final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "oox task returned an empty var that cannot be materialized";
     }
 };
 #endif
@@ -126,6 +146,93 @@ inline void preemption_point() {}
 
 } // namespace sync
 
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+struct injected_task_spawn_failure {};
+inline sync::atomic<unsigned>* task_spawn_failures_remaining = nullptr;
+inline sync::atomic<bool>* shared_var_waiter_subscribed_flag = nullptr;
+
+inline void inject_task_spawn_failures(sync::atomic<unsigned>& remaining, unsigned count) {
+    task_spawn_failures_remaining = &remaining;
+    remaining.store(count, std::memory_order_release);
+}
+
+inline void observe_shared_var_waiter_subscription(sync::atomic<bool>& subscribed) {
+    shared_var_waiter_subscribed_flag = &subscribed;
+    subscribed.store(false, std::memory_order_release);
+}
+
+inline void clear_task_spawn_failure_injection() {
+    task_spawn_failures_remaining = nullptr;
+    shared_var_waiter_subscribed_flag = nullptr;
+}
+
+inline void maybe_inject_task_spawn_failure() {
+    if (task_spawn_failures_remaining) {
+        unsigned remaining = task_spawn_failures_remaining->load(std::memory_order_acquire);
+        while (remaining != 0) {
+            if (task_spawn_failures_remaining->compare_exchange_weak(
+                    remaining, remaining - 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                throw injected_task_spawn_failure{};
+            }
+        }
+    }
+}
+#endif
+
+#if HAVE_TWIST && OOX_TWIST_TEST
+// The Twist backend launches detached worker threads. A value becomes ready
+// just before its worker exits, so a test scenario can otherwise return while
+// that worker is still completing its epilogue. Track test workers explicitly
+// and let the harness drain them before the simulator validates thread leaks.
+struct twist_task_tracker {
+    sync::mutex mutex;
+    std::vector<sync::thread> workers;
+
+    void track(sync::thread worker) {
+        std::lock_guard<sync::mutex> lock(mutex);
+        workers.push_back(std::move(worker));
+    }
+
+    void drain() {
+        while (true) {
+            std::vector<sync::thread> batch;
+            {
+                std::lock_guard<sync::mutex> lock(mutex);
+                if (workers.empty()) {
+                    return;
+                }
+                batch.swap(workers);
+            }
+            for (auto& worker : batch) {
+                worker.join();
+            }
+        }
+    }
+};
+
+inline twist_task_tracker* active_twist_task_tracker = nullptr;
+
+class twist_task_tracking_scope {
+    twist_task_tracker tracker_;
+
+public:
+    twist_task_tracking_scope() {
+        __OOX_ASSERT(active_twist_task_tracker == nullptr,
+                     "nested Twist task tracking scopes are not supported");
+        active_twist_task_tracker = &tracker_;
+    }
+
+    ~twist_task_tracking_scope() {
+        active_twist_task_tracker = nullptr;
+    }
+
+    void drain() {
+        tracker_.drain();
+    }
+};
+#endif
+
 #if OOX_EXCEPTIONS_ENABLED
 struct exception_control_struct {
     sync::atomic<std::uint32_t> ref_count{1};
@@ -185,8 +292,14 @@ struct task_life {
     }
 };
 
+inline constexpr std::size_t var_storage_pointer_alignment = 4;
+
+// var_storage keeps two flags in result-state pointer bits. Make that alignment
+// part of the storage contract instead of relying on surrounding task layout.
 template <typename T, bool CanThrow = false>
-struct result_state {
+struct alignas(alignof(T) < var_storage_pointer_alignment
+                   ? var_storage_pointer_alignment
+                   : alignof(T)) result_state {
     using value_type = T;
     static constexpr unsigned char state_unset = 0;
     static constexpr unsigned char state_set = 1;
@@ -228,7 +341,7 @@ struct result_state {
     template <typename... Args>
     void construct_value(Args&&... args) {
         if constexpr (sizeof...(Args) == 0) {
-            ::new (static_cast<void*>(storage.data)) T;
+            ::new (static_cast<void*>(storage.data)) T{};
         } else {
             ::new (static_cast<void*>(storage.data)) T(std::forward<Args>(args)...);
         }
@@ -236,7 +349,7 @@ struct result_state {
 };
 
 template <bool CanThrow>
-struct result_state<void, CanThrow> {};
+struct alignas(var_storage_pointer_alignment) result_state<void, CanThrow> {};
 
 } // namespace internal
 } // namespace oox
@@ -263,8 +376,6 @@ namespace details {
 
 inline constexpr std::uintptr_t k_next_writer_ready_tag = 0x1;
 inline constexpr std::uintptr_t k_next_writer_no_owner_tag = 0x3;
-inline constexpr std::uintptr_t k_forwarded_storage_ptr_tag = 0x1;
-
 inline task_node* next_writer_ready_marker() {
     return reinterpret_cast<task_node*>(k_next_writer_ready_tag);
 }
@@ -292,19 +403,6 @@ inline task_node* encode_next_writer_owner(task_node* owner) {
 
 inline task_node* decode_next_writer_owner(task_node* owner) {
     return reinterpret_cast<task_node*>(uintptr_t(owner)&~k_next_writer_ready_tag);
-}
-
-inline uintptr_t encode_forwarded_storage_ptr(void* ptr) {
-    __OOX_ASSERT((uintptr_t(ptr)&k_forwarded_storage_ptr_tag) == 0, "forwarded storage pointer is not aligned");
-    return uintptr_t(ptr)|k_forwarded_storage_ptr_tag;
-}
-
-inline bool is_forwarded_storage_ptr(uintptr_t ptr) {
-    return ptr&k_forwarded_storage_ptr_tag;
-}
-
-inline void** decode_forwarded_storage_ptr(uintptr_t ptr) {
-    return reinterpret_cast<void**>(ptr&~k_forwarded_storage_ptr_tag);
 }
 
 } // namespace details
@@ -505,6 +603,11 @@ struct task_node : public task, arc_list {
     int  forward_successors( int output_slots, int *counters, oox_var_base& );
     // Account for completion of n prerequisites
     void remove_prerequisite( int n=1 );
+    // A backend rejected this ready task before accepting ownership. Execute
+    // it synchronously so its visible graph node still reaches completion.
+    OOX_COLD_ATTRIBUTE virtual void execute_inline_after_spawn_failure() {
+        __OOX_ASSERT(false, "task cannot be submitted or executed inline");
+    }
     // Process next writer notification
     int  notify_next_writer( task_node* d );
     // Account for removal of a back_arc
@@ -792,7 +895,17 @@ void task_node::do_notify_arcs( arc* r, int *count ) {
                 n->publish_failure_from(this, arc_port);
             }
 #endif
+#if OOX_COMPILER_EXCEPTIONS_AVAILABLE && !defined(OOX_USING_SERIAL)
+            try {
+                n->remove_prerequisite();
+            } catch (...) {
+                // An attached successor has no publication caller to recover
+                // it. Complete it inline and continue the detached arc list.
+                n->execute_inline_after_spawn_failure();
+            }
+#else
             n->remove_prerequisite();
+#endif
         }
         if (delete_arc) {
             delete j;
@@ -1105,6 +1218,81 @@ tbb::task* task_node::forward_successors( oox_var_base& m ) {
 
 template< typename T, bool CanThrow > struct gen_oox;
 
+template <typename T>
+concept copy_value_assignable = std::is_copy_constructible_v<T> && std::is_copy_assignable_v<T>;
+
+template <typename T>
+concept move_value_assignable = std::is_move_constructible_v<T> && std::is_move_assignable_v<T>;
+
+template <typename T, bool CanThrow>
+concept policy_copy_value_assignable = copy_value_assignable<T>
+    && (CanThrow || std::is_nothrow_copy_assignable_v<T>);
+
+template <typename T, bool CanThrow>
+concept policy_move_value_assignable = move_value_assignable<T>
+    && (CanThrow || std::is_nothrow_move_assignable_v<T>);
+
+template <typename T>
+concept value_materializable = std::is_default_constructible_v<T>
+    && (std::is_move_constructible_v<T> || std::is_copy_constructible_v<T>);
+
+template <typename T, bool CanThrow>
+concept policy_value_materializable = value_materializable<T>
+    && (CanThrow || (std::is_nothrow_default_constructible_v<T>
+        && (std::is_nothrow_move_constructible_v<T>
+            || std::is_nothrow_copy_constructible_v<T>)));
+
+template <bool CanThrow, typename T>
+decltype(auto) materialized_value_source(T& value) noexcept {
+    if constexpr (std::is_nothrow_move_constructible_v<T>) {
+        return std::move(value);
+    } else if constexpr (std::is_nothrow_copy_constructible_v<T>) {
+        return std::as_const(value);
+    } else if constexpr (CanThrow && std::is_move_constructible_v<T>) {
+        return std::move(value);
+    } else {
+        static_assert(CanThrow && std::is_copy_constructible_v<T>);
+        return std::as_const(value);
+    }
+}
+
+struct var_storage {
+    static constexpr std::uintptr_t forwarded_tag = 0x1;
+    static constexpr std::uintptr_t initialize_if_empty_tag = 0x2;
+    static constexpr std::uintptr_t tag_mask = forwarded_tag | initialize_if_empty_tag;
+
+    std::uintptr_t tagged_ptr = 0;
+
+    var_storage() = default;
+    var_storage(void* ptr, bool forwarded, bool initialize_if_empty = false) noexcept
+        : tagged_ptr(reinterpret_cast<std::uintptr_t>(ptr)
+              | (forwarded ? forwarded_tag : 0)
+              | (initialize_if_empty ? initialize_if_empty_tag : 0)) {
+        __OOX_ASSERT_EX((reinterpret_cast<std::uintptr_t>(ptr) & tag_mask) == 0,
+                        "var storage pointer does not have two free low bits");
+    }
+
+    [[nodiscard]] bool has_tags() const noexcept { return (tagged_ptr & tag_mask) != 0; }
+    [[nodiscard]] bool forwarded() const noexcept { return (tagged_ptr & forwarded_tag) != 0; }
+    [[nodiscard]] bool initialize_if_empty() const noexcept {
+        return (tagged_ptr & initialize_if_empty_tag) != 0;
+    }
+    [[nodiscard]] void* ptr() const noexcept {
+        return reinterpret_cast<void*>(tagged_ptr & ~tag_mask);
+    }
+    void set_initialize_if_empty(bool value) noexcept {
+        if (value) {
+            tagged_ptr |= initialize_if_empty_tag;
+        } else {
+            tagged_ptr &= ~initialize_if_empty_tag;
+        }
+    }
+};
+static_assert(sizeof(var_storage) == sizeof(void*),
+              "oox argument storage descriptor must remain pointer-sized");
+static_assert(var_storage::tag_mask < var_storage_pointer_alignment,
+              "result-state alignment must leave room for all pointer tags");
+
 } // namespace internal
 
 
@@ -1116,17 +1304,17 @@ class var : public internal::oox_var_base {
                   "for const types use shared_ptr<T>.");
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::var<T, true> requires OOX_EXCEPTIONS_ENABLED=1");
 
-    void* allocate_new() noexcept {
-        auto *v = internal::task::allocate<internal::storage_task<1, T>>();
+    template <typename U>
+    void allocate_new(U&& value) {
+        auto *v = internal::task::allocate<internal::storage_task<1, T>>(std::forward<U>(value));
         __OOX_TRACE("%p oox::var",v);
         v->out(0).next_writer.store(internal::details::next_writer_ready_marker(), std::memory_order_release);
         v->head.store(internal::details::task_done_marker(), std::memory_order_release);
         // nobody wait on this task
         this->bind_to( v, static_cast<internal::result_state<T, false>*>(v), 2 );
-        return storage_ptr;
     }
 
-    void* allocate_deferred() noexcept {
+    void* allocate_deferred() {
         auto *v = internal::task::allocate<internal::storage_task<1, T>>();
         __OOX_TRACE("%p oox::var(deferred)", v);
         // Make writers behave like for a normal initial value (next_writer ready),
@@ -1142,15 +1330,15 @@ public:
     var(deferred_t) {
         allocate_deferred(); // storage exists, but value is not ready
     }
-    var(const T& t) noexcept {
-        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(t); // TODO: add exception-safe
-    }
-    var(T&& t)      noexcept {
-        auto* state = static_cast<internal::result_state<T, false>*>(allocate_new());
-        state->emplace(std::move(t));
-    }
+    var(const T& t) requires std::is_copy_constructible_v<T> { allocate_new(t); }
+    var(const T&) requires (!std::is_copy_constructible_v<T>) = delete;
+    var(T&& t) requires std::is_move_constructible_v<T> { allocate_new(std::move(t)); }
+    var(T&&) requires (!std::is_move_constructible_v<T>) = delete;
     var(var<T, CanThrow>&& t) : internal::oox_var_base(std::move(t)) { t.current_task = nullptr; }
+    var& operator=(const T& t) requires internal::policy_copy_value_assignable<T, CanThrow>;
+    var& operator=(const T&) requires (!internal::policy_copy_value_assignable<T, CanThrow>) = delete;
+    var& operator=(T&& t) requires internal::policy_move_value_assignable<T, CanThrow>;
+    var& operator=(T&&) requires (!internal::policy_move_value_assignable<T, CanThrow>) = delete;
     var& operator=(var<T, CanThrow>&& t) {
         release();
         new(this) internal::oox_var_base(std::move(t));
@@ -1203,6 +1391,18 @@ public:
 using node = var<void>;
 
 namespace internal {
+
+template <typename T, bool VarCanThrow, bool ActiveCanThrow>
+var<T, VarCanThrow> make_materialized_var() {
+    static_assert(policy_value_materializable<T, ActiveCanThrow>,
+                  "materializing an empty var violates the active task's exception policy");
+    T value{};
+    return var<T, VarCanThrow>(materialized_value_source<ActiveCanThrow>(value));
+}
+
+template <typename T, bool CanThrow>
+var<T, CanThrow> make_default_var_task();
+
 template< typename T >
 std::string get_type(const char *m = "T") {
     std::string s;
@@ -1217,12 +1417,37 @@ std::string get_type(const char *m = "T") {
 
 template< typename... Args > struct types {};
 
+template <typename T, typename Types>
+struct prepend_type;
+
+template <typename T, typename... Types>
+struct prepend_type<T, types<Types...>> {
+    using type = types<T, Types...>;
+};
+
+template <typename Param, typename Actual>
+inline constexpr bool matching_value_conversion_is_nothrow =
+    std::is_nothrow_constructible_v<Param, Actual>;
+
+template <typename Params, typename Actuals>
+struct argument_conversions_are_nothrow : std::false_type {};
+
+template <typename... Params>
+struct argument_conversions_are_nothrow<types<Params...>, types<>> : std::true_type {};
+
+template <typename Param, typename... Params, typename Actual, typename... Actuals>
+struct argument_conversions_are_nothrow<types<Param, Params...>, types<Actual, Actuals...>>
+    : std::bool_constant<matching_value_conversion_is_nothrow<Param, Actual>
+        && argument_conversions_are_nothrow<types<Params...>, types<Actuals...>>::value> {};
+
 // Types is types<list> of user functor argument types
 // Args is variadic list of run argument types
 template< typename Types, bool SelfCanThrow, typename... Args > struct base_args;
 // User functor might have default arguments which are not specified thus ignoring them
 template< typename IgnoredTypes, bool SelfCanThrow > struct base_args<IgnoredTypes, SelfCanThrow> {
     static constexpr int write_nodes_count = 1; // for resulting node
+    static constexpr bool consume_is_nothrow = true;
+    using consumed_args_type = types<>;
     int setup(int, internal::task_node *) { return 0 /* resulting node is ready initially*/; }
 };
 
@@ -1236,11 +1461,38 @@ struct base_args<types<T, Types...>, SelfCanThrow, A, Args...>
     base_args( A&& a, Args&&... args ) : base_type( std::forward<Args>(args)... ), my_value(std::forward<A>(a)) {}
     std::decay_t<A>&& consume() { return std::move(my_value); }
     static constexpr int write_nodes_count = base_type::write_nodes_count;
+    static constexpr bool consume_is_nothrow = base_type::consume_is_nothrow;
+    using consumed_args_type = typename prepend_type<
+        std::decay_t<A>&&, typename base_type::consumed_args_type>::type;
     int setup( int port, internal::task_node *self, A&& a, Args&&... args ) {
         //__OOX_ASSERT(my_value == a, "");
         return base_type::setup( port, self, std::forward<Args>(args)...);
     }
 };
+
+template <typename T, bool VarCanThrow, bool ActiveCanThrow>
+void* resolve_var_storage(var_storage storage) {
+    if (!storage.has_tags()) {
+        return reinterpret_cast<void*>(storage.tagged_ptr);
+    }
+
+    void* ptr = storage.ptr();
+    if (!storage.forwarded()) {
+        return ptr;
+    }
+
+    oox_var_base* base = static_cast<oox_var_base*>(ptr);
+    while (base->current_port_and_flags.is_forwarded) {
+        __OOX_ASSERT_EX(base->storage_ptr, "forwarded var has null storage pointer");
+        base = static_cast<oox_var_base*>(base->storage_ptr);
+    }
+    if (!base->current_task && storage.initialize_if_empty()) {
+        auto& empty = *static_cast<var<T, VarCanThrow>*>(base);
+        empty = make_materialized_var<T, VarCanThrow, ActiveCanThrow>();
+    }
+    __OOX_ASSERT_EX(base->current_task, "forwarded var resolved to an empty var without a recovery writer");
+    return base->storage_ptr;
+}
 
 template< typename Types, bool SelfCanThrow, typename C, bool VarCanThrow, typename... Args > struct oox_var_args;
 template< typename T, typename... Types, typename C, bool VarCanThrow, typename... Args, bool SelfCanThrow >
@@ -1250,18 +1502,24 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
     using ooxed_type = std::decay_t<C>;
     using var_type = var<ooxed_type, VarCanThrow>;
 
-    uintptr_t my_ptr;
+    var_storage my_storage;
     // TODO: copy-based optimizations
     oox_var_args( const var_type& cov, Args&&... args ) : base_type( std::forward<Args>(args)... ) {}
     static constexpr int is_writer = (std::is_rvalue_reference_v<C>
         || (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>))? 1 : 0;
     static constexpr int write_nodes_count = base_type::write_nodes_count + is_writer;
+    static constexpr bool consume_is_nothrow = base_type::consume_is_nothrow
+        && (!is_writer || policy_value_materializable<ooxed_type, SelfCanThrow>);
+    using consumed_args_type = typename prepend_type<
+        C&&, typename base_type::consumed_args_type>::type;
 
     int setup( int port, internal::task_node *self, const var_type& cov, Args&&... args ) {
         int count = is_writer;
         __OOX_TRACE("%p arg: %s=%p as %s: is_writer=%d", self, get_type<C>("oox::var<A>").c_str(), cov.current_task, get_type<T>("T").c_str(), count);
-        if( !cov.current_task )
-            new( &const_cast<var_type&>(cov) ) var_type(ooxed_type()); // allocate oox container with default value
+        if( !cov.current_task ) {
+            new (&const_cast<var_type&>(cov)) var_type(
+                make_default_var_task<ooxed_type, VarCanThrow>());
+        }
         if constexpr (is_writer) {
             static_assert(VarCanThrow || !SelfCanThrow, "throwing task cannot write to non-throwing var");
             auto &ov = const_cast<var_type&>(cov); // actual type is non-const due to is_writer
@@ -1270,26 +1528,18 @@ struct oox_var_args<types<T, Types...>, SelfCanThrow, C, VarCanThrow, Args...>
             static_assert(SelfCanThrow || !VarCanThrow, "non-throwing task cannot depend on throwing task");
             count = self->assign_prerequisite( cov.current_task, cov.current_port() );
         }
-        if( cov.current_port_and_flags.is_forwarded ) {
-            oox_var_base& next = *(oox_var_base*)cov.storage_ptr;
-            my_ptr = details::encode_forwarded_storage_ptr(&next.storage_ptr);
-        } else
-            my_ptr = (uintptr_t)cov.storage_ptr;
+        const bool forwarded = cov.current_port_and_flags.is_forwarded != 0;
+        my_storage = {cov.storage_ptr, forwarded, forwarded && is_writer != 0};
         //TODO: broken? if( !std::is_lvalue_reference_v<C> ) // consume oox::var
         //    ov.~var(); // TODO: no need in sync for not yet published task
         return count + base_type::setup( port+is_writer, self, std::forward<Args>(args)...);
     }
     C&& consume() {
-        void* state_ptr = nullptr;
-        if( details::is_forwarded_storage_ptr(my_ptr) ) {
-            state_ptr = *details::decode_forwarded_storage_ptr(my_ptr);
-        } else {
-            state_ptr = reinterpret_cast<void*>(my_ptr);
-        }
+        void* state_ptr = resolve_var_storage<ooxed_type, VarCanThrow, SelfCanThrow>(my_storage);
         __OOX_ASSERT_EX(state_ptr, "null result_state storage");
 
         auto* state = static_cast<internal::result_state<ooxed_type, VarCanThrow>*>(state_ptr);
-        if constexpr (std::is_lvalue_reference_v<T> && !std::is_const_v<std::remove_reference_t<T>>) {
+        if constexpr (is_writer) {
             if(!state->has_value()) {
                 state->emplace(); // requires default-constructible T
             }
@@ -1339,8 +1589,16 @@ template<int slots, typename F, typename R, bool CanThrow>
 struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, CanThrow> {
     using functor_base = storage_task<slots, F>;
     using result_base = result_state<R, CanThrow>;
+    static_assert(CanThrow || std::is_nothrow_move_constructible_v<R>
+                      || std::is_nothrow_copy_constructible_v<R>,
+                  "a non-throwing task must store its result through a nothrow move or copy");
     template<typename... Args>
     functional_task(Args&&... args) : storage_task<slots, F>(std::forward<Args>(args)...) {}
+
+    void invoke_and_store() {
+        R produced = this->functor_base::value()();
+        result_base::emplace(materialized_value_source<CanThrow>(produced));
+    }
 
     TASK_EXECUTE_METHOD {
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
@@ -1352,19 +1610,60 @@ struct alignas(64) functional_task : storage_task<slots, F>, result_state<R, Can
                 return nullptr;
             }
             try {
-                result_base::emplace(this->functor_base::value()());
-                task_node::notify_successors<slots, false>();
+                invoke_and_store();
             } catch(...) {
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
+                return nullptr;
             }
+            task_node::notify_successors<slots, false>();
         } else
 #endif
         {
-            result_base::emplace(this->functor_base::value()());
+            invoke_and_store();
             task_node::notify_successors<slots, false>();
         }
         return nullptr;
+    }
+
+    // Keep the fallback separate from execute(): ordinary run() task
+    // specializations must not acquire another call in their execution path.
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                invoke_and_store();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            task_node::notify_successors<slots, false>();
+        } else
+#endif
+        {
+            invoke_and_store();
+            task_node::notify_successors<slots, false>();
+        }
+    }
+
+    void publish_installed(int protect_count) {
+#if OOX_COMPILER_EXCEPTIONS_AVAILABLE && !defined(OOX_USING_SERIAL)
+        try {
+            this->remove_prerequisite(protect_count);
+        } catch (...) {
+            auto publication_failure = std::current_exception();
+            execute_inline_after_spawn_failure();
+            std::rethrow_exception(publication_failure);
+        }
+#else
+        this->remove_prerequisite(protect_count);
+#endif
     }
     ~functional_task() {
         result_base::reset();
@@ -1389,11 +1688,12 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
             }
             try {
                 this->functor_base::value()();
-                task_node::notify_successors<slots, false>();
             } catch(...) {
                 this->set_exception(std::current_exception());
                 task_node::notify_successors<slots, true>();
+                return nullptr;
             }
+            task_node::notify_successors<slots, false>();
         } else
 #endif
         {
@@ -1401,6 +1701,29 @@ struct functional_task<slots, F, void, CanThrow> : storage_task<slots, F>, resul
             task_node::notify_successors<slots, false>();
         }
         return nullptr;
+    }
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                this->functor_base::value()();
+            } catch(...) {
+                this->set_exception(std::current_exception());
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            task_node::notify_successors<slots, false>();
+        } else
+#endif
+        {
+            this->functor_base::value()();
+            task_node::notify_successors<slots, false>();
+        }
     }
     ~functional_task() override {}
 };
@@ -1423,9 +1746,23 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
     bool try_forward_result() {
         __OOX_TRACE("%p do_run: start forward",this);
         result_base::emplace(this->functor_base::value()());
+        auto& result = result_base::value();
+        if (!result.current_task) {
+            if constexpr (policy_value_materializable<VT, CanThrow>) {
+                result = make_materialized_var<VT, VarCanThrow, CanThrow>();
+            } else {
+#if OOX_EXCEPTIONS_ENABLED
+                if constexpr (CanThrow) {
+                    throw empty_forwarded_var{};
+                }
+#endif
+                __OOX_ASSERT_EX(false,
+                                "task returned an empty var that cannot be materialized");
+                std::terminate();
+            }
+        }
         this->start_count.store(1, std::memory_order_release);
         arc* j = new arc(this, 0, arc::flow_only); // TODO: embed into the task
-        auto& result = result_base::value();
         this->life_add_count(OOX_TASK_EXECUTE_LIFETIME_REF);
         if(result.current_task->add_arc(j)) {
             __OOX_TRACE("%p do_run: add_arc", this); // recycle_as_continuation was here
@@ -1440,6 +1777,7 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         OOX_TASK_EXECUTE_LIFETIME_GUARD;
 #if OOX_EXCEPTIONS_ENABLED
         if constexpr (CanThrow) {
+            bool forwarded_failure = false;
             if (this->has_start_failure()) [[unlikely]] {
                 task_node::notify_successors<slots, true>();
                 return nullptr;
@@ -1451,12 +1789,22 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
                     }
                     if (result_base::value().current_task->has_failure()) {
                         this->publish_failure_from(result_base::value().current_task, 0);
-                        task_node::notify_successors<slots, true>();
-                        return nullptr;
+                        forwarded_failure = true;
                     }
                 }
             } catch(...) {
-                this->set_exception(std::current_exception());
+                auto error = std::current_exception();
+                if (!result_base::has_value()) {
+                    // Establish the forwarded var object's lifetime even when
+                    // the producer threw before returning it. A recovery writer
+                    // materializes its value storage later in consume().
+                    result_base::emplace(var_type{});
+                }
+                this->set_exception(std::move(error));
+                task_node::notify_successors<slots, true>();
+                return nullptr;
+            }
+            if (forwarded_failure) {
                 task_node::notify_successors<slots, true>();
                 return nullptr;
             }
@@ -1470,6 +1818,49 @@ struct functional_task<slots, F, var<VT, VarCanThrow>, CanThrow> : storage_task<
         __OOX_TRACE("%p do_run: notify forward",this);
         task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
         return nullptr;
+    }
+
+    OOX_COLD_ATTRIBUTE void execute_inline_after_spawn_failure() override {
+        OOX_TASK_EXECUTE_LIFETIME_GUARD;
+#if OOX_EXCEPTIONS_ENABLED
+        if constexpr (CanThrow) {
+            bool forwarded_failure = false;
+            if (this->has_start_failure()) [[unlikely]] {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            try {
+                if ( !result_base::has_value() ) {
+                    if (this->try_forward_result()) {
+                        return;
+                    }
+                    if (result_base::value().current_task->has_failure()) {
+                        this->publish_failure_from(result_base::value().current_task, 0);
+                        forwarded_failure = true;
+                    }
+                }
+            } catch(...) {
+                auto error = std::current_exception();
+                if (!result_base::has_value()) {
+                    result_base::emplace(var_type{});
+                }
+                this->set_exception(std::move(error));
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+            if (forwarded_failure) {
+                task_node::notify_successors<slots, true>();
+                return;
+            }
+        } else
+#endif
+        {
+            if ( !result_base::has_value() && this->try_forward_result() ) {
+                return;
+            }
+        }
+        __OOX_TRACE("%p do_run: notify forward inline",this);
+        task_node::notify_successors<slots, !OOX_EXCEPTIONS_ENABLED>();
     }
 
     ~functional_task() {
@@ -1539,18 +1930,30 @@ inline constexpr bool functor_is_nothrow_invocable_v =
 
 } //namespace internal
 
+// CanThrow governs execution of a published task. Dependency setup happens
+// synchronously and is intentionally not exception-safe: if setup throws,
+// graph registrations and the unpublished task are not rolled back.
 template< bool CanThrow = default_exception_policy, typename F, typename... Args > // ->...decltype(f(internal::unoox(args)...))
 auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>, CanThrow>
 {
     static_assert(OOX_EXCEPTIONS_ENABLED || !CanThrow, "oox::run<true>(...) requires OOX_EXCEPTIONS_ENABLED=1");
     using r_type = internal::result_type_of<F>;
     using call_args_type = internal::args_list_of<F>;
-    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
-                      || internal::functor_is_nothrow_invocable_v<F, call_args_type>,
-        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
-        "the callable must satisfy std::is_nothrow_invocable for its argument types. "
-        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
     using args_type = internal::base_args<call_args_type, CanThrow, Args&&...>;
+    using consumed_args_type = typename args_type::consumed_args_type;
+    static_assert(CanThrow || args_type::consume_is_nothrow,
+        "oox::run with a non-throwing policy cannot perform potentially throwing "
+        "deferred or forwarded value materialization");
+    static_assert(CanThrow
+                      || internal::argument_conversions_are_nothrow<call_args_type,
+                                                                    consumed_args_type>::value,
+        "oox::run with a non-throwing policy cannot perform a potentially throwing "
+        "conversion from the value category returned by consume()");
+    static_assert(!OOX_EXCEPTIONS_ENABLED || CanThrow
+                      || internal::functor_is_nothrow_invocable_v<F, consumed_args_type>,
+        "oox::run with a non-throwing policy (CanThrow == false) requires a noexcept functor: "
+        "the callable must satisfy std::is_nothrow_invocable for the actual arguments returned by consume(). "
+        "Mark the functor noexcept, or use a throwing task policy (CanThrow == true).");
     using functor_type = internal::oox_bind<F, args_type>;
     using task_type = internal::functional_task<args_type::write_nodes_count, functor_type, r_type, CanThrow>;
 
@@ -1565,6 +1968,92 @@ auto run(F&& f, Args&&... args)->internal::var_type<internal::result_type_of<F>,
     auto r = internal::gen_oox<r_type, CanThrow>::bind_to( t );
     t->remove_prerequisite( protect_count ); // publish it
     return r;
+}
+
+namespace internal {
+
+template <typename T>
+struct default_var_factory {
+    T operator()() const noexcept(std::is_nothrow_default_constructible_v<T>) {
+        return T{};
+    }
+};
+
+template <typename T, bool CanThrow, typename Task>
+struct unpublished_default_var_task {
+    var<T, CanThrow> value;
+    Task* node;
+    int protect_count;
+
+    unpublished_default_var_task(var<T, CanThrow>&& v, Task* n, int count) noexcept
+        : value(std::move(v)), node(n), protect_count(count) {}
+    unpublished_default_var_task(const unpublished_default_var_task&) = delete;
+    unpublished_default_var_task& operator=(const unpublished_default_var_task&) = delete;
+    unpublished_default_var_task(unpublished_default_var_task&& other) noexcept
+        : value(std::move(other.value)),
+          node(std::exchange(other.node, nullptr)),
+          protect_count(other.protect_count) {}
+    ~unpublished_default_var_task() {
+        __OOX_ASSERT_EX(!node, "unpublished default materializer was not published");
+    }
+
+    void publish() {
+        Task* task = std::exchange(node, nullptr);
+        __OOX_ASSERT_EX(task, "default materializer was already published");
+        task->publish_installed(protect_count);
+    }
+};
+
+template <typename T, bool CanThrow>
+auto make_unpublished_default_var_task() {
+    static_assert(policy_value_materializable<T, CanThrow>);
+    using factory_type = default_var_factory<T>;
+    using args_type = base_args<types<>, CanThrow>;
+    using functor_type = oox_bind<factory_type, args_type>;
+    using task_type = functional_task<args_type::write_nodes_count, functor_type, T, CanThrow>;
+
+    auto* task = internal::task::allocate<task_type>(
+        functor_type(factory_type{}, args_type{}));
+    int protect_count = task_node::start_count_mask;
+    task->start_count.store(protect_count, std::memory_order_release);
+    protect_count -= static_cast<storage_task<args_type::write_nodes_count, functor_type>*>(task)
+                         ->value()
+                         .my_args.setup(1, task);
+    auto result = gen_oox<T, CanThrow>::bind_to(task);
+    return unpublished_default_var_task<T, CanThrow, task_type>(
+        std::move(result), task, protect_count);
+}
+
+template <typename T, bool CanThrow>
+var<T, CanThrow> make_default_var_task() {
+    return oox::run<CanThrow>(default_var_factory<T>{});
+}
+
+} // namespace internal
+
+template<typename T, bool CanThrow>
+var<T, CanThrow>& var<T, CanThrow>::operator=(const T& t)
+    requires internal::policy_copy_value_assignable<T, CanThrow> {
+    if (!current_task) {
+        return *this = var<T, CanThrow>(t);
+    }
+    auto value = std::make_shared<T>(t);
+    run<CanThrow>([value = std::move(value)](T& target) noexcept(std::is_nothrow_copy_assignable_v<T>) {
+        target = std::as_const(*value);
+    }, *this);
+    return *this;
+}
+
+template<typename T, bool CanThrow>
+var<T, CanThrow>& var<T, CanThrow>::operator=(T&& t)
+    requires internal::policy_move_value_assignable<T, CanThrow> {
+    if (!current_task) {
+        return *this = var<T, CanThrow>(std::move(t));
+    }
+    run<CanThrow>([value = std::move(t)](T& target) mutable noexcept(std::is_nothrow_move_assignable_v<T>) {
+        target = std::move(value);
+    }, *this);
+    return *this;
 }
 
 #if OOX_EXCEPTIONS_ENABLED
@@ -1663,6 +2152,8 @@ template<typename T, bool CanThrow>
 #undef TASK_EXECUTE_METHOD
 #undef OOX_TASK_EXECUTE_LIFETIME_REF
 #undef OOX_TASK_EXECUTE_LIFETIME_GUARD
+#undef OOX_COMPILER_EXCEPTIONS_AVAILABLE
+#undef OOX_COLD_ATTRIBUTE
 
 } // namespace oox
 #endif // __OOX_H__

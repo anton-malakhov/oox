@@ -82,7 +82,7 @@ void ForwardedConsumerRegistrationRace() {
 void ForwardingThroughDeferredInput() {
     oox::var<int> source(oox::deferred);
 
-    auto inner = [](oox::var<int> input) -> oox::var<int> {
+    auto inner = [](int input) -> oox::var<int> {
         return oox::run([](int value) {
             twist::assist::PreemptionPoint();
             return value + 1;
