@@ -42,6 +42,9 @@ void ParallelFor(std::size_t first, std::size_t last, F &&body,
     return scheduler_eval::detail::TaskRange(
         first, last, std::max(grain, std::size_t{1}), &body);
   });
+  // Nested calls rely on the pool's cooperative wait (workers execute queued
+  // work), not a passive OS wait. Re-run nested/saturated-pool tests whenever
+  // queue order, helping, or completion notification changes.
   static_cast<void>(oox::wait_and_get(done));
 }
 

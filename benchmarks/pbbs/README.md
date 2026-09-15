@@ -102,6 +102,12 @@ The original archive cache defaults to `results/pbbs-archives`; archives are
 hash-checked before copying into a build. Missing archives fail the upstream
 input recipe rather than initiating a code checkout or substituting data.
 
+On the supported POSIX hosts, benchmark commands have independent process
+groups. Timeouts and keyboard interruption terminate the group, including
+ordinary make/compiler/benchmark descendants, while retaining logs and the
+isolated build directory. Descendants that explicitly create their own sessions
+are outside this cleanup guarantee.
+
 This split is intentional: scheduler microbenchmarks and the flat-versus-nested
 BFS graph families are native CMake targets under `benchmarks/scheduler_eval`,
 while PBBS remains a pinned, attributed in-tree source snapshot so its algorithms,

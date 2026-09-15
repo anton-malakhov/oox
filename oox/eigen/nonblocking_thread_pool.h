@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -366,8 +367,10 @@ private:
     try {
       (*p)();
     } catch (...) {
-      // Pool tasks are fire-and-forget. Isolate an unhandled task exception so
-      // one callback cannot terminate the worker thread or the process.
+      // Exception-aware tasks must publish failure before returning. The pool
+      // cannot repair an arbitrary task's completion state after it unwinds;
+      // continuing here could leave its dependents waiting forever.
+      std::terminate();
     }
   }
 

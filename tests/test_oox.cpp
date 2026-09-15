@@ -23,6 +23,24 @@ bool g_oox_verbose = false;
 #include <atomic>
 #endif
 
+#if defined(OOX_USING_EIGEN) && !OOX_EXCEPTIONS_ENABLED
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
+TEST(OOXDeathTest, UnexpectedAllocationFailureFailsFast) {
+    EXPECT_EXIT({
+        std::set_terminate([] { std::_Exit(86); });
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::_Exit(0);
+        }).detach();
+        auto result = oox::run([]() -> int { throw std::bad_alloc{}; });
+        static_cast<void>(oox::wait_and_get(result));
+    }, testing::ExitedWithCode(86), "");
+}
+#endif
+
 
 /////////////////////////////////////// EXAMPLES ////////////////////////////////////////
 
@@ -235,6 +253,11 @@ TEST(OOX, ExceptionReturnRethrowsOriginal) {
         throw dummy_exception{};
     });
     EXPECT_THROW(oox::wait_and_get(a), dummy_exception);
+}
+
+TEST(OOX, AllocationFailureReachesWaiter) {
+    oox::var<int> a = oox::run([]() -> int { throw std::bad_alloc{}; });
+    EXPECT_THROW(oox::wait_and_get(a), std::bad_alloc);
 }
 
 TEST(OOX, ExceptionPropagatesThroughChainAndSkipsUserCode) {

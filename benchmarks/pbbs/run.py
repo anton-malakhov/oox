@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import snapshot
+import processes
 
 COMMIT = "396a299f03c58dbe9e7604daab38a65781227b75"
 DEFAULT_BENCHMARKS = [
@@ -137,6 +138,8 @@ template <typename L, typename R>
 inline void par_do(L&& left, R&& right, bool) {
   auto task = oox::run([&] { left(); return 0; });
   right();
+  // Nested worker waits require cooperative helping; retain nesting coverage
+  // when changing the pool or its queue/completion protocol.
   static_cast<void>(oox::wait_and_get(task));
 }
 inline void init_plugin_internal() { InitParallel(GetNumThreads()); }
@@ -481,7 +484,7 @@ def main():
                     print(f"Writing {output}", flush=True)
                     try:
                         with output.open("w") as stream:
-                            subprocess.run(
+                            processes.run(
                                 command, cwd=source, env=env, stdout=stream,
                                 stderr=subprocess.STDOUT, check=True,
                                 timeout=args.timeout)

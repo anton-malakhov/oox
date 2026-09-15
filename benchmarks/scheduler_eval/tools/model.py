@@ -75,6 +75,9 @@ def nonnegative_line_fit(xs, ys):
 def fit_launch(points):
     """Fit H(N)=a+b*(N/scale)^gamma by a bounded grid search."""
     points = sorted(points)
+    if not points or any(not math.isfinite(x) or x <= 0 or
+                         not math.isfinite(y) or y < 0 for x, y in points):
+        raise ValueError("launch fit requires positive finite task counts and nonnegative finite timings")
     scale = float(max(x for x, _ in points))
     best = None
     for step in range(20, 161):
@@ -99,6 +102,10 @@ def fit_launch(points):
 
 
 def launch_time(fit, tasks):
+    if not math.isfinite(fit["task_scale"]) or fit["task_scale"] <= 0:
+        raise ValueError("launch task_scale must be positive and finite")
+    if not math.isfinite(tasks) or tasks < 0:
+        raise ValueError("launch task count must be nonnegative and finite")
     return (fit["intercept_us"] + fit["scale_us"] *
             (max(1, tasks) / fit["task_scale"]) ** fit["exponent"])
 
@@ -110,7 +117,11 @@ def mean_absolute_percentage(observed, predicted):
 
 
 def through_origin(xs, ys):
+    if not xs or len(xs) != len(ys) or any(not math.isfinite(v) for v in (*xs, *ys)):
+        raise ValueError("origin fit requires paired nonempty finite samples")
     denominator = sum(x * x for x in xs)
+    if not math.isfinite(denominator) or denominator == 0:
+        raise ValueError("origin fit requires a finite nonzero predictor norm")
     return max(0.0, sum(x * y for x, y in zip(xs, ys)) / denominator)
 
 

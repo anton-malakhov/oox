@@ -101,7 +101,7 @@ def main():
         driver.select_backend(source, "oox")
         build = ["make", "-B", "-j", str(args.threads), program]
         with target.with_suffix(".build.log").open("w") as log:
-            subprocess.run(build, cwd=generator_dir, env=env, stdout=log,
+            driver.processes.run(build, cwd=generator_dir, env=env, stdout=log,
                            stderr=subprocess.STDOUT, check=True, timeout=args.timeout)
         executable = generator_dir / program
         manifest.update(pbbs_revision=driver.COMMIT, generator_sha256=digest(executable),
@@ -111,7 +111,7 @@ def main():
             generated = Path(temporary) / "graph.adj"
             command = [str(executable), *arguments, str(generated)]
             with target.with_suffix(".run.log").open("w") as log:
-                subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT,
+                driver.processes.run(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                check=True, timeout=args.timeout)
             vertices, edges = validate_graph(generated)
             manifest.update(vertices=vertices, edges=edges, graph_sha256=digest(generated),

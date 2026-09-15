@@ -153,6 +153,9 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   endif()
 endforeach()
 
+add_executable(test_eval_arguments tests/tests_arguments.cpp)
+oox_configure_scheduler_eval_target(test_eval_arguments SERIAL_ELISION)
+list(APPEND OOX_SCHEDULER_EVAL_TARGETS test_eval_arguments)
 add_custom_target(scheduler_eval_all DEPENDS ${OOX_SCHEDULER_EVAL_TARGETS})
 
 if(OOX_ENABLE_EIGEN OR TBB_FOUND)
@@ -160,6 +163,13 @@ if(OOX_ENABLE_EIGEN OR TBB_FOUND)
 endif()
 
 if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
+  add_test(NAME scheduler_eval_arguments
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tests/tests_arguments.py $<TARGET_FILE:test_eval_arguments>)
+  add_test(NAME scheduler_eval_process_cleanup
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/benchmarks/pbbs/tests_processes.py)
+  add_test(NAME scheduler_eval_shell_safety
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/tests_benchmark_scripts.py)
+  list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_arguments scheduler_eval_process_cleanup scheduler_eval_shell_safety)
   add_test(NAME scheduler_eval_pbbs_snapshot
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/benchmarks/pbbs/tests_snapshot.py)
   list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_pbbs_snapshot)

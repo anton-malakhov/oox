@@ -12,6 +12,25 @@ on:
       - synchronize
       - reopened
 jobs:
+  eigen-exception-policy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: sudo apt update && sudo apt install cmake clang-19 libgtest-dev libeigen3-dev
+    - name: Configure exception-aware Eigen tasks
+      run: >
+        cmake -S . -B build-exception-policy -DCMAKE_CXX_COMPILER=clang++-19
+        -DOOX_BUILD_TESTS=ON -DOOX_BUILD_BENCHMARKS=OFF
+        -DOOX_ENABLE_EIGEN=ON -DOOX_EIGEN_THREADS=2 -DOOX_EXCEPTIONS_ENABLED=ON
+        -DOOX_ENABLE_TBB=OFF -DOOX_ENABLE_TF=OFF -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=OFF
+    - name: Build exception and pool tests
+      run: cmake --build build-exception-policy --target test_oox_eigen eigen_pool_test -j 8
+    - name: Verify propagation and fail-fast boundary
+      run: >
+        ctest --test-dir build-exception-policy --output-on-failure --timeout 120
+        -R '^(OOX_EIGEN[.]|EigenPool[.]|EigenPoolDeathTest[.])'
+
   papi-build:
     runs-on: ubuntu-latest
     steps:
@@ -47,7 +66,9 @@ jobs:
     - name: Dependencies
       run: sudo apt update && sudo apt install cmake clang-19 libjemalloc-dev
     - name: Verify vendored PBBS sources
-      run: python3 benchmarks/pbbs/tests_snapshot.py
+      run: |
+        python3 benchmarks/pbbs/tests_snapshot.py
+        python3 benchmarks/pbbs/tests_processes.py
     - name: Acquire checksum-verified original data (no code checkout)
       run: >
         python3 benchmarks/scheduler_eval/tools/datasets.py --archives-only --bundled

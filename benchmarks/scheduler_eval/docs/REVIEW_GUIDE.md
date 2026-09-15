@@ -45,3 +45,36 @@ Paths beginning with `scheduler_eval/` above are relative to `benchmarks/`.
 
 See [plan status](PLAN_STATUS.md), [dataset/PAPI scope](DATASETS_AND_PAPI.md), and
 [provenance](PROVENANCE.md) for the detailed coverage and qualifications.
+
+## Owner review follow-up (2026-09-15)
+
+- LLVM 19 provisioning: the hypothesized apt failure did not reproduce.
+  [All ten checks for the vendoring commit passed](https://github.com/anton-malakhov/oox/actions/runs/34893889162),
+  including the configuration that installs and uses libomp-19-dev. No compiler
+  downgrade or additional package repository is needed for the observed CI run.
+- Escaped task exceptions: `spawn -> Schedule -> ExecuteTask -> execute` formerly
+  swallowed an exception before task completion could be published. With a
+  non-throwing task policy, that could leave `wait_and_get` waiting indefinitely.
+  The pool now terminates on an escaped exception: it cannot repair an arbitrary
+  task's result state. Exception-enabled OOX tasks still catch inside `execute`,
+  store the exception, and notify dependents. Regressions cover injected
+  `std::bad_alloc` propagation and fail-fast behavior; this is not an actual
+  memory-exhaustion campaign. CI also exercises the exception-enabled policy.
+- PBBS timeouts: the driver and graph-generator commands run in fresh POSIX
+  sessions. Timeout or interruption kills the complete process group, including
+  make/compiler/benchmark descendants. A test checks a grandchild that ignores
+  SIGTERM. Processes deliberately escaping into a different session are outside
+  this group-based guarantee.
+- Nesting: worker waits execute queued work through `Wait/TryExecuteOne`; they
+  are not passive OS waits. Queue-order independence is not asserted. Adapter
+  comments require rerunning nesting tests after scheduler changes, and the
+  pool regression explicitly saturates both workers before launching children.
+- Input handling: malformed, missing, overflowing, or out-of-range numeric
+  options produce diagnostics and exit status 2. JSON escaping covers every
+  control byte. Degenerate model inputs raise explicit validation errors instead
+  of division-by-zero failures.
+- Branch scripts: M1 runs use detached worktrees, never checkout/reset the main
+  tree. A fake-Git/fake-runner test checks isolation without running benchmarks.
+  Comparison generation failures now propagate instead of being ignored.
+- Research-repository dependencies were removed in the preceding vendoring
+  commit; original attributed benchmark sources remain isolated in-tree.

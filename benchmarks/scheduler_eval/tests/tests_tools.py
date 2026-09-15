@@ -14,9 +14,23 @@ from paper_graphs import parameters
 from input_graphs import recipe, validate_graph
 import hardware
 import provenance
+import model
 
 
 class HistoricalToolsTest(unittest.TestCase):
+    def test_model_rejects_degenerate_samples(self):
+        for points in ([], [(0, 1)], [(-1, 2)], [(float("nan"), 1)], [(1, float("inf"))]):
+            with self.subTest(points=points), self.assertRaises(ValueError):
+                model.fit_launch(points)
+        for xs, ys in (([], []), ([0, 0], [1, 2]), ([1], []), ([float("inf")], [1])):
+            with self.subTest(xs=xs, ys=ys), self.assertRaises(ValueError):
+                model.through_origin(xs, ys)
+        with self.assertRaises(ValueError):
+            model.launch_time(dict(task_scale=0), 1)
+        self.assertEqual(model.through_origin([0, 1, 2], [0, 3, 6]), 3)
+        fit = model.fit_launch([(1, 4), (2, 4), (4, 4)])
+        self.assertAlmostEqual(model.launch_time(fit, 2), 4)
+
     def test_execution_environment_disables_backend_specific_pinning(self):
         original = dict(OMP_PROC_BIND="close", KMP_AFFINITY="compact",
                         GOMP_CPU_AFFINITY="0", KMP_HW_SUBSET="1c", KEEP="yes")

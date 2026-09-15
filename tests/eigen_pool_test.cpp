@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <future>
 #include <memory>
 #include <thread>
@@ -41,13 +42,14 @@ TEST(EigenPool, MakeTaskCopiesLvalueCallable) {
   EXPECT_TRUE(ran);
 }
 
-TEST(EigenPool, WorkerSurvivesUnhandledTaskException) {
-  ThreadPool pool(1, false, false);
-  std::promise<void> completed;
-  auto result = completed.get_future();
-  pool.Schedule(MakeTask([] { throw std::runtime_error("task failure"); }));
-  pool.Schedule(MakeTask([&] { completed.set_value(); }));
-  EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
+TEST(EigenPoolDeathTest, UnhandledTaskExceptionFailsFast) {
+  EXPECT_EXIT({
+    std::set_terminate([] { std::_Exit(86); });
+    ThreadPool pool(1, false, false);
+    pool.Schedule(MakeTask([] { throw std::bad_alloc{}; }));
+    std::this_thread::sleep_for(2s);
+    std::_Exit(0);
+  }, testing::ExitedWithCode(86), "");
 }
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
@@ -91,12 +93,16 @@ TEST(EigenPool, SurvivesCreatorThreadExit) {
 
 TEST(EigenPool, NestedWaitsMakeProgressWithAllWorkersOccupied) {
   ThreadPool pool(2, false, false);
+  std::atomic<int> parents_started{0};
   std::atomic<int> parents_completed{0};
   std::promise<void> completed;
   auto result = completed.get_future();
 
   for (int i = 0; i < 2; ++i) {
     pool.Schedule(MakeTask([&] {
+      parents_started.fetch_add(1);
+      while (parents_started.load() != 2)
+        std::this_thread::yield();
       auto child_done = std::make_shared<std::atomic<bool>>(false);
       pool.Schedule(MakeTask([&, child_done] {
         child_done->store(true, std::memory_order_release);

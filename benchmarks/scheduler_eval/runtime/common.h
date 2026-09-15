@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "eval_parallel.h"
+#include "benchmarks/eigen/arguments.h"
 
 namespace scheduler_eval {
 
@@ -49,9 +50,10 @@ inline std::uint64_t Nanoseconds(Clock::time_point origin) {
 
 inline std::size_t Argument(int argc, char **argv, std::string_view name,
                             std::size_t fallback) {
-  for (int i = 1; i + 1 < argc; ++i) {
+  for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) == name)
-      return std::stoull(argv[i + 1]);
+      return benchmark_arguments::Number<std::size_t>(
+          i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view{}, name);
   }
   return fallback;
 }
@@ -105,10 +107,17 @@ inline void PrintSummary(const Summary &summary) {
 
 inline std::string JsonEscape(std::string_view value) {
   std::string result;
-  for (char c : value) {
+  for (unsigned char c : value) {
+    if (c < 0x20) {
+      constexpr char hex[] = "0123456789abcdef";
+      result += "\\u00";
+      result.push_back(hex[c >> 4]);
+      result.push_back(hex[c & 15]);
+      continue;
+    }
     if (c == '"' || c == '\\')
       result.push_back('\\');
-    result.push_back(c);
+    result.push_back(static_cast<char>(c));
   }
   return result;
 }
