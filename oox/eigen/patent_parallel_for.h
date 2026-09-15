@@ -8,9 +8,12 @@
 namespace oox::detail::eigen_pool {
 namespace patent_detail {
 
+inline constexpr unsigned initial_depth = 3;
+
 struct Metrics {
   std::atomic<size_t> owner_ranges{0};
   std::atomic<size_t> range_tasks{0};
+  std::atomic<size_t> initial_tasks{0};
   std::atomic<size_t> signal_tasks{0};
   std::atomic<size_t> stolen_signals{0};
   std::atomic<size_t> donated_ranges{0};
@@ -121,24 +124,21 @@ inline void Arm(Region &region, Signal &signal) {
   region.pool.Schedule(probe.release());
 }
 
-template <bool Feedback, bool Interruptible, typename F>
-void Process(Region &, F &, LoopRange, size_t, unsigned) noexcept;
+template <typename F>
+void Process(Region &, F &, LoopRange, size_t) noexcept;
 
-template <bool Feedback, bool Interruptible, typename F>
+template <typename F>
 class Work final : public Task {
 public:
-  Work(Region &region, F &function, LoopRange range, size_t budget,
-       unsigned initial_depth) noexcept
-      : region_(region), function_(function), range_(range), budget_(budget),
-        initial_depth_(initial_depth) {
+  Work(Region &region, F &function, LoopRange range, size_t budget) noexcept
+      : region_(region), function_(function), range_(range), budget_(budget) {
     region_.AddTask();
     if (region_.metrics)
       region_.metrics->range_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   ~Work() override { region_.TaskComplete(); }
   void operator()() final {
-    Process<Feedback, Interruptible>(region_, function_, range_, budget_,
-                                     initial_depth_);
+    Process(region_, function_, range_, budget_);
     delete this;
   }
   void Discard() noexcept final { delete this; }
@@ -148,7 +148,6 @@ private:
   F &function_;
   LoopRange range_;
   size_t budget_;
-  unsigned initial_depth_;
 };
 
 struct OwnerSignal {
@@ -161,9 +160,9 @@ struct OwnerSignal {
 
 // The range pool belongs exclusively to this running invocation. A stolen
 // probe requests work; only this owner removes and publishes its FIFO range.
-template <bool Feedback, bool Interruptible, typename F>
-void Process(Region &region, F &function, LoopRange range, size_t budget,
-             unsigned initial_depth) noexcept {
+template <typename F>
+void Process(Region &region, F &function, LoopRange range,
+             size_t budget) noexcept {
   OwnerSignal signal;
   size_t chunks = 0;
   try {
@@ -174,66 +173,56 @@ void Process(Region &region, F &function, LoopRange range, size_t budget,
       const size_t size = range.end - range.begin;
       const size_t middle = range.begin + (size / budget) * left_budget +
                             std::min(left_budget, size % budget);
-      auto child = std::make_unique<Work<Feedback, Interruptible, F>>(
+      auto child = std::make_unique<Work<F>>(
           region, function, LoopRange{middle, range.end, range.grain},
-          budget - left_budget, initial_depth);
+          budget - left_budget);
       range.end = middle;
       budget = left_budget;
       region.pool.Schedule(child.release());
+      if (region.metrics)
+        region.metrics->initial_tasks.fetch_add(1, std::memory_order_relaxed);
     }
     if (region.metrics)
       region.metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
     partitioning::RangePool<LoopRange> ranges(range);
     unsigned limit = initial_depth;
-    if constexpr (Feedback) {
-      if (range.IsDivisible()) {
-        signal.value = new Signal;
-        Arm(region, *signal.value);
-      }
+    if (range.IsDivisible()) {
+      signal.value = new Signal;
+      Arm(region, *signal.value);
     }
     while (!ranges.Empty() && !region.IsCancelled()) {
       ranges.Fill(limit);
-      if constexpr (Feedback && Interruptible) {
-        LoopRange &current = ranges.Back();
-        const size_t first = current.begin;
-        while (current.begin < current.end) {
-          // An indivisible remainder always executes: a stream of stolen
-          // probes must not prevent the owner from making progress.
-          if (current.IsDivisible() && signal.value &&
-              signal.value->demand.load(std::memory_order_relaxed))
-            break;
-          const size_t index = current.begin++;
-          std::invoke(function, index);
-        }
-        if (current.begin != first)
-          ++chunks;
-        if (current.begin == current.end)
-          ranges.PopBack();
-      } else {
-        const LoopRange current = ranges.Back();
-        ranges.PopBack();
-        for (size_t i = current.begin; i < current.end; ++i)
-          std::invoke(function, i);
-        ++chunks;
+      LoopRange &current = ranges.Back();
+      const size_t first = current.begin;
+      while (current.begin < current.end) {
+        // An indivisible remainder always executes: a stream of stolen
+        // probes must not prevent the owner from making progress.
+        if (current.IsDivisible() && signal.value &&
+            signal.value->demand.load(std::memory_order_relaxed))
+          break;
+        const size_t index = current.begin++;
+        std::invoke(function, index);
       }
-      if constexpr (Feedback) {
-        if (signal.value && !ranges.Empty() && !region.IsCancelled()) {
-          if (signal.value->demand.exchange(false, std::memory_order_acq_rel)) {
-            if (limit < partitioning::AutoPartition::max_depth)
-              ++limit;
-            if (ranges.Size() > 1) {
-              auto child = std::make_unique<Work<Feedback, Interruptible, F>>(
-                  region, function, ranges.Front(), 1, initial_depth);
-              region.pool.Schedule(child.release());
-              ranges.PopFront();
-              if (region.metrics)
-                region.metrics->donated_ranges.fetch_add(
-                    1, std::memory_order_relaxed);
-            }
+      if (current.begin != first)
+        ++chunks;
+      if (current.begin == current.end)
+        ranges.PopBack();
+      if (signal.value && !ranges.Empty() && !region.IsCancelled()) {
+        if (signal.value->demand.exchange(false, std::memory_order_acq_rel)) {
+          if (limit < partitioning::AutoPartition::max_depth)
+            ++limit;
+          if (ranges.Size() > 1) {
+            auto child = std::make_unique<Work<F>>(
+                region, function, ranges.Front(), 1);
+            region.pool.Schedule(child.release());
+            ranges.PopFront();
+            if (region.metrics)
+              region.metrics->donated_ranges.fetch_add(
+                  1, std::memory_order_relaxed);
           }
-          // Re-arm also when a nested helper consumed its own probe.
-          Arm(region, *signal.value);
         }
+        // Re-arm also when a nested helper consumed its own probe.
+        Arm(region, *signal.value);
       }
     }
   } catch (...) {
@@ -247,12 +236,11 @@ void Process(Region &region, F &function, LoopRange range, size_t budget,
 
 // Worker-count-based initial subdivision, private range buffering,
 // stolen-signal feedback, FIFO donation, and LIFO local processing from
-// WO2013021223A1 / US9262230B2. U=1 and V=2^initial_depth.
+// WO2013021223A1 / US9262230B2. U=1 and initial V=8.
 // Only ordinary Eigen task submission, cancellation, and waiting are used.
-template <bool Feedback = true, bool Interruptible = true, typename F>
+template <typename F>
 void ParallelForPatent(ThreadPool &pool, size_t begin, size_t end,
                        F &&function, size_t grain = 1,
-                       unsigned initial_depth = 3,
                        patent_detail::Metrics *metrics = nullptr) {
   if (begin >= end || pool.IsCancelled())
     return;
@@ -266,13 +254,10 @@ void ParallelForPatent(ThreadPool &pool, size_t begin, size_t end,
       std::invoke(function, i);
     return;
   }
-  initial_depth =
-      std::min(initial_depth, partitioning::AutoPartition::max_depth);
   const size_t budget =
       std::min(pool.NumThreads(), (end - begin - 1) / grain + 1);
   patent_detail::Region region(pool, metrics);
-  patent_detail::Process<Feedback, Interruptible>(
-      region, function, {begin, end, grain}, budget, initial_depth);
+  patent_detail::Process(region, function, {begin, end, grain}, budget);
   region.TaskComplete();
   // Wait may return early on pool cancellation. Published tasks still own
   // references to the callback and region, so retain both until all tasks

@@ -1,5 +1,9 @@
 # Patent-only Eigen results
 
+> Measurements of commit 415dd8f, including experimental controls that are now
+> removed. See [PATENT_DEFAULT_COMPARISONS.md](PATENT_DEFAULT_COMPARISONS.md)
+> for the current default-only implementation and direct OOX comparisons.
+
 These measurements use ordinary Eigen tasks. The patent header has no Rapid
 dependency, and both benchmark modes use the same existing pool implementation.
 The existing pool also supports separate Rapid modes; this run creates no

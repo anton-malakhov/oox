@@ -24,7 +24,7 @@ The private range buffer is adapted from oneTBB 2021.5.0, pinned at
 70bf10c0a9e65e3a954156f801b0a11c96f7f6bd; provenance is retained in
 tbb_partitioning.h and licenses/oneTBB-Apache-2.0.txt.
 Checking demand between callback invocations is an implementation extension;
-the callback itself is not preempted. Initial relative depth defaults to three.
+the callback itself is not preempted. Initial relative depth is fixed at three.
 
 ## Runtime boundary and later adaptation
 
@@ -60,9 +60,11 @@ The direct-loop harness mode is EIGEN_PATENT_DEMAND_LOOP.
 Both route through the ordinary Eigen range entry point. The former
 RAPID_PATENT_DEMAND hybrid mode has been removed.
 
-`ParallelForPatent<false>` disables demand feedback for measurement.
-`ParallelForPatent<true, false>` checks demand at private-block boundaries.
-These are controls; the normal call uses feedback and callback-boundary checks.
+Only the default policy is retained: demand feedback and callback-boundary
+checks are always enabled, with initial relative depth three. The earlier
+feedback-disabled, block-end, and depth-selection controls have been removed.
+The optional metrics pointer provides diagnostics without selecting another
+policy.
 
 ## Validation and results
 
@@ -74,6 +76,6 @@ cancellation, allocation failure, and reuse. Initial subdivision is checked
 against a serial visitation oracle and its worker budget; callbacks are also
 checked for absence of a Rapid region.
 
-Current measurements: [PATENT_ONLY_RESULTS.md](../../benchmarks/scheduler_eval/PATENT_ONLY_RESULTS.md).
+Current measurements and the OOX before/after check: [PATENT_DEFAULT_COMPARISONS.md](../../benchmarks/scheduler_eval/PATENT_DEFAULT_COMPARISONS.md).
 The earlier [hybrid experiment](PATENT.md) and its data are retained explicitly
 as historical evidence. They are not results for this implementation.

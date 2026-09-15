@@ -44,14 +44,13 @@ int main() {
     ThreadPool pool(p, true, true);
     for (size_t n : {1ul, 2ul, 7ul, 31ul, 257ul}) {
       patent_detail::Metrics metrics;
-      std::vector<unsigned> visits(n);
-      ParallelForPatent<false>(pool, 0, n, [&](size_t i) { ++visits[i]; },
-                               1, 3, &metrics);
-      for (auto v : visits)
+      std::vector<std::atomic<unsigned>> visits(n);
+      ParallelForPatent(pool, 0, n, [&](size_t i) { ++visits[i]; },
+                        1, &metrics);
+      for (auto &v : visits)
         check(v == 1, "initial subdivision oracle", cases);
       const size_t owners = std::min<size_t>(p, n);
-      check(metrics.owner_ranges == owners &&
-                metrics.range_tasks == owners - 1 && metrics.signal_tasks == 0,
+      check(metrics.initial_tasks == owners - 1,
             "initial task budget", cases++);
       items += n;
     }
