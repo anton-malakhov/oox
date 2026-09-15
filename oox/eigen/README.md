@@ -79,3 +79,7 @@ remain in every Eigen-derived file.
 `OOX_EIGEN_CACHE_LINE_SIZE` can override the stable 64-byte cache-line layout
 constant used by the vendored MPMC queue. Its value must be a power of two no
 greater than 128, matching the vendored aligned allocator's supported range.
+
+## Patent work-demand ranges
+
+The optional range operation and existing benchmark modes are described in [PATENT.md](PATENT.md).

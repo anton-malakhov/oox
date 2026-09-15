@@ -100,6 +100,15 @@ if (OOX_ENABLE_EIGEN)
           DISCOVERY_MODE PRE_TEST
           DISCOVERY_TIMEOUT 30)
 
+  add_executable(eigen_patent_range_test eigen_patent_range_test.cpp)
+  target_link_libraries(eigen_patent_range_test PRIVATE ${PROJECT_NAME}::eigen)
+  add_test(NAME EigenPatentRangeOracle COMMAND eigen_patent_range_test)
+  set_tests_properties(EigenPatentRangeOracle PROPERTIES TIMEOUT 120)
+  add_executable(eigen_patent_allocation_test eigen_patent_allocation_test.cpp)
+  target_link_libraries(eigen_patent_allocation_test PRIVATE ${PROJECT_NAME}::eigen)
+  add_test(NAME EigenPatentAllocationFailure COMMAND eigen_patent_allocation_test)
+  set_tests_properties(EigenPatentAllocationFailure PROPERTIES TIMEOUT 60)
+
   # Standalone (no gtest) policy-matrix checks. These run every GrainLaw x
   # VictimPolicy combination and were validated under TSan/ASan/UBSan on Linux.
   add_executable(policy_matrix_check policy_matrix_check.cpp)

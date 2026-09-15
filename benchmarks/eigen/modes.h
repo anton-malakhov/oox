@@ -56,6 +56,7 @@ inline std::string GetParallelMode() {
 #define EIGEN_RAPID_LAZY_PRESSURE 16
 // Dedicated busy-wait pool with a 64-participant resident availability mask.
 #define EIGEN_RAPID_RESIDENT 17
+#define EIGEN_PATENT_DEMAND 18
 
 #define TASKFLOW_GUIDED 1
 #define TASKFLOW_DYNAMIC 2
