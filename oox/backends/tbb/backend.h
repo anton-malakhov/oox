@@ -66,6 +66,9 @@ struct task : public tbb_task, task_life {
     }
 
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
 #if TBB_USE_ASSERT
         is_spawned.store(true, std::memory_order_release);
 #endif

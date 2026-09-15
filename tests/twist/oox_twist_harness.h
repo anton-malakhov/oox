@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
+#include <utility>
 
 #include <fmt/core.h>
 
@@ -29,6 +30,15 @@
 
 namespace oox::twist_tests {
 
+template <typename Scenario>
+auto DrainSpawnedTasks(Scenario scenario) {
+    return [scenario = std::move(scenario)]() mutable {
+        internal::twist_task_tracking_scope tracking;
+        scenario();
+        tracking.drain();
+    };
+}
+
 #if __TWIST_SIM__
 
 inline void ReportFailure(const char* scheduler,
@@ -54,7 +64,7 @@ void RunRandomSeeds(const char* name, Scenario scenario, std::size_t seeds = OOX
         twist::sim::sched::RandomScheduler scheduler{{.seed = seed}};
         twist::sim::Simulator simulator{&scheduler};
 
-        auto result = simulator.Run(scenario);
+        auto result = simulator.Run(DrainSpawnedTasks(scenario));
         if (!result.Ok()) {
             ReportFailure("RandomScheduler", name, seed, result);
             std::abort();
@@ -71,11 +81,12 @@ void RunDfs(const char* name, Scenario scenario) {
         .max_steps = OOX_TWIST_MAX_STEPS,
     }};
 
-    auto exploration = twist::sim::Explore(dfs, scenario);
+    auto tracked_scenario = DrainSpawnedTasks(scenario);
+    auto exploration = twist::sim::Explore(dfs, tracked_scenario);
     if (exploration.found) {
         const auto& found = *exploration.found;
         ReportFailure("DfsScheduler", name, OOX_TWIST_MAX_PREEMPTS, found.result);
-        twist::sim::Print(scenario, found.schedule);
+        twist::sim::Print(tracked_scenario, found.schedule);
         std::abort();
     }
 }
@@ -88,7 +99,7 @@ void RunRandomSeeds(const char* /*name*/, Scenario scenario, std::size_t seeds =
 
     for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
         (void)seed;
-        scenario();
+        DrainSpawnedTasks(scenario)();
     }
 }
 

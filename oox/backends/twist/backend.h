@@ -30,10 +30,25 @@ struct task : task_life {
     }
 
     void spawn() {
-        sync::thread([this] {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
+#if OOX_TWIST_TEST
+        auto* tracker = active_twist_task_tracker;
+#endif
+        sync::thread worker([this] {
             sync::preemption_point();
-            this->execute();
-        }).detach();
+            this->execute(); // releases OOX_TASK_EXECUTE_LIFETIME_REF via the in-execute guard
+        });
+#if OOX_TWIST_TEST
+        if (tracker) {
+            tracker->track(std::move(worker));
+        } else {
+            worker.detach();
+        }
+#else
+        worker.detach();
+#endif
     }
 
     void wait() {
