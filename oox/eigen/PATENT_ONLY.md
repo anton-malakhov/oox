@@ -76,6 +76,6 @@ cancellation, allocation failure, and reuse. Initial subdivision is checked
 against a serial visitation oracle and its worker budget; callbacks are also
 checked for absence of a Rapid region.
 
-Current measurements and the OOX before/after check: [PATENT_DEFAULT_COMPARISONS.md](../../benchmarks/scheduler_eval/PATENT_DEFAULT_COMPARISONS.md).
+Default Eigen versus the current patent implementation: [PATENT_DEFAULT_COMPARISONS.md](../../benchmarks/scheduler_eval/PATENT_DEFAULT_COMPARISONS.md).
 The earlier [hybrid experiment](PATENT.md) and its data are retained explicitly
 as historical evidence. They are not results for this implementation.
