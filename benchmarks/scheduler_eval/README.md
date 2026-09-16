@@ -1,14 +1,110 @@
 # Native scheduler evaluation
 
+Start with the [MR review guide](docs/REVIEW_GUIDE.md) for scope and review order.
+
+## Directory layout
+
+- `bench/`: benchmark registrations and timed entry points.
+- `workloads/`: workload algorithms and granularity control.
+- `runtime/`: scheduler adapters and shared execution helpers.
+- `metrics/`: scheduler statistics and optional PAPI counters.
+- `probes/`: scheduling distribution, spin tracing, and timespan tuning.
+- `tests/`: correctness tests, fixtures, and the isolated fake-PAPI harness.
+- `tools/`: dataset acquisition, analysis, plotting, and CI helpers.
+- `data/`: the original-dataset catalog (downloaded inputs stay outside the source tree).
+- `docs/`: design, provenance, usage guides, and plan status.
+
+`run.py` remains the main entry point. CMake target names and executable output
+paths are unchanged; invoke helper scripts from `tools/`.
+
+All native evaluation backends leave per-worker CPU pinning disabled. The runner
+disables OpenMP-specific repinning as well, so every mode inherits the same CPU
+set. Use `--cpu-node` on Linux to restrict that set uniformly; this is not a
+promise of identical worker-to-core assignments. Direct executable invocations
+must likewise avoid externally configured OpenMP affinity.
+
+Result metadata records every measured executable's SHA-256 and size, and checks
+that those files did not change during the run. `checkout` records the current
+revision, dirty status, and tracked-diff hash. The legacy `oox_commit` is the
+checkout revision only: it does not identify the binary's source revision.
+`binary_source_revision` remains null because the runner cannot prove how an
+existing build was produced. Keep the build and its source snapshot together.
+
+See [the porting-plan status](docs/PLAN_STATUS.md) for the remaining gaps versus the
+original full reproduction plan.
+The current remaining scope is [original datasets and PAPI](docs/DATASETS_AND_PAPI.md).
+Hardware measurement campaigns and legacy-runtime builds are not required.
+
+`SERIAL_ELISION` runs the same algorithms with serial loop execution. It keeps
+the requested thread count for workload-size formulas, while metadata and
+execution traces report one execution thread. This is an algorithm-elision
+control, not a replacement for independent serial implementations. Concurrent
+caller experiments still create their explicitly requested caller threads.
+The PBBS driver separately provides eight original implementations with
+`--backend serial --mode SERIAL`; those always execute with one worker.
+
+Use `tools/input_graphs.py --kind rmat24 --smoke --output <directory>` to build the
+pinned PBBS generator and produce a validated small graph. Omit `--smoke` for
+the full RMat24/RMat27 recipe; random-local and cube-grid recipes support
+`--size small|large`. These are PBBS recipes, not assertions of byte identity
+with historical PASL datasets. Metadata records source revision, generator
+hash, parameters, actual graph dimensions, and graph SHA-256.
+
+On Linux, `--likwid-group MEM --likwid-cpus 0-3` wraps the benchmark process in
+`likwid-perfctr` and retains its CSV output. Use a group supported by the CPU.
+LIKWID collects across the selected CPUs, including unrelated work on them;
+reserve those CPUs for the experiment. Counts include process initialization
+and the entire selected benchmark suite. They are not individual kernel
+counters. LIKWID and `--perf` are mutually exclusive; LIKWID pinning cannot be
+combined with `--cpu-node`, though explicit memory placement is supported.
+An unavailable collector or missing output fails the run without marking it
+complete. Optional PAPI callback instrumentation is available with
+`-DOOX_SCHEDULER_EVAL_PAPI=ON` and `--papi-events`; useful-work utilization is
+still unmeasured. See the scope and limitations in `docs/DATASETS_AND_PAPI.md`.
+The wrapper follows the [official LIKWID interface](https://github.com/RRZE-HPC/likwid/blob/master/doc/likwid-perfctr.1).
+See [historical inputs and baseline runners](docs/HISTORICAL_BASELINES.md) for pinned
+PASL commands and revision-checked historical executable integration.
+
+Native sample sort now includes string and 64-bit record cases (records use
+lexicographic key/value ordering). `RadixPassWidth` compares 4-, 8- and 11-bit
+digits while retaining full-width keys. `Pasl*` BFS cases implement wrap-around
+grids, rejoining chains and cyclic phased topologies without vertex permutation.
+File BFS accepts `--source-vertex`; all three policies and the oracle use it.
+First-touch tests allocate fresh anonymous mappings per repetition, so vector
+initialization or allocator reuse cannot pre-touch the input pages.
+
+The suite also builds `OOX_TASKS`, which expresses parallel ranges as recursive
+`oox::run` tasks joined through `oox::var`. It reads counters from OOX's actual
+pool. Its thread count is the library's build setting `OOX_EIGEN_THREADS`
+(zero means detected hardware concurrency); configure that value to match the
+runner's `--threads` for cross-mode comparisons.
+Automatic OOX task grains target eight ranges per worker, capped at 1,024
+iterations per leaf; explicit grain requests are retained. This grain policy
+is distinct from the low-level Eigen policies and must be accounted for when
+interpreting task counts.
+
+Additional cases include frontier-parallel QuickHull, atomic string deduplication
+on synthetic word triples, eight-pass 64-bit radix sort, concurrent callers, and
+workers temporarily occupied by controlled tasks. Radix `preflight_pass_*_ns`
+counters describe an untimed instrumented invocation; ordinary benchmark timing
+does not include that instrumentation. QuickHull uses long-double orientation
+arithmetic and reports partition depth, so its floating-point boundary behavior
+can differ from PBBS's double-precision implementation.
+
+Use `--graph /path/to/graph.adj_bin --filter BfsFile` to benchmark a supplied
+PASL binary or PBBS `AdjacencyGraph` text file. Loading and serial validation
+occur outside timing; the runner records the graph path and SHA-256. Add
+`--paper-scale` to register 100-million-element primary cases explicitly.
+
 This directory is OOX's offline, reproducible implementation of the evaluation
 families studied in *Fast work distribution for composable task scheduling
 engines*. It compares ordinary work stealing, proactive mailbox publication,
 adaptive timespan splitting, their combined Eigen policy, oneTBB partitioners,
 and available OpenMP schedules through one shared workload layer.
 
-The historical thesis repository is pinned as optional reference material at
-`thirdparty/composable-parallel-scheduler-thesis`. The runner never clones or
-downloads it. See `PROVENANCE.md` for the clean-room implementation policy and
+The historical thesis is cited at its original revision without a repository
+checkout dependency. The runner never clones or downloads its code.
+See `docs/PROVENANCE.md` for the clean-room implementation policy and
 the intentional differences from that source.
 
 ## Build and verify
@@ -22,49 +118,26 @@ cmake -S . -B build-eval -G Ninja \
   -DOOX_BUILD_TASKBENCH=OFF \
   -DOOX_BUILD_SCHEDULER_EVALS=ON
 cmake --build build-eval --target scheduler_eval_all -j
-ctest --test-dir build-eval -R scheduler_eval --output-on-failure
+ctest --test-dir build-eval -L scheduler-eval --output-on-failure
 ```
 
 CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
-`EIGEN_SHARING_STEALING`, plus the pool-backed `RAPID_START`, `RAPID_MAILBOX`,
-`RAPID_LAZY_STEALING`, and `RAPID_TIMESPAN_LAZY_STEALING` experiments. TBB
-contributes simple, automatic, and affinity partitioners. OpenMP
+`EIGEN_SHARING_STEALING`. TBB contributes simple, automatic, and affinity
+partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
-`RAPID_START` uses the Eigen pool's lifetime worker registrations. Each
-invocation creates an independent stack region and publishes a hierarchical
-activation tree through per-worker inboxes, falling back to the ordinary queue
-when a bounded rapid inbox fills. Nested calls inherit contiguous worker
-domains, so nested matrix multiplication and transpose are enabled. The
-implementation supports the pool's full 65535-worker limit rather than the
-historical 64-bit mask.
+`RAPID_START` waits for every requested trapper task to register before its
+warm-up publication. It supports at most 64 workers. Because the prototype has
+one global publication descriptor and is not reentrant, its target omits nested
+matrix multiplication and transpose; normalized reports use only cases present
+in every selected mode. Nested workloads and registrations live in separate
+sources that CMake attaches only to reentrant modes.
 
-`RAPID_MAILBOX` ends Rapid participation after bounded adaptive range blocks
-have been placed in targeted ordinary mailboxes; the blocks then use
-unrestricted work stealing. A mailbox block retains its logical proportional
-domain for nested loops, avoiding whole-pool fan-out while remaining ordinary
-stealable work. `RAPID_LAZY_STEALING` reserves one first block for every
-proportional owner before publishing execution. An idle worker leaves its
-Rapid domain once before claiming later blocks from peer ranges. Both modes run
-one-worker effective domains directly. These modes trade some uniform-loop
-launch cost for recovery from irregular static partitions without creating a
-task per item.
-
-`RAPID_TIMESPAN_LAZY_STEALING` retains the same protected first blocks and
-one-way Rapid-domain exit, but each proportional owner times its own blocks and
-smoothly adjusts toward a runtime-derived useful-work duration. A one-time probe
-measures the current CPU's clock and atomic-claim cost; the policy combines it
-with domain size, projected owner-range time, and the fraction of owners already
-looking for work. Changes are bounded to one quarter through eight times the
-previous block and leave at least four later steal opportunities. Thieves use
-the owner's latest published block size without feeding migration or contention
-time back into the estimate. Define `OOX_RAPID_TIMESPAN_TARGET_NS` to a nonzero
-value only when a fixed target is useful for a controlled comparison.
-
-The `test_scheduler_eval_*` executables validate scan, reduction, and all three
-sparse distributions for every built policy. Reentrant policies additionally
-validate nested multiplication and transpose.
+The `test_scheduler_eval_*` executables validate scan, reduction, all three
+sparse distributions, convex hull, remove-duplicates, radix sort, and sample
+sort for every built policy. Reentrant policies additionally validate nested
+multiplication, transpose, and BFS.
 The standard CI configuration keeps `OOX_BUILD_BENCHMARKS=OFF`; this research
 suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 
@@ -79,15 +152,32 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | Balanced SpMV | Equal row work; isolates distribution overhead |
 | Hyperbolic SpMV | A few very heavy rows and a long light tail |
 | Triangular SpMV | Gradually changing row width and work |
+| Convex hull | Parallel block sorting and merging followed by a hull scan over square, disk, circle, and Kuzmin point distributions |
+| Remove duplicates | Concurrent open-addressing over uniform, exponential, duplicate-heavy, almost-sorted, and reverse-sorted keys |
+| Stable radix sort | Four parallel histogram/scatter passes over 32-bit scalar keys and key-value records |
+| Sample sort | Deterministic sampling, parallel bucket distribution, and parallel bucket sorting, including reverse-sorted input |
+| Flat/fixed/adaptive BFS | High-arity trees, parallel chains, dense/sparse phases, trunk-first, RMat, square/cube grids, and a small-world control |
+| Variable-cost loops | Constant, uniform, exponential, Pareto, linear, clustered, periodic, shuffled, and phase-changing costs |
+| Competing loops | Two simultaneous OOX loops contending for one worker pool |
+| First touch | Serial versus parallel page initialization before parallel reads |
 | Matrix multiply | Nested parallel regions with substantial inner work |
 | Matrix transpose | Nested tiled regions with short inner tasks |
 
 Inputs are deterministic and construction and validation stay outside measured
-regions. The current SpMV input is reused across Google Benchmark calibration
-and repetition entries so setup does not repeatedly rebuild a multi-gigabyte
-matrix. A full SpMV run intentionally has the same large scale as the research
-workload and can still require several gigabytes; use `--smoke` before a full
-run.
+regions. A full SpMV run intentionally has the same large scale as the research
+workload and can require several gigabytes; use `--smoke` before a full run.
+Adaptive BFS uses SPTL's κ/α estimator rule with its 20 µs and 1.8 defaults;
+see `docs/THIRDPARTY.md` for the retained MIT notice.
+
+Eigen benchmark JSON includes scheduled/executed tasks, successful steals,
+failed steal rounds, worker sleeps, and observed sleeping time. BFS additionally
+records nested launches, sequentialized inner loops, and the learned sequential
+complexity limit. Native primary workloads record hull vertices and merge
+passes, deduplication probe rate and table load, radix passes, and sample-sort
+bucket count, maximum bucket size, and imbalance. The counters are compiled
+only for scheduler-evaluation targets. Workload descriptors are collected in
+an untimed preflight invocation so probe accounting does not perturb the timed
+kernel or its scheduler counters.
 
 ## Startup and publication probes
 
@@ -125,12 +215,22 @@ python3 benchmarks/scheduler_eval/run.py \
 
 python3 benchmarks/scheduler_eval/run.py \
   --build build-eval --threads 16 --repetitions 5 --timeout 1800
+
+python3 benchmarks/scheduler_eval/run.py \
+  --build build-eval --threads 16 --cpu-node 0 --memory-node 1 --perf
 ```
 
 Use `--filter REGEX` for a workload family and `--benchmark-min-time 9s` for
 long throughput-quality samples. The default is 0.5 seconds per benchmark
 case. A result's `complete` metadata field becomes true only after all selected
 commands and report generation succeed.
+
+On Linux, `--cpu-node` and `--memory-node` create explicit local or remote NUMA
+placements; `--interleave-memory` selects interleaved allocation. `--perf`
+records process-level cycles, instructions, cache misses, and CPU migrations,
+with `--perf-events` available for another event list. Placement and event names
+are retained in metadata. These options fail early when `numactl` or `perf` is
+unavailable rather than silently running an uncontrolled experiment.
 
 Each timestamped directory under `results/scheduler_eval` contains:
 
@@ -157,40 +257,18 @@ Do not combine numbers from different metadata files without checking them.
 PBBS application benchmarks remain in `benchmarks/pbbs`; they answer the
 end-to-end application question, while this suite isolates scheduler mechanics.
 
-For an implementation overview and a direct comparison with the normal Eigen
-backend, see
-[Rapid Start for Eigen: fast launch without giving up work stealing](RAPID_START_VS_EIGEN.md).
-A self-contained journal-style manuscript is also available as
-[LaTeX source](RAPID_START_EIGEN_PAPER.tex).
-Regenerate its measurement tables and build it from the repository root with:
-
-```sh
-python3 benchmarks/scheduler_eval/paper_figures.py \
-  results/scheduler_eval/20260901_journal_release \
-  benchmarks/scheduler_eval/paper_data \
-  --secondary results/scheduler_eval/20260831_model_all_policies
-latexmk -pdf -outdir=output/pdf \
-  benchmarks/scheduler_eval/RAPID_START_EIGEN_PAPER.tex
-```
-
-The manuscript compiles its plots as vector graphics; the generated CSV schema
-and provenance are documented in `paper_data/README.md`.
-
 ## Fit the explanatory model
 
-For a complete result containing Rapid Start, `Launch`, and all three SpMV
-families, fit the policy-specific scheduling-event, useful-work, and
-residual-load-imbalance terms, and report separately observed cold initialization
-with:
+For a complete full result containing Rapid Start, `Launch`, and all three SpMV
+families, fit the warm task-publication, useful-work, and residual-load-imbalance
+terms, and report separately observed cold initialization with:
 
 ```sh
-python3 benchmarks/scheduler_eval/model.py results/scheduler_eval/<result>
+python3 benchmarks/scheduler_eval/tools/model.py results/scheduler_eval/<result>
 ```
 
-The command adds fitted parameters, structural launch-event counts, per-case
-predictions, deterministic size-holdout errors, policy-selection regret,
-initialization amortization, and an observed-versus-predicted SpMV plot to that
-result. The
+The command adds model parameters, per-case predictions, initialization
+amortization, and an observed-versus-predicted SpMV plot to that result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
-[*Estimating Rapid Start and choosing scheduler parameters*](PERFORMANCE_MODEL.md).
+[*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).

@@ -36,12 +36,20 @@ inline eigen_thread_pool& get_eigen_pool() {
     return pool;
 }
 
-struct task : task_life {
+struct task : task_life, detail::eigen_pool::Task {
     enum : unsigned { completed = 1, worker_waiter = 2, external_waiter = 4 };
 
     std::atomic<unsigned> state{0};
     virtual ~task() = default;
     virtual void* execute() = 0;
+
+    void operator()() override {
+        execute();
+    }
+
+    void Discard() noexcept override {
+        release();
+    }
 
     void release(int n = 1) {
         if (life_release(n))
@@ -54,9 +62,7 @@ struct task : task_life {
     }
 
     void spawn() {
-        get_eigen_pool().Schedule(
-            detail::eigen_pool::MakeTask([this] { this->execute(); })
-        );
+        get_eigen_pool().Schedule(this);
     }
 
     void wait() {

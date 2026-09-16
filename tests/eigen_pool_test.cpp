@@ -8,6 +8,7 @@
 #include <chrono>
 #include <ctime>
 #include <functional>
+#include <cstdlib>
 #include <future>
 #include <memory>
 #include <thread>
@@ -126,6 +127,69 @@ struct ReentrantCancelTask final : Task {
   ThreadPool &pool;
   std::atomic<bool> &discarded;
 };
+struct MoveAwareCallable {
+  bool *moved_from;
+  bool *ran;
+
+  MoveAwareCallable(bool &moved, bool &called)
+      : moved_from(&moved), ran(&called) {}
+  MoveAwareCallable(const MoveAwareCallable &) = default;
+  MoveAwareCallable(MoveAwareCallable &&other) noexcept : ran(other.ran) {
+    *other.moved_from = true;
+    moved_from = other.moved_from;
+  }
+  void operator()() { *ran = true; }
+};
+
+TEST(EigenPool, MakeTaskCopiesLvalueCallable) {
+  bool moved_from = false;
+  bool ran = false;
+  MoveAwareCallable callable(moved_from, ran);
+  (*MakeTask(callable))();
+  EXPECT_FALSE(moved_from);
+  EXPECT_TRUE(ran);
+}
+
+TEST(EigenPoolDeathTest, UnhandledTaskExceptionFailsFast) {
+  EXPECT_EXIT({
+    std::set_terminate([] { std::_Exit(86); });
+    ThreadPool pool(1, false, false);
+    pool.Schedule(MakeTask([] { throw std::bad_alloc{}; }));
+    std::this_thread::sleep_for(2s);
+    std::_Exit(0);
+  }, testing::ExitedWithCode(86), "");
+}
+
+TEST(EigenPool, StatisticsIncludeExternalQueueFullExecution) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> started;
+  auto entered = started.get_future();
+  std::atomic<bool> release{false};
+  pool.Schedule(MakeTask([&] {
+    started.set_value();
+    while (!release.load())
+      std::this_thread::yield();
+  }));
+  entered.wait();
+  constexpr size_t count = 2048;
+  std::vector<std::atomic<unsigned>> visits(count);
+  std::atomic<size_t> completed{0};
+  for (size_t i = 0; i < count; ++i)
+    pool.Schedule(MakeTask([&, i] {
+      ++visits[i];
+      if (++completed == count)
+        pool.NotifyTaskCompletion();
+    }));
+  const auto during = pool.GetStatistics();
+  release.store(true);
+  pool.Wait([&] { return completed.load() == count; });
+  const auto after = pool.GetStatistics();
+  EXPECT_GT(during.executed, 1u);
+  EXPECT_EQ(after.scheduled, count + 1);
+  EXPECT_EQ(after.executed, count + 1);
+  for (auto &value : visits)
+    EXPECT_EQ(value.load(), 1u);
+}
 
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
@@ -183,12 +247,16 @@ TEST(EigenPool, SurvivesCreatorThreadExit) {
 
 TEST(EigenPool, NestedWaitsMakeProgressWithAllWorkersOccupied) {
   ThreadPool pool(2, false, false);
+  std::atomic<int> parents_started{0};
   std::atomic<int> parents_completed{0};
   std::promise<void> completed;
   auto result = completed.get_future();
 
   for (int i = 0; i < 2; ++i) {
     pool.Schedule(MakeTask([&] {
+      parents_started.fetch_add(1);
+      while (parents_started.load() != 2)
+        std::this_thread::yield();
       auto child_done = std::make_shared<std::atomic<bool>>(false);
       pool.Schedule(MakeTask([&, child_done] {
         child_done->store(true, std::memory_order_release);

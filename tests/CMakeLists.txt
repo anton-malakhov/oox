@@ -112,6 +112,7 @@ add_test(NAME NonThrowConsumeCompile
                  -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_test eigen_pool_test.cpp)
+  target_compile_definitions(eigen_pool_test PRIVATE OOX_EIGEN_ENABLE_STATS=1)
   target_link_libraries(eigen_pool_test PRIVATE
           ${PROJECT_NAME}::eigen
           ${OOX_GTEST_LIB})

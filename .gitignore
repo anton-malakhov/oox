@@ -37,3 +37,7 @@ cmake-build*/
 output/
 results/
 .vscode/
+
+# Retired local research checkouts; kept only to preserve existing user data.
+/thirdparty/pbbsbench/
+/thirdparty/composable-parallel-scheduler-thesis/
