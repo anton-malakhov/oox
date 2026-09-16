@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "pbbs_revision": "396a299f03c58dbe9e7604daab38a65781227b75",
+  "archive_base_url": "https://raw.githubusercontent.com/EgorkaZ/pbbsbench/396a299f03c58dbe9e7604daab38a65781227b75/testData/data/",
+  "graph_catalog": "http://deepsea.inria.fr/graph/",
+  "source_vertex_reference": "https://github.com/deepsea-inria/pasl/blob/d2147d5986866d6060b6dee562fa65df432f90b7/graph/bench/graph.ml",
+  "datasets": {
+    "chr22": {"file": "chr22.dna", "archive": "chr22.dna.bz2", "sha256": "dabd16a09fb2dd49c8468896c93344c76963a61b64a8a040f4656e8a6ca72f8e", "format": "text"},
+    "english": {"file": "etext99", "archive": "etext99.bz2", "sha256": "e3ff3ecf0d10b8169eb12431b7a9b957a3af418dff4ed7021fbaa0640901e621", "format": "text"},
+    "wikipedia-text": {"file": "wikisamp.xml", "archive": "wikisamp.xml.bz2", "sha256": "05720f3edc57deb78b657ac24273fcd310b7b262c50e01db78e3903e015a7366", "format": "text"},
+    "wikipedia250m": {"file": "wikipedia250M.txt", "archive": "wikipedia250M.txt.bz2", "sha256": "35315c6c0af4026cc4bd3f0100b68cbb3c4f71b389b6a9bdc2105f76e4288ab9", "format": "text"},
+    "angel": {"file": "angelTriangles", "archive": "angelTriangles.bz2", "sha256": "aab7dd3d5cec30c11ff9740f54b056478f4bfd4ccb8cdb7451530c375494c0e4", "format": "pbbs-triangles"},
+    "dragon": {"file": "dragonTriangles", "archive": "dragonTriangles.bz2", "sha256": "2b145889d91243e25be8a5b1a46f902fe310b846dd3d550d7e83cd453830a761", "format": "pbbs-triangles"},
+    "happy-buddha": {"file": "happyTriangles", "archive": "happyTriangles.bz2", "sha256": "76eab9eb87f8c1847a304c29e0d93a956141f284f7c14434704dea8dd0aa7436", "format": "pbbs-triangles"},
+    "livejournal": {"file": "livejournal1.adj_bin", "cid": "QmZJk9P5qodnwfKKHUa4BnCR4NyNg2NkyLbJoJJjFhSm6G", "format": "pasl-binary", "source_vertex": 0},
+    "twitter": {"file": "twitter.adj_bin", "cid": "QmW7y6EL3FtakEw9UxtqhDjkhcZVAGtqJZi5dXeKtcKCjt", "format": "pasl-binary", "source_vertex": 1},
+    "wikipedia": {"file": "wikipedia-20070206.adj_bin", "cid": "QmYi8Ga5j4zb1XWBGjR4f9WRWbQYs5BC4yARuJKtAdvG6w", "format": "pasl-binary", "source_vertex": 0},
+    "europe": {"file": "europe.adj_bin", "cid": "QmSA2tgcdKoyFWfktdQVb6AuJfsg6Se5cbBfAf878BAiEc", "format": "pasl-binary", "source_vertex": 0},
+    "w3c2": {"file": "w3c2", "format": "text", "url": "https://people.unipmn.it/manzini/lightweight/corpus/w3c2.bz2", "payload_md5": "58e8cbea57e026898356695da537c919", "checksum_source": "https://people.unipmn.it/manzini/lightweight/corpus/md5sums"}
+  }
+}

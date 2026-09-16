@@ -12,8 +12,7 @@
      (defined(HAVE_TF) && HAVE_TF) +                                      \
      (defined(HAVE_TWIST) && HAVE_TWIST) +                                \
      (defined(HAVE_FOLLY) && HAVE_FOLLY) +                                \
-     (defined(HAVE_EIGEN) && HAVE_EIGEN) +                                \
-     (defined(HAVE_EIGEN_DEMAND) && HAVE_EIGEN_DEMAND) > 1)
+     (defined(HAVE_EIGEN) && HAVE_EIGEN) > 1)
 #error "Enable exactly one OOX asynchronous backend"
 #endif
 
@@ -29,7 +28,7 @@
 #include "twist/backend.h"
 #elif HAVE_FOLLY
 #include "folly/backend.h"
-#elif HAVE_EIGEN || HAVE_EIGEN_DEMAND
+#elif HAVE_EIGEN
 #include "eigen/backend.h"
 #else
 #include "std/backend.h"

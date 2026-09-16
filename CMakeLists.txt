@@ -20,13 +20,10 @@ FetchContent_MakeAvailable(googletest)
 # build options
 option(OOX_BUILD_BENCHMARKS "Enables builds of benchmarks" ON)
 option(OOX_BUILD_TESTS "Enables builds of tests" ON)
+option(OOX_BUILD_EXAMPLES "Enables builds of examples" ON)
 option(OOX_BUILD_TWIST_TESTS "Build Twist-based concurrency tests" OFF)
 option(OOX_ENABLE_TBB "Enable TBB for threading (priority)" ON)
 option(OOX_ENABLE_EIGEN "Enable the bundled Eigen work-stealing backend" ON)
-option(OOX_ENABLE_EIGEN_DEMAND "Enable the experimental TBB-derived Eigen backend" OFF)
-if (OOX_ENABLE_EIGEN_DEMAND AND NOT OOX_ENABLE_EIGEN)
-  message(FATAL_ERROR "OOX_ENABLE_EIGEN_DEMAND requires OOX_ENABLE_EIGEN")
-endif ()
 set(OOX_EIGEN_THREADS "0" CACHE STRING
     "OOX Eigen worker count (0 uses hardware_concurrency with a fallback of 1)")
 option(OOX_LOCAL_TBB "Force local copy of TBB" OFF)
@@ -184,16 +181,6 @@ if (OOX_ENABLE_EIGEN)
   target_link_libraries(OOXEigen INTERFACE ${PROJECT_NAME} Threads::Threads)
 endif ()
 
-if (OOX_ENABLE_EIGEN_DEMAND)
-  add_library(OOXEigenDemand INTERFACE)
-  add_library(${PROJECT_NAME}::eigen_demand ALIAS OOXEigenDemand)
-  set_target_properties(OOXEigenDemand PROPERTIES EXPORT_NAME eigen_demand)
-  target_compile_definitions(OOXEigenDemand INTERFACE
-          HAVE_EIGEN_DEMAND=1
-          OOX_EIGEN_NUM_THREADS=${OOX_EIGEN_THREADS})
-  target_link_libraries(OOXEigenDemand INTERFACE ${PROJECT_NAME} Threads::Threads)
-endif ()
-
 enable_testing()
 if (OOX_BUILD_TESTS)
   add_subdirectory(tests)
@@ -202,6 +189,10 @@ endif (OOX_BUILD_TESTS)
 if (OOX_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
 endif (OOX_BUILD_BENCHMARKS)
+
+if (OOX_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif (OOX_BUILD_EXAMPLES)
 
 # -----------------------------------------------------------------------------
 # create find_package(OOX CONFIG)
@@ -215,9 +206,6 @@ set_target_properties(${PROJECT_NAME} PROPERTIES EXPORT_NAME ${PROJECT_NAME})
 set(OOX_EXPORT_TARGETS ${PROJECT_NAME})
 if (OOX_ENABLE_EIGEN)
   list(APPEND OOX_EXPORT_TARGETS OOXEigen)
-endif ()
-if (OOX_ENABLE_EIGEN_DEMAND)
-  list(APPEND OOX_EXPORT_TARGETS OOXEigenDemand)
 endif ()
 
 export(

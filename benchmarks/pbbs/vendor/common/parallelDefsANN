@@ -1,0 +1,54 @@
+ifeq (, $(shell which jemalloc-config))
+JEMALLOC =
+else
+JEMALLOCLD = $(shell jemalloc-config --libdir)
+JEMALLOC = -L$(JEMALLOCLD) -ljemalloc 
+endif
+
+CCFLAGS = -O3 -std=c++17 -march=native -DNDEBUG -I .
+CCFLAGS = -mcx16 -O3 -std=c++17 -march=native -DNDEBUG -I .
+CLFLAGS = -ldl $(JEMALLOC)
+
+OMPFLAGS = -DPARLAY_OPENMP -DOMP_MODE=$(OMP_MODE) -fopenmp=libomp
+CILKFLAGS = -DPARLAY_OPENCILK -fopencilk
+PBBFLAGS = -DHOMEGROWN -pthread
+TBBFLAGS = -DPARLAY_TBB -DTBB_MODE=$(TBB_MODE) -I $(TBB_INCLUDE)
+EIGENFLAGS = -DPARLAY_EIGEN -DEIGEN_MODE=$(EIGEN_MODE) -pthread
+TASKFLOWFLAGS = -DPARLAY_TASKFLOW -DTASKFLOW_MODE=$(TASKFLOW_MODE) -pthread
+OPENCLFLAGS = -DPARLAY_OPENCL -lOpenCL
+
+ifdef OPENMP
+CC = clang++
+CFLAGS = $(OMPFLAGS) $(CCFLAGS)
+LFLAGS = $(OMPFLAGS) $(CLFLAGS)
+
+else ifdef CILK
+CC = /opt/user/opencilk/bin/clang++
+CFLAGS = $(CILKFLAGS) $(CCFLAGS)
+LFLAGS = $(CILKFLAGS) $(CLFLAGS)
+
+else ifdef TBB_PATH
+CC = g++
+CFLAGS = $(TBBFLAGS)   $(CCFLAGS)
+LFLAGS = $(TBB_LFLAGS) $(CLFLAGS)
+
+else ifdef EIGEN
+CC = g++
+CFLAGS = $(EIGENFLAGS) $(CCFLAGS)
+LFLAGS = $(EIGENFLAGS) $(CLFLAGS)
+
+else ifdef TASKFLOW
+CC = g++
+CFLAGS = $(TASKFLOWFLAGS) $(CCFLAGS)
+LFLAGS = $(TASKFLOWFLAGS) $(CLFLAGS)
+
+else ifdef OPENCL
+CC = g++
+CFLAGS = $(OPENCLFLAGS) $(CCFLAGS)
+LFLAGS = $(OPENCLFLAGS) $(CLFLAGS)
+
+else
+CC = g++
+CFLAGS = $(PBBFLAGS) $(CCFLAGS)
+LFLAGS = $(PBBFLAGS) $(CLFLAGS)
+endif

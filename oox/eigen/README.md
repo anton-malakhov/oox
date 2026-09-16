@@ -34,5 +34,7 @@ remain in every Eigen-derived file.
 constant used by the vendored MPMC queue. Its value must be a power of two no
 greater than 128, matching the vendored aligned allocator's supported range.
 
-The opt-in [demand backend](DEMAND.md) shares this runtime and adds
-Apache-2.0 TBB-derived partitioning helpers with a separate ready-task adapter.
+## Patent work-demand ranges
+
+[ParallelForPatent](PATENT_ONLY.md) adds optional demand-driven range partitioning
+on the ordinary scheduler. It reuses the existing scheduler-evaluation workloads.
