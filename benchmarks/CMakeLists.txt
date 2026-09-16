@@ -95,23 +95,17 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
-  list(APPEND EIGEN_LOOP_MODES
-    EIGEN_STEALING_LOOP EIGEN_RAPID_LOOP EIGEN_RAPID_MAILBOX_LOOP
-    EIGEN_RAPID_LAZY_STEALING_LOOP EIGEN_RAPID_TIMESPAN_LAZY_STEALING_LOOP
-    EIGEN_PATENT_DEMAND_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
   foreach(mode IN LISTS OOX_BACKENDS)
     if("${bench}" MATCHES "loops")
       set(OOX_LOOP_MODES ${${mode}_LOOP_MODES})
-      set(OOX_LOOP_CTEST_FILTER "/64")
     else()
       set(OOX_LOOP_MODES exe)
-      set(OOX_LOOP_CTEST_FILTER ${OOX_BENCHMARK_CTEST_FILTER})
     endif()
     foreach(suffix IN LISTS OOX_LOOP_MODES)
-      set(bench_ctest_filter ${OOX_LOOP_CTEST_FILTER})
+      set(bench_ctest_filter ${OOX_BENCHMARK_CTEST_FILTER})
       if(bench STREQUAL "bench_accounts")
         set(bench_ctest_filter "^BenchAccounts/10/100000$")
       elseif(bench STREQUAL "bench_shared_var_get_heavy")
@@ -170,7 +164,6 @@ if(TBB_FOUND)
                    --benchmark_repetitions=1
                    --benchmark_min_warmup_time=0
                    --benchmark_filter=/128/16)
-  set_tests_properties(bench_taskbench_alt_failures PROPERTIES TIMEOUT 60)
 endif()
 
 if(OOX_BUILD_TASKBENCH)

@@ -26,7 +26,6 @@ void verify(ThreadPool &pool, size_t n, size_t begin, size_t grain,
   ParallelForPatent(
       pool, begin, begin + n,
       [&](size_t i) {
-        check(pool.CurrentRegionContext() == nullptr, "Rapid context entered", c);
         check(i >= begin && i < begin + n, "out of range", c);
         const auto index = i - begin;
         visits[index].fetch_add(1, std::memory_order_relaxed);
@@ -125,6 +124,57 @@ int main() {
           cases);
     done.get();
     ++cases;
+  }
+  {
+    ThreadPool pool(2, true, true);
+    std::atomic<bool> entered{false}, release{false};
+    pool.RunOnThread(MakeTask([&] {
+      entered.store(true);
+      while (!release.load())
+        std::this_thread::yield();
+    }), 1);
+    while (!entered.load())
+      std::this_thread::yield();
+    std::atomic<unsigned> callbacks{0};
+    {
+      auto body = [&](size_t) { ++callbacks; pool.Cancel(); };
+      ParallelForPatent(pool, 0, 65536, body);
+    }
+    const unsigned at_return = callbacks.load();
+    for (unsigned i = 0; i < 4; ++i)
+      pool.Wait([] { return false; });
+    release.store(true);
+    check(at_return != 0 && callbacks.load() == at_return,
+          "cancelled queued task accessed expired callback", cases++);
+  }
+  {
+    ThreadPool pool(2, true, false);
+    std::atomic<bool> entered{false}, cancelled{false}, release{false};
+    std::atomic<unsigned> visits[2]{};
+    auto run = std::async(std::launch::async, [&] {
+      ParallelForPatent(pool, 0, 2, [&](size_t i) {
+        ++visits[i];
+        if (i == 1) {
+          entered.store(true);
+          while (!release.load())
+            std::this_thread::yield();
+        } else {
+          while (!entered.load())
+            std::this_thread::yield();
+          pool.Cancel();
+          cancelled.store(true);
+        }
+      });
+    });
+    while (!cancelled.load())
+      std::this_thread::yield();
+    const bool returned_early = run.wait_for(50ms) == std::future_status::ready;
+    release.store(true);
+    check(run.wait_for(15s) == std::future_status::ready,
+          "active callback cancellation hang", cases);
+    run.get();
+    check(!returned_early && visits[0] == 1 && visits[1] == 1,
+          "operation returned before active callback", cases++);
   }
   {
     ThreadPool pool(8, true, true);

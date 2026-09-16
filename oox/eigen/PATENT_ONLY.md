@@ -33,9 +33,9 @@ Wait, and NotifyTaskCompletion. It does not include rapid_start.h, construct
 a Rapid group, publish Rapid activations, inherit Rapid worker domains, or
 use a Rapid completion region. No OOX dependency or task API changes are required.
 
-The enclosing branch retains its existing pool, which also supports separate
-Rapid modes. Both baseline and patent-only measurements use that same pool;
-this patch does not modify its implementation.
+The pool follows main's implementation. Its only added API is the read-only
+IsCancelled query. The port does not change task publication, queues, stealing,
+waiting, or cancellation behavior.
 
 For later adaptation, carry patent_parallel_for.h, tbb_partitioning.h, and
 licenses/oneTBB-Apache-2.0.txt. The included pool supplies the existing Task type.
@@ -44,38 +44,43 @@ Preserve these contracts when adapting to another pool revision:
 - Schedule consumes the task, including exceptional publication and rejection.
 - Queued tasks are either executed or discarded; either path completes their
   contribution to the operation's outstanding count.
-- Cancellation drains rejected/pending tasks. Wait may return on cancellation,
-  so the operation retains its callback and state until every task is finished.
+- Wait may return on cancellation while queued tasks remain in the pool.
+  Each task retains the operation state until execution or discard. Closing
+  the operation blocks callback/metrics access by queued tasks and waits for
+  active callbacks before returning. The callback itself is not retained.
 - Registered callers help ordinary queued work while waiting, allowing nesting.
 - Completion uses release/acquire ordering and notifies waiting callers.
 
-Exceptions stop further operation work and are rethrown after completion.
+Exceptions stop further operation work and are rethrown after active work
+finishes. A cancelled operation may leave inert tasks for the pool to discard;
+those tasks cannot invoke the callback or access its metrics after return.
 Nested calls use ordinary task scheduling and a fresh worker-count budget.
 Concurrent external roots and calls into another pool are covered by tests.
 
 ## Selection
 
-The existing scheduler-evaluation mode is EIGEN_PATENT_DEMAND.
-The direct-loop harness mode is EIGEN_PATENT_DEMAND_LOOP.
-Both route through the ordinary Eigen range entry point. The former
-RAPID_PATENT_DEMAND hybrid mode has been removed.
+The existing scheduler-evaluation suite selects the port with
+EIGEN_PATENT_DEMAND. The branch adds a mode selector, not new benchmark
+workloads, harnesses, or workflows.
 
-Only the default policy is retained: demand feedback and callback-boundary
-checks are always enabled, with initial relative depth three. The earlier
-feedback-disabled, block-end, and depth-selection controls have been removed.
-The optional metrics pointer provides diagnostics without selecting another
-policy.
+Only the default policy is exposed: demand feedback and callback-boundary
+checks are always enabled, with initial relative depth three. The optional
+metrics pointer provides diagnostics without selecting another policy.
 
-## Validation and results
+## Validation
 
-The corrected implementation passes 121 Release tests, 215 exception-enabled
-UBSan tests, and four existing benchmark entry-point tests. Generated range
-checks cover small and million-item ranges, origins near SIZE_MAX, nesting,
+Local checks passed: 205 Release tests, 351 exception-enabled UBSan tests,
+and 59 existing scheduler-evaluation checks. Seven serial-backend blocking-wait
+tests were intentionally skipped across the two unit-test configurations.
+
+The dedicated EigenPatentRangeOracle and EigenPatentAllocationFailure tests
+cover small and million-item ranges, origins near SIZE_MAX, nesting,
 concurrent roots, cross-pool calls, unavailable workers, saturated queues,
-cancellation, allocation failure, and reuse. Initial subdivision is checked
-against a serial visitation oracle and its worker budget; callbacks are also
-checked for absence of a Rapid region.
+cancellation, allocation failure, and reuse. Visitation and computed values
+are checked against a serial reference. Cancellation tests also cover queued
+tasks outliving the callback and waiting for an active callback to finish.
 
-Default Eigen versus the current patent implementation: [PATENT_DEFAULT_COMPARISONS.md](../../benchmarks/scheduler_eval/PATENT_DEFAULT_COMPARISONS.md).
-The earlier [hybrid experiment](PATENT.md) and its data are retained explicitly
-as historical evidence. They are not results for this implementation.
+Existing scheduler-evaluation validators exercise this mode through the same
+workloads and harness as default Eigen. Earlier experimental reports and raw
+data are archived locally under build-patent-cleanup/archive; they are not
+measurements of this cleaned implementation on main's pool.

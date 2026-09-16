@@ -112,7 +112,6 @@ add_test(NAME NonThrowConsumeCompile
                  -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_test eigen_pool_test.cpp)
-  target_compile_definitions(eigen_pool_test PRIVATE OOX_EIGEN_ENABLE_STATS=1)
   target_link_libraries(eigen_pool_test PRIVATE
           ${PROJECT_NAME}::eigen
           ${OOX_GTEST_LIB})
@@ -124,33 +123,15 @@ if (OOX_ENABLE_EIGEN)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
 
-  add_executable(eigen_rapid_start_test eigen_rapid_start_test.cpp)
-  target_link_libraries(eigen_rapid_start_test PRIVATE
-          ${PROJECT_NAME}::eigen
-          ${OOX_GTEST_LIB})
-  gtest_discover_tests(eigen_rapid_start_test
-          DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
-
   add_executable(eigen_patent_range_test eigen_patent_range_test.cpp)
   target_link_libraries(eigen_patent_range_test PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPatentRangeOracle COMMAND eigen_patent_range_test)
   set_tests_properties(EigenPatentRangeOracle PROPERTIES TIMEOUT 120)
+
   add_executable(eigen_patent_allocation_test eigen_patent_allocation_test.cpp)
   target_link_libraries(eigen_patent_allocation_test PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPatentAllocationFailure COMMAND eigen_patent_allocation_test)
   set_tests_properties(EigenPatentAllocationFailure PROPERTIES TIMEOUT 60)
-
-  # Standalone (no gtest) policy-matrix checks. These run every GrainLaw x
-  # VictimPolicy combination and were validated under TSan/ASan/UBSan on Linux.
-  add_executable(policy_matrix_check policy_matrix_check.cpp)
-  target_link_libraries(policy_matrix_check PRIVATE ${PROJECT_NAME}::eigen)
-  add_test(NAME EigenRapidPolicyMatrix COMMAND policy_matrix_check)
-  set_tests_properties(EigenRapidPolicyMatrix PROPERTIES TIMEOUT 600)
-
-  add_executable(wake_check wake_check.cpp)
-  target_link_libraries(wake_check PRIVATE ${PROJECT_NAME}::eigen)
-  add_test(NAME EigenBatchedWakeCount COMMAND wake_check)
 
   find_package(Eigen3 3.4 QUIET NO_MODULE)
   if (TARGET Eigen3::Eigen)

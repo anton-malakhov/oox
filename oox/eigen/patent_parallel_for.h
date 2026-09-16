@@ -3,12 +3,14 @@
 #include "nonblocking_thread_pool.h"
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include "tbb_partitioning.h"
 
 namespace oox::detail::eigen_pool {
 namespace patent_detail {
 
 inline constexpr unsigned initial_depth = 3;
+inline constexpr unsigned max_depth = std::numeric_limits<size_t>::digits;
 
 struct Metrics {
   std::atomic<size_t> owner_ranges{0};
@@ -26,16 +28,40 @@ public:
       : pool(pool), metrics(metrics) {}
   void AddTask() noexcept { remaining.fetch_add(1, std::memory_order_relaxed); }
   void TaskComplete() noexcept {
-    // Copy notification state before publishing completion. The caller may
-    // destroy the region as soon as it observes complete=true.
+    // The caller and each published task own one reference. Copy the pool
+    // before releasing: observing completion may let the caller release too.
     ThreadPool *saved_pool = &pool;
-    if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      complete.store(true, std::memory_order_release);
+    const size_t previous = remaining.fetch_sub(1, std::memory_order_acq_rel);
+    if (previous == 1)
+      delete this;
+    else if (previous == 2)
       saved_pool->NotifyTaskCompletion();
-    }
   }
   bool IsComplete() const noexcept {
-    return complete.load(std::memory_order_acquire);
+    return remaining.load(std::memory_order_acquire) == 1;
+  }
+  bool BeginWork() noexcept {
+    if (IsCancelled())
+      return false;
+    size_t state = active.load(std::memory_order_relaxed);
+    while (!(state & closed)) {
+      if (active.compare_exchange_weak(state, state + 1,
+                                       std::memory_order_acquire,
+                                       std::memory_order_relaxed))
+        return true;
+    }
+    return false;
+  }
+  void EndWork() noexcept {
+    if (active.fetch_sub(1, std::memory_order_acq_rel) == closed + 1)
+      active.notify_all();
+  }
+  void CloseAndWait() noexcept {
+    size_t state = active.fetch_or(closed, std::memory_order_acq_rel) | closed;
+    while (state != closed) {
+      active.wait(state, std::memory_order_acquire);
+      state = active.load(std::memory_order_acquire);
+    }
   }
   bool IsCancelled() const noexcept {
     return cancelled.load(std::memory_order_relaxed) || pool.IsCancelled();
@@ -56,10 +82,30 @@ public:
 
 private:
   std::atomic<size_t> remaining{1};
-  std::atomic<bool> complete{false};
+  static constexpr size_t closed = size_t{1} << (max_depth - 1);
+  std::atomic<size_t> active{0};
   std::atomic<bool> cancelled{false};
   std::mutex error_mutex;
   std::exception_ptr exception;
+};
+
+// Closing prevents queued tasks from accessing the callback or metrics after
+// return. Running callbacks finish before CloseAndWait releases the caller.
+class WorkLease {
+public:
+  explicit WorkLease(Region &region) noexcept
+      : region_(region), acquired_(region.BeginWork()) {}
+  WorkLease(const WorkLease &) = delete;
+  WorkLease &operator=(const WorkLease &) = delete;
+  ~WorkLease() {
+    if (acquired_)
+      region_.EndWork();
+  }
+  explicit operator bool() const noexcept { return acquired_; }
+
+private:
+  Region &region_;
+  const bool acquired_;
 };
 
 struct LoopRange {
@@ -100,12 +146,13 @@ public:
     region_.TaskComplete();
   }
   void operator()() final {
-    if (std::this_thread::get_id() != owner_) {
+    std::unique_ptr<Probe> self(this);
+    WorkLease work(region_);
+    if (work && std::this_thread::get_id() != owner_) {
       signal_.demand.store(true, std::memory_order_release);
       if (region_.metrics)
         region_.metrics->stolen_signals.fetch_add(1, std::memory_order_relaxed);
     }
-    delete this;
   }
   void Discard() noexcept final { delete this; }
 
@@ -125,12 +172,12 @@ inline void Arm(Region &region, Signal &signal) {
 }
 
 template <typename F>
-void Process(Region &, F &, LoopRange, size_t) noexcept;
+void Process(Region &, F *, LoopRange, size_t) noexcept;
 
 template <typename F>
 class Work final : public Task {
 public:
-  Work(Region &region, F &function, LoopRange range, size_t budget) noexcept
+  Work(Region &region, F *function, LoopRange range, size_t budget) noexcept
       : region_(region), function_(function), range_(range), budget_(budget) {
     region_.AddTask();
     if (region_.metrics)
@@ -145,7 +192,7 @@ public:
 
 private:
   Region &region_;
-  F &function_;
+  F *function_;
   LoopRange range_;
   size_t budget_;
 };
@@ -161,8 +208,11 @@ struct OwnerSignal {
 // The range pool belongs exclusively to this running invocation. A stolen
 // probe requests work; only this owner removes and publishes its FIFO range.
 template <typename F>
-void Process(Region &region, F &function, LoopRange range,
+void Process(Region &region, F *function, LoopRange range,
              size_t budget) noexcept {
+  WorkLease work(region);
+  if (!work)
+    return;
   OwnerSignal signal;
   size_t chunks = 0;
   try {
@@ -201,7 +251,7 @@ void Process(Region &region, F &function, LoopRange range,
             signal.value->demand.load(std::memory_order_relaxed))
           break;
         const size_t index = current.begin++;
-        std::invoke(function, index);
+        std::invoke(*function, index);
       }
       if (current.begin != first)
         ++chunks;
@@ -209,7 +259,7 @@ void Process(Region &region, F &function, LoopRange range,
         ranges.PopBack();
       if (signal.value && !ranges.Empty() && !region.IsCancelled()) {
         if (signal.value->demand.exchange(false, std::memory_order_acq_rel)) {
-          if (limit < partitioning::AutoPartition::max_depth)
+          if (limit < max_depth)
             ++limit;
           if (ranges.Size() > 1) {
             auto child = std::make_unique<Work<F>>(
@@ -256,14 +306,17 @@ void ParallelForPatent(ThreadPool &pool, size_t begin, size_t end,
   }
   const size_t budget =
       std::min(pool.NumThreads(), (end - begin - 1) / grain + 1);
-  patent_detail::Region region(pool, metrics);
-  patent_detail::Process(region, function, {begin, end, grain}, budget);
-  region.TaskComplete();
-  // Wait may return early on pool cancellation. Published tasks still own
-  // references to the callback and region, so retain both until all tasks
-  // have either completed or been discarded by the pool.
-  while (!region.IsComplete())
-    pool.Wait([&] { return region.IsComplete(); });
-  region.Rethrow();
+  const auto release = [](patent_detail::Region *region) {
+    region->TaskComplete();
+  };
+  std::unique_ptr<patent_detail::Region, decltype(release)> region(
+      new patent_detail::Region(pool, metrics), release);
+  patent_detail::Process(*region, std::addressof(function), {begin, end, grain},
+                        budget);
+  pool.Wait([&] { return region->IsComplete(); });
+  // Main's pool may retain cancelled queued tasks until destruction. They
+  // keep the region alive, but closing forbids further callback/metrics access.
+  region->CloseAndWait();
+  region->Rethrow();
 }
 } // namespace oox::detail::eigen_pool
