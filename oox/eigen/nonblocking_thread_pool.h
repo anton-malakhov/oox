@@ -286,6 +286,10 @@ public:
     auto &event = registered ? worker_event_ : waiter_event_;
 
     while (!ready()) {
+      // Help before registering; the second check below prevents lost wakeups.
+      if (registered && TryExecuteOne()) {
+        continue;
+      }
       const uint64_t token = event.PrepareWait();
       if (registered && TryExecuteOne()) {
         event.CancelWait();

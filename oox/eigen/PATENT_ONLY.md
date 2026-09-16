@@ -33,9 +33,10 @@ Wait, and NotifyTaskCompletion. It does not include rapid_start.h, construct
 a Rapid group, publish Rapid activations, inherit Rapid worker domains, or
 use a Rapid completion region. No OOX dependency or task API changes are required.
 
-The pool follows main's implementation. Its only added API is the read-only
-IsCancelled query. The port does not change task publication, queues, stealing,
-waiting, or cancellation behavior.
+The pool follows main's task publication, queues, stealing, and cancellation
+behavior. Its only added API is the read-only IsCancelled query. Registered
+callers of Wait try helping before registering as waiters. If no task is
+available, they retain the registration, recheck, and parking protocol.
 
 For later adaptation, carry patent_parallel_for.h, tbb_partitioning.h, and
 licenses/oneTBB-Apache-2.0.txt. The included pool supplies the existing Task type.
