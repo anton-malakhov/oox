@@ -66,7 +66,8 @@ Key properties of the model:
 - **Waiting is a graph edge**: blocking waits (`get()`/`wait()` on
   `shared_var`) register a waiter node into the graph's lock-free arc queue
   and block on the *pool's own* native mechanism (TBB `wait_context`,
-  `std::future`, ...) — worker threads never wait on foreign primitives
+  the Eigen pool's own worker wait, `std::future`, or C++20 `std::atomic`
+  wait/notify for external threads) — worker threads never wait on foreign primitives
   (no condition variables, no spin loops in the library).
 - **Clear serialization semantics**: writers chained onto the same `var` /
   `shared_var` are serialized; readers run in parallel.
@@ -152,12 +153,27 @@ Key properties of the model:
 
 ### 2.4 Backends
 
-The same library compiles against several execution backends, selected at
-build time (priority order): **TBB** (default, recommended), **TaskFlow**,
-**Folly fibers**, **OpenMP** (comparison), **Twist** (deterministic testing),
-**std** (`std::async`, thread-per-task), and **serial** (debug). All
-semantics are backend-independent; waits are always performed through the
-backend's own native mechanism.
+The same library compiles against exactly one execution backend selected at
+build time: outside serial-debug builds, enabling more than one
+asynchronous backend macro is a compile error (selecting by incidental
+preprocessor order would make consumer behavior non-portable). The
+`oox/backends/select.h` priority chain runs through **OpenMP**, **TBB**
+(recommended), **TaskFlow**, **Twist** (deterministic testing),
+**Folly fibers**, and the bundled **Eigen** work-stealing scheduler, and
+falls back to **std** (`std::async`, thread-per-task) when no macro is
+defined; `OOX_SERIAL_DEBUG` intentionally overrides everything to the
+**serial** debug backend. All semantics are backend-independent; waits are
+always performed through the backend's own native mechanism.
+
+The **Eigen** backend is bundled (no external dependency): OOX's private
+scheduler port, all symbols in `oox::detail::eigen_pool`, selected through
+the `OOX::eigen` target (`HAVE_EIGEN=1`). Workers briefly spin only when
+requested, then park with C++20 atomic wait/notify; the wait path is the
+pool's own mechanism (`pool.Wait` for pooled workers, C++20 `std::atomic`
+wait/notify for external threads). The worker count comes from
+`OOX_EIGEN_THREADS` (CMake; `0` = `std::thread::hardware_concurrency()`,
+one-worker fallback) or `OOX_EIGEN_NUM_THREADS` (headers-only builds).
+Provenance, OOX additions, and per-file licenses: `oox/eigen/README.md`.
 
 ### 2.5 Storage rules and dynamic dependencies
 
@@ -241,8 +257,10 @@ compile time even when exception machinery is disabled.
 
 ## 4. Build
 
-Requirements: CMake ≥ 3.14, a C++20 compiler, GTest, Google Benchmark,
-optionally TBB / TaskFlow / Folly / OpenMP / Twist.
+Requirements: CMake ≥ 3.18, a C++20 compiler, GTest and Google Benchmark
+(both fetched via FetchContent when not installed), and optionally TBB /
+TaskFlow / Folly / OpenMP / Twist for the corresponding backends. The
+**Eigen** backend is bundled — no external dependency.
 
 ```sh
 make            # release build + tests + bench_fib (TBB allocator)
@@ -255,6 +273,11 @@ CMake options (root `CMakeLists.txt`):
 
 - `OOX_BUILD_TESTS` (ON), `OOX_BUILD_BENCHMARKS` (ON),
   `OOX_BUILD_EXAMPLES` (ON);
+- `OOX_ENABLE_EIGEN` (ON) — build the bundled Eigen work-stealing backend
+  (target `OOX::eigen`; defines `HAVE_EIGEN=1`, links `OOX::OOX` +
+  `Threads::Threads`); `OOX_EIGEN_THREADS` fixes the worker count
+  (`0` = `std::thread::hardware_concurrency()`, one-worker fallback;
+  headers-only builds use `OOX_EIGEN_NUM_THREADS`);
 - `OOX_ENABLE_TBB` (ON), `OOX_ENABLE_TF` (ON), `OOX_ENABLE_FOLLY` (ON),
   `OOX_ENABLE_OMP` (ON) — enable/disable backends
   (`OOX_LOCAL_*` force fetching a local copy);
@@ -272,7 +295,18 @@ Twist-based builds require a Clang compiler (the fetched `sure` library uses
 ## 5. Testing
 
 - **Unit tests** (`tests/test_oox.cpp`, `tests/test_shared_var.cpp`) — gtest,
-  built per backend (std/serial/tbb/tf).
+  built per backend: `test_*` (std), `test_*_serial`, `test_*_tbb` (when
+  TBB is found), `test_*_eigen` (when `OOX_ENABLE_EIGEN`, links
+  `OOX::eigen`), and `test_*_tf` (when TaskFlow is found);
+- **Eigen pool tests** (when `OOX_ENABLE_EIGEN`) — `eigen_pool_test`
+  (`MakeTask` copy/move, fail-fast on an unhandled task exception,
+  rejection of non-positive thread counts, single-worker submission),
+  `eigen_pool_instantiation`, and `eigen_include_oox_first` /
+  `eigen_include_upstream_first` (coexistence with upstream Eigen 3.4 in
+  either include order);
+- **Compile-policy tests** — `NonThrowConsumeCompile` and
+  `NestedCMakePreservesListValues` (always built), plus
+  `ExceptionPolicyCompile` when `OOX_EXCEPTIONS_ENABLED=ON`;
 - **Twist tests** (`tests/twist/`) — deterministic concurrency testing:
   - `twist-fault` — real threads + fault injection, randomized seeds;
   - `twist-sim` — full state-space exploration (RandomSeeds; DFS requires
@@ -285,34 +319,69 @@ Twist-based builds require a Clang compiler (the fetched `sure` library uses
 
 ## 6. Benchmarks
 
-`benchmarks/` (Google Benchmark; `bench_*_TBB.exe` variants per backend):
+`benchmarks/` (Google Benchmark; one target per mode, e.g.
+`bench_fib_TBB.exe`, `bench_loops_TBB.TBB_SIMPLE`, plus
+`bench_fib_<MODE>_noexc`/`_exc` exception-policy variants):
 
-- `bench_fib`, `bench_loops`, `bench_accessing`, `bench_accounts` — classic
-  patterns (Fibonacci, loop parallelism, task access, account transfers);
+- `bench_fib`, `bench_loops`, `bench_accounts` — classic patterns
+  (Fibonacci, loop parallelism, account transfers);
 - `bench_shared_var_get_heavy` — concurrent `get()` + writer registration on
   one shared_var (the wait-path pattern);
-- `bench_taskbench` — TaskBench-style kernels with per-backend runners
-  (oox/serial/openmp/tbb/taskflow/folly).
+- `bench_taskbench` (`OOX_BUILD_TASKBENCH=ON`) — TaskBench-style kernels with
+  per-mode runners (oox/serial/tbb-flow/taskflow/openmp/folly);
+- `bench_taskbench_alt_failures` — additional failure-path benchmark
+  (TBB only);
+- `benchmarks/scheduler_eval/` (`OOX_BUILD_SCHEDULER_EVALS=OFF`) — native
+  scheduler evaluations of Rapid Start, Launch, and SpMV workloads across
+  the OOX Eigen modes and the reference Eigen schedulers (driver `run.py`);
+- `benchmarks/pbbs/` — the PBBS application suite reproduced from the pinned
+  `EgorkaZ/pbbsbench` `eigen-mailbox` snapshot (commit `396a299`): the
+  original serial baselines, OOX's `oox::run`/`oox::var` port, the OOX
+  Eigen port (modes `EIGEN_STEALING`, `EIGEN_SHARING`,
+  `EIGEN_STEALING_GRAINSIZE`, `EIGEN_SHARING_STEALING`), and the untouched
+  historical Eigen plugin for reference (driver `run.py`).
 
 ## 7. Examples
 
 - `examples/accounts.cpp` — the shared_var showcase: an array of
   `shared_var<account>`, 100 000 random point transfers between accounts,
-  per-account writer serialization, total conservation check.
-- `examples/fibonacci.h`, `examples/filesystem.h`, `examples/wavefront.h` —
-  example patterns compiled into `test_oox`.
+  per-account writer serialization, total conservation check (also built as
+  the `accounts_example` executable);
+- `examples/fibonacci.h` — the Fibonacci recursion in three styles (serial,
+  concise OOX, task-order-optimized OOX);
+- `examples/filesystem.h` — recursive `disk_usage` over a tree (a simple
+  serialized-writer version, plus a TBB `concurrent_vector` anti-dependence
+  variant);
+- `examples/wavefront.h` — the wavefront LCS dynamic program (serial and
+  straight OOX versions).
 
 ## 8. Directory layout
 
-- `oox/oox.h` — the core library (graph, var, run, backends);
+- `oox/oox.h` — the core library (graph, `var`, `run`);
 - `oox/shared_var.h` — the shared_var layer (waiter-based waits,
   multi-state registration);
-- `tests/`, `tests/twist/` — gtest and Twist suites;
-- `benchmarks/`, `benchmarks/taskbench/` — Google Benchmark suites;
-- `examples/` — examples;
-- `scripts/run_benchmarks.py` — benchmark driver;
-- `thirdparty/` — vendored/fetched dependencies (TBB, TaskFlow, Folly,
-  fast_float, oneTBB);
+- `oox/backends/` — per-backend adapters (`select.h` plus `std`, `serial`,
+  `openmp`, `tbb`, `taskflow`, `twist`, `folly`, and `eigen`);
+- `oox/eigen/` — the vendored Eigen-derived work-stealing scheduler
+  (namespace `oox::detail::eigen_pool`; provenance and licenses in
+  `oox/eigen/README.md`);
+- `tests/` — gtest suites, compile-policy cases, and the CMake consumer
+  project; `tests/twist/` — the Twist deterministic-testing suite;
+- `benchmarks/` — the classic Google Benchmark binaries;
+- `benchmarks/eigen/` — the experimental parallel-for layer on top of the
+  Eigen pool (used by the PBBS and scheduler-eval drivers);
+- `benchmarks/taskbench/` — TaskBench-style kernels with per-mode runners;
+- `benchmarks/scheduler_eval/` — the native scheduler-evaluation suite
+  (driver `run.py`);
+- `benchmarks/pbbs/` — the pinned PBBS application reproduction
+  (driver `run.py`, vendored sources under `vendor/`);
+- `examples/` — example patterns (plus the built `accounts_example`
+  executable);
+- `scripts/` — benchmark drivers and branch comparisons;
+- `research/egorkaz-eigen-mailbox/` — the archived `EgorkaZ/pbbsbench`
+  mailbox-scheduler snapshot (reference material, not built by CMake);
+- `thirdparty/` — fetched optional dependencies (oneTBB, TaskFlow, Folly,
+  fast_float);
 - `docs/` — this documentation.
 
 ## 9. Design documents
@@ -320,6 +389,9 @@ Twist-based builds require a Clang compiler (the fetched `sure` library uses
 - `docs/design-shared-var.md` — the thread-safe shared handle design
   (thick-handle architecture, atomic multi-state registration,
   waiter-as-graph-edge waits, deferred/forwarding semantics).
+- `oox/eigen/README.md` — provenance, OOX additions (guarded overflow
+  queue, C++20 atomic wait/notify parking), and per-file licenses of the
+  vendored Eigen-derived scheduler.
 
 
 ## 10. References
@@ -327,3 +399,8 @@ Twist-based builds require a Clang compiler (the fetched `sure` library uses
 - A. Malakhov, "OOX 2.0: Out of order execution made easy", Intel corporate
   blog, 2021 — the original proposal this project implements:
   <https://habr.com/en/company/intel/blog/542908/>.
+- The Eigen-derived work-stealing scheduler vendored in `oox/eigen/`
+  originates from the `eigen-mailbox` experiment in
+  [`EgorkaZ/pbbsbench`](https://github.com/EgorkaZ/pbbsbench), pinned at
+  commit `396a299f03c58dbe9e7604daab38a65781227b75`
+  <https://github.com/EgorkaZ/pbbsbench/tree/396a299f03c58dbe9e7604daab38a65781227b75/parlaylib/include/parlay/internal/scheduler_plugins/eigen>.

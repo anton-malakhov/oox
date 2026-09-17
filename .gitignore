@@ -37,6 +37,7 @@ cmake-build*/
 output/
 results/
 .vscode/
+.codewhale/
 
 # Retired local research checkouts; kept only to preserve existing user data.
 /thirdparty/pbbsbench/
