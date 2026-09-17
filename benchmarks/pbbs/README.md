@@ -60,7 +60,10 @@ Without an explicit backend, the driver runs OOX. Select both backends explicitl
 to compare them. Their mode names differ: the reference uses `EIGEN_SIMPLE`, `EIGEN_TIMESPAN`,
 `EIGEN_TIMESPAN_GRAINSIZE`, `EIGEN_STATIC`, and `EIGEN_RAPID`; OOX uses
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
-`EIGEN_SHARING_STEALING`. Therefore `--mode` requires one `--backend`.
+`EIGEN_SHARING_STEALING`, plus `EIGEN_AUTO`, `EIGEN_SIMPLE`, `EIGEN_STATIC`,
+and `EIGEN_AFFINITY` from the oneTBB partitioner port. Names shared with the
+historical reference select different implementations in the two backends.
+Therefore `--mode` requires one `--backend`.
 
 The historical reference targets Linux. It builds on macOS with the affinity
 shim, but its original scheduler can stall there; use Linux for reference data.

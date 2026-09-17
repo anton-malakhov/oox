@@ -123,8 +123,10 @@ ctest --test-dir build-eval -L scheduler-eval --output-on-failure
 
 CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_STEALING`, `EIGEN_SHARING`, `EIGEN_STEALING_GRAINSIZE`, and
-`EIGEN_SHARING_STEALING`. TBB contributes simple, automatic, and affinity
-partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
+`EIGEN_SHARING_STEALING`, plus the oneTBB-derived `EIGEN_AUTO`,
+`EIGEN_SIMPLE`, `EIGEN_STATIC`, and `EIGEN_AFFINITY` range policies.
+See [the partitioner API and placement semantics](../../oox/eigen/PARTITIONERS.md).
+TBB contributes simple, automatic, static, and affinity partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
 `RAPID_START` waits for every requested trapper task to register before its
@@ -162,6 +164,17 @@ suite and its JSON-to-report smoke test run only in an explicit opt-in build.
 | First touch | Serial versus parallel page initialization before parallel reads |
 | Matrix multiply | Nested parallel regions with substantial inner work |
 | Matrix transpose | Nested tiled regions with short inner tasks |
+| Deep nested loops | Fixed 65,536 elements through 2/4/8/16 nested fork/join levels |
+
+DeepNested fixes the element count independently of depth and worker count.
+Its arguments are depth, fanout, and work per element: fanout 4 with one mixing
+step at depths 2/4/8, and fanout 2 with 64 steps at depths 2/4/8/16. Outer levels
+branch by fanout; the innermost loop spans all remaining elements. Every level
+calls and joins the selected backend with grain 1. Compare depths within one
+fanout/work profile to keep
+useful work fixed. The existing nested validator checks exact visitation and
+values against a flat serial oracle, including empty ranges, uneven splits,
+large origins, and the benchmark tree shapes.
 
 Inputs are deterministic and construction and validation stay outside measured
 regions. A full SpMV run intentionally has the same large scale as the research

@@ -34,7 +34,8 @@ remain in every Eigen-derived file.
 constant used by the vendored MPMC queue. Its value must be a power of two no
 greater than 128, matching the vendored aligned allocator's supported range.
 
-## Patent work-demand ranges
+## Range partitioners
 
-[ParallelForPatent](PATENT_ONLY.md) adds optional demand-driven range partitioning
-on the ordinary scheduler. It reuses the existing scheduler-evaluation workloads.
+[ParallelFor and partitioners](PARTITIONERS.md) provide auto, simple, static,
+and affinity policies adapted from oneTBB on the ordinary scheduler. They reuse
+the existing scheduler-evaluation workloads.

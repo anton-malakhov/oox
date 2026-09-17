@@ -119,19 +119,44 @@ if (OOX_ENABLE_EIGEN)
           DISCOVERY_MODE PRE_TEST
           DISCOVERY_TIMEOUT 30)
 
+  add_executable(eigen_small_object_pool_test eigen_small_object_pool_test.cpp)
+  target_link_libraries(eigen_small_object_pool_test PRIVATE
+          ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_small_object_pool_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL_TESTING=1)
+  gtest_discover_tests(eigen_small_object_pool_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30)
+
   add_executable(eigen_pool_instantiation eigen_pool_instantiation.cpp)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
 
-  add_executable(eigen_patent_range_test eigen_patent_range_test.cpp)
-  target_link_libraries(eigen_patent_range_test PRIVATE ${PROJECT_NAME}::eigen)
-  add_test(NAME EigenPatentRangeOracle COMMAND eigen_patent_range_test)
-  set_tests_properties(EigenPatentRangeOracle PROPERTIES TIMEOUT 120)
+  add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
+  target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)
 
-  add_executable(eigen_patent_allocation_test eigen_patent_allocation_test.cpp)
-  target_link_libraries(eigen_patent_allocation_test PRIVATE ${PROJECT_NAME}::eigen)
-  add_test(NAME EigenPatentAllocationFailure COMMAND eigen_patent_allocation_test)
-  set_tests_properties(EigenPatentAllocationFailure PROPERTIES TIMEOUT 60)
+  add_executable(eigen_partitioner_allocation_test eigen_partitioner_allocation_test.cpp)
+  target_link_libraries(eigen_partitioner_allocation_test PRIVATE ${PROJECT_NAME}::eigen)
+  # Inject failures at every allocation request, including warm-cache calls.
+  target_compile_definitions(eigen_partitioner_allocation_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL=0)
+  add_executable(eigen_partitioner_lifetime_test eigen_partitioner_lifetime_test.cpp)
+  target_link_libraries(eigen_partitioner_lifetime_test PRIVATE ${PROJECT_NAME}::eigen)
+  # Observe actual Region reclamation rather than retention in the object cache.
+  target_compile_definitions(eigen_partitioner_lifetime_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL=0)
+  add_test(NAME EigenPartitionerLifetimeOracle COMMAND eigen_partitioner_lifetime_test)
+
+  foreach (partitioner IN ITEMS auto simple static affinity)
+    add_test(NAME EigenPartitionerRangeOracle_${partitioner}
+             COMMAND eigen_partitioner_range_test ${partitioner})
+    add_test(NAME EigenPartitionerAllocationFailure_${partitioner}
+             COMMAND eigen_partitioner_allocation_test ${partitioner})
+    set_tests_properties(EigenPartitionerRangeOracle_${partitioner}
+                         PROPERTIES TIMEOUT 120)
+    set_tests_properties(EigenPartitionerAllocationFailure_${partitioner}
+                         PROPERTIES TIMEOUT 60)
+  endforeach ()
 
   find_package(Eigen3 3.4 QUIET NO_MODULE)
   if (TARGET Eigen3::Eigen)
