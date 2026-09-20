@@ -276,6 +276,107 @@ TEST(EigenPool, CancellationWakesParkedWorkers) {
   pool.Cancel();
 }
 
+TEST(EigenPool, MakeTaskSupportsPolymorphicDeletion) {
+  auto token = std::make_shared<int>(17);
+  std::weak_ptr<int> lifetime = token;
+  std::unique_ptr<oox::detail::eigen_pool::Task> task(
+      MakeTask([token] {}));
+  token.reset();
+  EXPECT_FALSE(lifetime.expired());
+  task.reset();
+  EXPECT_TRUE(lifetime.expired());
+
+  struct alignas(128) Payload {
+    std::shared_ptr<int> token;
+    char padding[512]{};
+  };
+  token = std::make_shared<int>(23);
+  lifetime = token;
+  Payload payload{token};
+  task.reset(MakeTask([payload = std::move(payload)] {}));
+  token.reset();
+  EXPECT_FALSE(lifetime.expired());
+  task.reset();
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(EigenPool, AffinitySenderDrainsWhileRecipientIsBlocked) {
+  constexpr size_t count = 65537;
+  std::vector<std::atomic<unsigned>> visits(count);
+  {
+    std::atomic<bool> entered{false}, released{false};
+    ThreadPool pool(2, false, true);
+    pool.RunOnThread(MakeTask([&] {
+      entered.store(true, std::memory_order_release);
+      entered.notify_one();
+      released.wait(false, std::memory_order_acquire);
+    }), 1);
+    entered.wait(false, std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+      pool.ScheduleWithAffinity(MakeTask([&, i] {
+        visits[i].fetch_add(1, std::memory_order_release);
+        pool.NotifyTaskCompletion();
+      }), 1);
+      pool.Wait([&] { return visits[i].load(std::memory_order_acquire) != 0; });
+    }
+    released.store(true, std::memory_order_release);
+    released.notify_one();
+  }
+  for (size_t i = 0; i < count; ++i)
+    EXPECT_EQ(visits[i].load(), 1u) << "case=blocked-recipient item=" << i;
+}
+
+TEST(EigenPool, AffinityRecipientWinsAndSenderEntriesRemainSafe) {
+  constexpr size_t count = 65537;
+  std::vector<std::atomic<unsigned>> visits(count);
+  {
+    std::atomic<size_t> completed{0};
+    std::promise<void> done;
+    auto result = done.get_future();
+    ThreadPool pool(2, false, true);
+    for (size_t i = 0; i < count; ++i)
+      pool.ScheduleWithAffinity(MakeTask([&, i] {
+        visits[i].fetch_add(1, std::memory_order_relaxed);
+        if (completed.fetch_add(1, std::memory_order_acq_rel) + 1 == count)
+          done.set_value();
+      }), 1);
+    EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
+    // Destruction drains already-claimed sender entries, including overflow.
+  }
+  for (size_t i = 0; i < count; ++i)
+    EXPECT_EQ(visits[i].load(), 1u) << "case=recipient-wins item=" << i;
+}
+
+TEST(EigenPool, AffinityCancellationDiscardsEachUsefulTaskOnce) {
+  struct CountedTask : oox::detail::eigen_pool::Task {
+    CountedTask(std::atomic<size_t> &ran, std::atomic<size_t> &destroyed)
+        : ran(ran), destroyed(destroyed) {}
+    ~CountedTask() override { destroyed.fetch_add(1); }
+    void operator()() override { ran.fetch_add(1); delete this; }
+    std::atomic<size_t> &ran;
+    std::atomic<size_t> &destroyed;
+  };
+  constexpr size_t count = 4097;
+  std::atomic<size_t> ran{0}, destroyed{0};
+  {
+    std::atomic<bool> entered{false}, released{false};
+    ThreadPool pool(2, false, true);
+    pool.RunOnThread(MakeTask([&] {
+      entered.store(true, std::memory_order_release);
+      entered.notify_one();
+      released.wait(false, std::memory_order_acquire);
+    }), 1);
+    entered.wait(false, std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i)
+      pool.ScheduleWithAffinity(new CountedTask(ran, destroyed), 1);
+    pool.Cancel();
+    released.store(true, std::memory_order_release);
+    released.notify_one();
+  }
+  EXPECT_EQ(ran.load(), 0u);
+  EXPECT_EQ(destroyed.load(), count);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {

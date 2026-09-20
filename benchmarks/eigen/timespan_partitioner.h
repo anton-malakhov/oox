@@ -7,6 +7,10 @@
 #include "modes.h"
 #include "num_threads.h"
 #include "oox/eigen/stack_depth.h"
+#if EIGEN_MODE == EIGEN_AUTO || EIGEN_MODE == EIGEN_SIMPLE || \
+    EIGEN_MODE == EIGEN_STATIC || EIGEN_MODE == EIGEN_AFFINITY
+#include "oox/eigen/parallel_for.h"
+#endif
 #include "thread_index.h"
 #include "util.h"
 
@@ -95,7 +99,7 @@ struct Task {
   using Func = std::decay_t<F>;
 
   static inline const uint64_t INIT_TIME = [] {
-  // should be calculated using timespan_tuner with EIGEN_SIMPLE
+  // should be calculated using timespan_tuner with EIGEN_STEALING
   // currently 0.99 percentile for maximums is used: 99% of iterations should
   // fit scheduling in timespan
 #if defined(__x86_64__)
@@ -338,7 +342,22 @@ void ParallelFor(size_t from, size_t to, F&& func, size_t grainsize) {
 template <typename Func>
 void ParallelFor(size_t from, size_t to, Func&& func, size_t grainsize = 1) {
   grainsize = std::max(grainsize, size_t{1});
+#if EIGEN_MODE == EIGEN_AUTO
+  const oox::detail::eigen_pool::AutoPartitioner part;
+#elif EIGEN_MODE == EIGEN_SIMPLE
+  const oox::detail::eigen_pool::SimplePartitioner part;
+#elif EIGEN_MODE == EIGEN_STATIC
+  const oox::detail::eigen_pool::StaticPartitioner part;
+#elif EIGEN_MODE == EIGEN_AFFINITY
+  static oox::detail::eigen_pool::AffinityPartitioner part;
+#endif
+#if EIGEN_MODE == EIGEN_AUTO || EIGEN_MODE == EIGEN_SIMPLE || \
+    EIGEN_MODE == EIGEN_STATIC || EIGEN_MODE == EIGEN_AFFINITY
+  return oox::detail::eigen_pool::ParallelFor(
+      EigenPool(), from, to, std::forward<Func>(func), part, grainsize);
+#else
   return ParallelFor<EIGEN_MODE>(from, to, std::forward<Func>(func), grainsize);
+#endif
 }
 
 } // namespace EigenPartitioner

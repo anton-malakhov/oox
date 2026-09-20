@@ -25,6 +25,31 @@ struct DenseMatrix {
   std::vector<double> values;
 };
 
+// Outer levels branch by fanout; the innermost loop covers every remaining item.
+template <typename F>
+void DeepNestedFor(std::size_t begin, std::size_t end, std::size_t depth,
+                   std::size_t fanout, const F &body) {
+  assert(fanout > 0);
+  if (begin >= end)
+    return;
+  if (depth == 0) {
+    for (auto i = begin; i < end; ++i)
+      body(i);
+    return;
+  }
+  const auto children = depth == 1 ? end - begin : std::min(fanout, end - begin);
+  const auto block = (end - begin) / children;
+  const auto extra = (end - begin) % children;
+  EvalParallelFor(
+      0, children,
+      [&](std::size_t child) {
+        const auto first = begin + child * block + std::min(child, extra);
+        DeepNestedFor(first, first + block + (child < extra), depth - 1, fanout,
+                      body);
+      },
+      1);
+}
+
 inline void Multiply(const DenseMatrix &left, const DenseMatrix &right,
                      DenseMatrix &output) {
   assert(left.columns == right.rows && output.rows == left.rows &&

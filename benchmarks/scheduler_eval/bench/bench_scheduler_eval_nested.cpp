@@ -39,6 +39,34 @@ void MatrixTranspose(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * size * size);
 }
 
+void DeepNested(benchmark::State &state) {
+  const auto depth = static_cast<std::size_t>(state.range(0));
+  const auto fanout = static_cast<std::size_t>(state.range(1));
+  const auto work = static_cast<std::size_t>(state.range(2));
+  std::vector<std::uint64_t> output(1 << 16);
+  SchedulerMetricsScope metrics(state);
+  for (auto _ : state) {
+    DeepNestedFor(0, output.size(), depth, fanout, [&](std::size_t i) {
+      std::uint64_t value = i + 1;
+      for (std::size_t step = 0; step < work; ++step)
+        value = (value ^ (value >> 27)) * 0x3c79ac492ba7b653ULL + step;
+      output[i] = value;
+    });
+    benchmark::DoNotOptimize(output.data());
+    benchmark::ClobberMemory();
+  }
+  state.SetItemsProcessed(state.iterations() * output.size());
+  state.counters["elements"] = output.size();
+}
+
+BENCHMARK(DeepNested)
+    ->Setup(SetupNested)
+    ->ArgNames({"depth", "fanout", "work"})
+    ->Args({2, 4, 1})->Args({4, 4, 1})->Args({8, 4, 1})
+    ->Args({2, 2, 64})->Args({4, 2, 64})->Args({8, 2, 64})
+    ->Args({16, 2, 64})
+    ->UseRealTime();
+
 BENCHMARK(MatrixMultiply)->Setup(SetupNested)->UseRealTime();
 BENCHMARK(MatrixTranspose)->Setup(SetupNested)->UseRealTime();
 

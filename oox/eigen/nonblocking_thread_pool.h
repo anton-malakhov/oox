@@ -19,6 +19,7 @@
 #include "max_size_vector.h"
 #include "run_queue.h"
 #include "stl_thread_env.h"
+#include "small_object_pool.h"
 
 #include <atomic>
 #include <cassert>
@@ -40,6 +41,13 @@
 
 namespace oox::detail::eigen_pool {
 
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+namespace internal {
+inline std::atomic<size_t> completion_notifications{0};
+inline std::atomic<size_t> completion_waits{0};
+}
+#endif
+
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
@@ -47,20 +55,24 @@ struct Task {
   virtual ~Task() = default;
 };
 
-template <typename F> struct UniqueTask : Task {
+template <typename F>
+struct UniqueTask final : Task, SmallObjectAllocated<UniqueTask<F>> {
 
   template <typename G> explicit UniqueTask(G &&f) : f(std::forward<G>(f)) {}
 
   void operator()() override {
-    std::unique_ptr<UniqueTask> self(this);
+    const auto release = [](UniqueTask *p) { DeleteSmallObject(p); };
+    std::unique_ptr<UniqueTask, decltype(release)> self(this, release);
     f();
   }
+
+  void Discard() noexcept override { DeleteSmallObject(this); }
 
   F f;
 };
 
 template <typename F> Task *MakeTask(F &&f) {
-  return new UniqueTask<std::decay_t<F>>{std::forward<F>(f)};
+  return NewSmallObject<UniqueTask<std::decay_t<F>>>(std::forward<F>(f));
 }
 
 // This defines an interface that ThreadPoolDevice can take to use
@@ -97,7 +109,8 @@ template <typename Environment>
 class ThreadPoolTempl : public ThreadPoolInterface {
 public:
   using TaskPtr = Task *;
-  using Queue = RunQueue<TaskPtr, 1024>;
+  using QueueEntry = uintptr_t;
+  using Queue = RunQueue<QueueEntry, 1024>;
 
 #ifdef OOX_EIGEN_ENABLE_STATS
   struct Statistics {
@@ -187,6 +200,48 @@ public:
     PublishTask(t, static_cast<int>(threadIndex), local);
   }
 
+  void ScheduleWithAffinity(TaskPtr task, size_t hint) {
+    if (!task)
+      return;
+    if (IsCancelled()) {
+      task->Discard();
+      return;
+    }
+    PerThread *pt = GetPerThread();
+    hint %= num_threads_;
+    if (!IsRegistered(pt) || !pt->owns_queue ||
+        hint == static_cast<size_t>(pt->thread_id)) {
+      RunOnThread(task, hint);
+      return;
+    }
+    const auto discard = [](Task *p) { p->Discard(); };
+    std::unique_ptr<Task, decltype(discard)> pending(task, discard);
+    auto *proxy = new AffinityProxy(task);
+    pending.release();
+    AccountTask(task, pt->thread_id);
+    // The recipient may claim the work immediately. The local location keeps
+    // the proxy alive until publication below consumes that location.
+    thread_data_[hint].affinity_mailbox.Push(proxy);
+    const QueueEntry entry = reinterpret_cast<QueueEntry>(proxy) | proxy_tag;
+    try {
+      if (!thread_data_[pt->thread_id].local_tasks.PushFront(entry)) {
+        std::lock_guard<std::mutex> lock(overflow_mutex_);
+        overflow_tasks_.push_back(entry);
+        overflow_nonempty_.store(true, std::memory_order_release);
+      }
+    } catch (...) {
+      // The recipient may be unavailable. Do not leave useful work reachable
+      // only from its mailbox when the stealable sender location failed.
+      if (TaskPtr unclaimed = proxy->template Extract<AffinityProxy::local_bit>()) {
+        auto *outstanding = unclaimed->outstanding;
+        unclaimed->Discard();
+        TaskFinished(outstanding);
+      }
+      throw;
+    }
+    WakeOneWorker();
+  }
+
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
     if (t == nullptr) {
       return;
@@ -229,6 +284,10 @@ public:
   }
 
   size_t NumThreads() const final { return num_threads_; }
+
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
 
   size_t CurrentThreadId() const final {
     const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
@@ -282,6 +341,10 @@ public:
     auto &event = registered ? worker_event_ : waiter_event_;
 
     while (!ready()) {
+      // Help before registering; the second check below prevents lost wakeups.
+      if (registered && TryExecuteOne()) {
+        continue;
+      }
       const uint64_t token = event.PrepareWait();
       if (registered && TryExecuteOne()) {
         event.CancelWait();
@@ -291,11 +354,18 @@ public:
         event.CancelWait();
         return;
       }
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+      internal::completion_waits.fetch_add(1);
+      internal::completion_waits.notify_one();
+#endif
       event.Wait(token);
     }
   }
 
   void NotifyTaskCompletion() {
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+    internal::completion_notifications.fetch_add(1);
+#endif
     worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
   }
@@ -398,6 +468,75 @@ private:
 
   typedef typename Environment::EnvThread Thread;
 
+  static constexpr QueueEntry proxy_tag = 1;
+
+  struct AffinityProxy final {
+    static constexpr uintptr_t local_bit = 1;
+    static constexpr uintptr_t mailbox_bit = 2;
+    static constexpr uintptr_t locations = local_bit | mailbox_bit;
+    static_assert(alignof(Task) > locations);
+
+    explicit AffinityProxy(TaskPtr task) noexcept
+        : task_and_locations(reinterpret_cast<uintptr_t>(task) | locations) {}
+
+    template <uintptr_t Location> TaskPtr Extract() noexcept {
+      constexpr uintptr_t other = locations ^ Location;
+      const uintptr_t previous =
+          task_and_locations.fetch_and(other, std::memory_order_acq_rel);
+      // The other location can reclaim this proxy immediately after the RMW.
+      // Only the last location may access it again.
+      if (!(previous & other))
+        delete this;
+      return reinterpret_cast<TaskPtr>(previous & ~locations);
+    }
+
+    std::atomic<uintptr_t> task_and_locations;
+    AffinityProxy *next = nullptr;
+  };
+
+  // Multiple publishers; only the queue's owning worker consumes. A detached
+  // batch is reversed to preserve FIFO mailbox order. Thieves use the sender's
+  // local proxy, so they never consume another worker's affinity mailbox.
+  class AffinityMailbox {
+  public:
+    void Push(AffinityProxy *proxy) noexcept {
+      auto *head = incoming_.load(std::memory_order_relaxed);
+      do {
+        proxy->next = head;
+      } while (!incoming_.compare_exchange_weak(
+          head, proxy, std::memory_order_release, std::memory_order_relaxed));
+    }
+
+    AffinityProxy *Pop() noexcept {
+      if (!ready_) {
+        if (!incoming_.load(std::memory_order_acquire))
+          return nullptr;
+        auto *batch = incoming_.exchange(nullptr, std::memory_order_acquire);
+        while (batch) {
+          auto *next = batch->next;
+          batch->next = ready_;
+          ready_ = batch;
+          batch = next;
+        }
+      }
+      auto *result = ready_;
+      if (result)
+        ready_ = result->next;
+      return result;
+    }
+
+  private:
+    std::atomic<AffinityProxy *> incoming_{nullptr};
+    AffinityProxy *ready_ = nullptr;
+  };
+
+  static TaskPtr ExtractEntry(QueueEntry entry) noexcept {
+    if (entry & proxy_tag)
+      return reinterpret_cast<AffinityProxy *>(entry & ~proxy_tag)
+          ->template Extract<AffinityProxy::local_bit>();
+    return reinterpret_cast<TaskPtr>(entry);
+  }
+
   struct PerThread {
     constexpr PerThread()
         : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
@@ -427,6 +566,7 @@ private:
     std::unique_ptr<Thread> thread;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
+    AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
 #ifdef OOX_EIGEN_ENABLE_STATS
     AtomicStatistics statistics;
@@ -434,16 +574,19 @@ private:
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
-        return local_tasks.PushFront(p);
+        return local_tasks.PushFront(reinterpret_cast<QueueEntry>(p));
       } else {
         return mailbox.try_push(p);
       }
     }
 
     TaskPtr PopFront() {
-      if (auto p = local_tasks.PopFront()) {
-        return p;
-      }
+      while (auto entry = local_tasks.PopFront())
+        if (auto *task = ExtractEntry(entry))
+          return task;
+      while (auto *proxy = affinity_mailbox.Pop())
+        if (auto *task = proxy->template Extract<AffinityProxy::mailbox_bit>())
+          return task;
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
       return task;
@@ -453,7 +596,9 @@ private:
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
       if (!task && force) {
-        task = local_tasks.PopBack();
+        while (auto entry = local_tasks.PopBack())
+          if ((task = ExtractEntry(entry)))
+            break;
       }
       return task;
     }
@@ -467,7 +612,8 @@ private:
   const uint64_t pool_generation_;
 
   std::mutex overflow_mutex_;
-  std::deque<TaskPtr> overflow_tasks_;
+  std::atomic<bool> overflow_nonempty_{false};
+  std::deque<QueueEntry> overflow_tasks_;
   EventCount worker_event_;
   EventCount waiter_event_;
   std::atomic<bool> done_;
@@ -578,7 +724,7 @@ private:
     return pt->pool == this && pt->pool_generation == pool_generation_;
   }
 
-  void PublishTask(TaskPtr task, int target, bool local) {
+  void AccountTask(TaskPtr task, int target) noexcept {
 #ifdef OOX_EIGEN_ENABLE_STATS
     thread_data_[target].statistics.scheduled.fetch_add(
         1, std::memory_order_relaxed);
@@ -586,10 +732,16 @@ private:
     auto &outstanding = thread_data_[target].outstanding_tasks;
     task->outstanding = &outstanding;
     outstanding.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void PublishTask(TaskPtr task, int target, bool local) {
+    AccountTask(task, target);
+    auto &outstanding = thread_data_[target].outstanding_tasks;
     try {
       if (!thread_data_[target].PushTask(task, local)) {
         std::lock_guard<std::mutex> lock(overflow_mutex_);
-        overflow_tasks_.push_back(task);
+        overflow_tasks_.push_back(reinterpret_cast<QueueEntry>(task));
+        overflow_nonempty_.store(true, std::memory_order_release);
       }
     } catch (...) {
       outstanding.fetch_sub(1, std::memory_order_relaxed);
@@ -600,13 +752,21 @@ private:
   }
 
   TaskPtr PopOverflow() {
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    if (overflow_tasks_.empty()) {
-      return nullptr;
+    while (overflow_nonempty_.load(std::memory_order_acquire)) {
+      QueueEntry entry;
+      {
+        std::lock_guard<std::mutex> lock(overflow_mutex_);
+        if (overflow_tasks_.empty())
+          return nullptr;
+        entry = overflow_tasks_.front();
+        overflow_tasks_.pop_front();
+        overflow_nonempty_.store(!overflow_tasks_.empty(),
+                                 std::memory_order_release);
+      }
+      if (auto *task = ExtractEntry(entry))
+        return task;
     }
-    TaskPtr task = overflow_tasks_.front();
-    overflow_tasks_.pop_front();
-    return task;
+    return nullptr;
   }
 
   bool TryExecuteOne() {
@@ -682,12 +842,15 @@ private:
     }
     std::lock_guard<std::mutex> lock(overflow_mutex_);
     while (!overflow_tasks_.empty()) {
-      TaskPtr task = overflow_tasks_.front();
+      const auto entry = overflow_tasks_.front();
       overflow_tasks_.pop_front();
-      auto *outstanding = task->outstanding;
-      task->Discard();
-      outstanding->fetch_sub(1, std::memory_order_relaxed);
+      if (auto *task = ExtractEntry(entry)) {
+        auto *outstanding = task->outstanding;
+        task->Discard();
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+      }
     }
+    overflow_nonempty_.store(false, std::memory_order_release);
     assert(NoOutstandingTasks());
   }
 

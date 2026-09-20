@@ -55,6 +55,8 @@ void ParallelFor(size_t from, size_t to, Func &&func, size_t grainSize = 1) {
   const tbb::simple_partitioner part;
 #elif TBB_MODE == TBB_AUTO
   const tbb::auto_partitioner part;
+#elif TBB_MODE == TBB_STATIC
+  const tbb::static_partitioner part;
 #elif TBB_MODE == TBB_AFFINITY
   // "it is important that the same affinity_partitioner object be passed to
   // loop templates to be optimized for affinity" see

@@ -292,6 +292,30 @@ Twist-based builds require a Clang compiler (the fetched `sure` library uses
 `__has_feature`); presets in `CMakePresets.json` configure
 `twist-fault`/`twist-sim`/`tsan` builds.
 
+### Backend selection
+
+`OOX::OOX` is the backend-neutral interface target. Link `OOX::eigen` to select
+the bundled Eigen-derived scheduler; it links `OOX::OOX` and `Threads::Threads`
+and defines `HAVE_EIGEN=1`. The serial-debug macro intentionally overrides an
+asynchronous backend, while enabling multiple asynchronous backend macros is a
+compile error.
+
+The Eigen worker count defaults to `std::thread::hardware_concurrency()` with a
+one-worker fallback. Set the CMake cache variable `OOX_EIGEN_THREADS` to a
+positive fixed count, or define `OOX_EIGEN_NUM_THREADS` for a direct header
+build.
+
+Eigen pool workers never block on a steal of another worker's queue: a steal
+attempt is dropped when the owner is already publishing or executing (its
+`RunQueue::PopBack` is a try-lock). A failed round is retried, and the owner
+still drains its own front; this is what keeps steal dead-lock-free.
+
+A task scheduled directly on the pool that throws leaves its completion state
+unrecoverable, so the pool ends the process with `std::terminate()`. The
+`parallel_for` layer instead captures a body's exception and rethrows it to
+callers (see `oox/eigen/PARTITIONERS.md`); submit tasks that must survive
+exceptions to that layer, not raw to the pool.
+
 ## 5. Testing
 
 - **Unit tests** (`tests/test_oox.cpp`, `tests/test_shared_var.cpp`) — gtest,
