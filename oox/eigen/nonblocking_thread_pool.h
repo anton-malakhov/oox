@@ -41,6 +41,13 @@
 
 namespace oox::detail::eigen_pool {
 
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+namespace internal {
+inline std::atomic<size_t> completion_notifications{0};
+inline std::atomic<size_t> completion_waits{0};
+}
+#endif
+
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
@@ -347,11 +354,18 @@ public:
         event.CancelWait();
         return;
       }
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+      internal::completion_waits.fetch_add(1);
+      internal::completion_waits.notify_one();
+#endif
       event.Wait(token);
     }
   }
 
   void NotifyTaskCompletion() {
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+    internal::completion_notifications.fetch_add(1);
+#endif
     worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
   }

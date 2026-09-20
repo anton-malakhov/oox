@@ -147,6 +147,13 @@ if (OOX_ENABLE_EIGEN)
           OOX_EIGEN_SMALL_OBJECT_POOL=0)
   add_test(NAME EigenPartitionerLifetimeOracle COMMAND eigen_partitioner_lifetime_test)
 
+  add_executable(eigen_partitioner_completion_test eigen_partitioner_completion_test.cpp)
+  target_link_libraries(eigen_partitioner_completion_test PRIVATE ${PROJECT_NAME}::eigen)
+  target_compile_definitions(eigen_partitioner_completion_test PRIVATE
+          OOX_EIGEN_THREAD_POOL_TESTING=1)
+  add_test(NAME EigenPartitionerCompletion COMMAND eigen_partitioner_completion_test)
+  set_tests_properties(EigenPartitionerCompletion PROPERTIES TIMEOUT 60)
+
   foreach (partitioner IN ITEMS auto simple static affinity)
     add_test(NAME EigenPartitionerRangeOracle_${partitioner}
              COMMAND eigen_partitioner_range_test ${partitioner})

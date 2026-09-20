@@ -32,6 +32,8 @@ struct Owner : partitioner_detail::PeerJoin<Owner> {
   Owner(PeerJoin *parent, unsigned bit, unsigned &destroyed)
       : PeerJoin(parent), bit(bit), destroyed(destroyed) {}
   ~Owner() { destroyed |= bit; }
+  std::thread::id PublishingThreadId() const noexcept { return publisher; }
+  const std::thread::id publisher = std::this_thread::get_id();
   unsigned bit;
   unsigned &destroyed;
 };

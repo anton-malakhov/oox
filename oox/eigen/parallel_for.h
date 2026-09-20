@@ -71,14 +71,14 @@ public:
   explicit Region(ThreadPool &pool, Metrics *metrics)
       : pool(pool), metrics(metrics) {}
   void AddTask() noexcept { remaining.fetch_add(1, std::memory_order_relaxed); }
-  void TaskComplete() noexcept {
+  void TaskComplete(bool notify = true) noexcept {
     // The caller and the adaptive tree (or each non-adaptive task) retain us.
     // Copy the pool before releasing: completion may release the caller too.
     ThreadPool *saved_pool = &pool;
     const size_t previous = remaining.fetch_sub(1, std::memory_order_acq_rel);
     if (previous == 1)
       DeleteSmallObject(this);
-    else if (previous == 2)
+    else if (previous == 2 && notify)
       saved_pool->NotifyTaskCompletion();
   }
   bool IsComplete() const noexcept {
@@ -195,21 +195,35 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
     return (references.load(std::memory_order_acquire) & branch_mask) == 2;
   }
   static void Release(PeerJoin *node) noexcept {
+    if (node && IsRoot(node)) {
+      // The root Process returns this branch before its caller starts waiting.
+      reinterpret_cast<Region *>(reinterpret_cast<uintptr_t>(node) & ~root_bit)
+          ->TaskComplete(false);
+      return;
+    }
     while (node) {
-      if (IsRoot(node)) {
-        auto *region = reinterpret_cast<Region *>(
-            reinterpret_cast<uintptr_t>(node) & ~root_bit);
-        region->TaskComplete();
-        return;
-      }
-      // FinishExecution may free the owner as soon as the last branch leaves.
+      // Capture metadata before the RMW can allow FinishExecution to free us.
       PeerJoin *parent = node->parent;
+      std::thread::id caller;
+      if constexpr (requires(const Owner &owner) { owner.PublishingThreadId(); }) {
+        if (IsRoot(parent))
+          caller = static_cast<const Owner *>(node)->PublishingThreadId();
+      }
       const unsigned previous =
           node->references.fetch_sub(1, std::memory_order_acq_rel);
       if ((previous & branch_mask) != 1)
         return;
       if (!(previous & executing))
         DeleteSmallObject(static_cast<Owner *>(node));
+      if (IsRoot(parent)) {
+        // The first task was published by the synchronous caller. That thread
+        // cannot be parked while executing this completion; other threads notify.
+        auto *region = reinterpret_cast<Region *>(
+            reinterpret_cast<uintptr_t>(parent) & ~root_bit);
+        region->TaskComplete(caller == std::thread::id{} ||
+                             caller != std::this_thread::get_id());
+        return;
+      }
       node = parent;
     }
   }
@@ -290,6 +304,9 @@ public:
       region_.metrics->range_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   ~Work() override = default;
+  std::thread::id PublishingThreadId() const noexcept requires(State::adaptive) {
+    return context_.owner;
+  }
   void operator()() final {
     Process(region_, function_, range_, state_, static_cast<Join *>(this),
             context_);

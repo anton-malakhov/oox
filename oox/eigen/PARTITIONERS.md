@@ -77,6 +77,14 @@ reference. Callback/metrics admission ends before branch completion, and an
 adaptive task's final execution release never touches Region: cancellation
 may already have let the caller and tree reclaim it.
 
+When the adaptive tree completes, the first task's existing publishing-thread
+ID identifies the synchronous caller. Completion on that same thread skips the
+pool notification, since it cannot also be parked waiting for itself. Remote
+completion still notifies, including external callers. The parent link and
+thread ID are copied before releasing the final subtree reference, which can
+allow concurrent reclamation. Direct root completion precedes the caller's
+wait and also needs no notification. No task or Region fields are added.
+
 Simple and static policies have no sibling-demand feedback. Their completion
 already uses Region's task count, so join storage and join reference operations
 are compiled out. Publication dispatch lives in the task's Publish method.
@@ -217,7 +225,12 @@ and reuse. Values and visits are checked against a simple serial reference.
 A Boolean reference model checks all 5,040 completion orders of a three-node
 embedded join tree, including storage lifetime and peer-active state.
 A separate oracle checks all 40,320 orders including caller release, verifying
-Region reclamation independently of task-storage reclamation.
+Region reclamation independently of task-storage reclamation, including reads
+of the publishing-thread ID before the final reference release. Completion
+regressions check Auto/Affinity visitation against a serial reference, suppress
+same-thread notifications, and require remote notifications after registered
+and external callers arm their waits. Test-only counters are compiled out of
+normal builds.
 
 Affinity-specific checks cover learned placement, sequential history reuse,
 overlap isolation, pool changes, and queued tasks outliving a temporary history.
