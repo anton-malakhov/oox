@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <exception>
 #include <limits>
-#include "tbb_partitioning.h"
+#include "partitioning.h"
 
 namespace oox::detail::eigen_pool {
 struct AutoPartitioner {

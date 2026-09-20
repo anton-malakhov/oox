@@ -47,7 +47,7 @@ These mechanisms implement the work-demand scheme in
 Partition-state transitions, the private buffer, and sibling join feedback
 are adapted from oneTBB 2021.5.0 partitioner.h and parallel_for.h, revision
 70bf10c0a9e65e3a954156f801b0a11c96f7f6bd. The Apache-2.0 notice is retained in
-tbb_partitioning.h and licenses/oneTBB-Apache-2.0.txt.
+partitioning.h and licenses/oneTBB-Apache-2.0.txt.
 
 The executor remains Eigen. Stealing is identified by execution on a different
 thread from the publishing thread; Eigen has no TBB execution-slot metadata.
@@ -182,11 +182,14 @@ steal mutex is busy. Registered callers of Wait try helping before registering
 as waiters. If no task is available, they retain the registration, recheck, and
 parking protocol.
 
-For later adaptation, carry parallel_for.h, tbb_partitioning.h,
+For later adaptation, carry parallel_for.h, partitioning.h,
 small_object_pool.h, the affinity-aware pool changes, and
 licenses/oneTBB-Apache-2.0.txt. The included pool supplies the existing Task type.
 Preserve these contracts when adapting to another pool revision:
 
+- The caller owns the pool: an operation and its queued tasks hold it by raw
+  reference, so keep it alive until every submitted task has executed or been
+  discarded.
 - Schedule, RunOnThread and ScheduleWithAffinity consume the task, including exceptional publication
   and rejection.
 - Queued tasks are either executed or discarded; either path completes their
