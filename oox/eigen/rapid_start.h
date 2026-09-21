@@ -981,7 +981,8 @@ private:
   RapidDomainState *previous_;
 };
 
-template <typename F> class ResidentRegion final : public ResidentTask {
+template <typename F, bool Ranges = false>
+class ResidentRegion final : public ResidentTask {
 public:
   ResidentRegion(RapidDomainState &state, F &function, size_t begin, size_t end,
                  size_t slots, size_t helpers) noexcept
@@ -1017,13 +1018,19 @@ private:
         begin_ + slot * quotient + std::min(slot, remainder);
     const size_t last = first + quotient + (slot < remainder ? 1 : 0);
     try {
-      for (size_t index = first;
-           index < last && !state_.Pool().IsCancelled(); ++index) {
-        if (((index - first) & 63) == 0 &&
-            cancelled_.load(std::memory_order_acquire)) {
-          break;
+      if constexpr (Ranges) {
+        if (!state_.Pool().IsCancelled() &&
+            !cancelled_.load(std::memory_order_acquire))
+          std::invoke(function_, first, last);
+      } else {
+        for (size_t index = first;
+             index < last && !state_.Pool().IsCancelled(); ++index) {
+          if (((index - first) & 63) == 0 &&
+              cancelled_.load(std::memory_order_acquire)) {
+            break;
+          }
+          std::invoke(function_, index);
         }
-        std::invoke(function_, index);
       }
     } catch (...) {
       std::lock_guard<std::mutex> lock(exception_mutex_);
@@ -1068,21 +1075,28 @@ inline void PrepareResidentGroup(RapidStartGroup group) {
   }
 }
 
-template <typename F>
-void ParallelForResident(RapidStartGroup group, size_t begin, size_t end,
-                         F &&function) {
+template <bool Ranges, typename F>
+void ParallelForResidentImpl(RapidStartGroup group, size_t begin, size_t end,
+                             F &&function) {
   if (group.IsEmpty() || begin >= end) {
     return;
   }
   group.Validate();
   ThreadPool &pool = group.state->Pool();
   if (!pool.UsesResidentBusyWait()) {
-    ParallelFor(group, begin, end, std::forward<F>(function));
+    if constexpr (Ranges)
+      ParallelForRanges(group, begin, end, std::forward<F>(function));
+    else
+      ParallelFor(group, begin, end, std::forward<F>(function));
     return;
   }
   if (current_resident_state == group.state || group.domain.Size() == 1) {
-    for (size_t index = begin; index < end && !pool.IsCancelled(); ++index) {
-      std::invoke(function, index);
+    if constexpr (Ranges) {
+      if (!pool.IsCancelled())
+        std::invoke(function, begin, end);
+    } else {
+      for (size_t index = begin; index < end && !pool.IsCancelled(); ++index)
+        std::invoke(function, index);
     }
     return;
   }
@@ -1096,19 +1110,29 @@ void ParallelForResident(RapidStartGroup group, size_t begin, size_t end,
       group.domain, workers.data(), slots - 1);
   using Function = std::remove_reference_t<F>;
   Function &callable = function;
-  ResidentRegion<Function> region(*group.state, callable, begin, end,
+  ResidentRegion<Function, Ranges> region(*group.state, callable, begin, end,
                                   helpers + 1, helpers);
   for (size_t helper = 0; helper < helpers; ++helper) {
     pool.PublishResident(region, region.CompletionCounter(), workers[helper],
                          helper + 1);
   }
   region.RunCaller();
-  while (!region.IsComplete()) {
-    if (!pool.TryExecuteSomething()) {
-      std::this_thread::yield();
-    }
-  }
+  pool.HelpResidentUntil(region);
   region.Rethrow();
+}
+
+template <typename F>
+void ParallelForResident(RapidStartGroup group, size_t begin, size_t end,
+                         F &&function) {
+  ParallelForResidentImpl<false>(group, begin, end, std::forward<F>(function));
+}
+
+// One callback per captured participant. The callback owns its range's loop
+// and checks cancellation at its own safe points, like an ordinary pool task.
+template <typename F>
+void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
+                               F &&function) {
+  ParallelForResidentImpl<true>(group, begin, end, std::forward<F>(function));
 }
 
 template <typename F>

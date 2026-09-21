@@ -313,6 +313,33 @@ TEST(EigenRapidResident, MatchesExactOnceOracleAcrossSmallRanges) {
   }
 }
 
+TEST(EigenRapidResident, ClaimMaskMatchesScanningOracle) {
+  const auto oracle = [](uint64_t candidates, unsigned first, size_t count) {
+    uint64_t result = 0;
+    for (unsigned offset = 0; offset < 64 && count; ++offset) {
+      const uint64_t bit = uint64_t{1} << ((first + offset) % 64);
+      if (candidates & bit) {
+        result |= bit;
+        --count;
+      }
+    }
+    return result;
+  };
+  uint64_t random = 0x21aab731;
+  for (size_t case_index = 0; case_index < 1256; ++case_index) {
+    random = random * 6364136223846793005ULL + 1;
+    const uint64_t mask = case_index < 256 ? case_index : random;
+    for (unsigned first = 0; first < 64; ++first) {
+      for (size_t count : {0u, 1u, 2u, 7u, 16u, 63u, 64u}) {
+        EXPECT_EQ(oox::detail::eigen_pool::ResidentClaimMask(mask, first, count),
+                  oracle(mask, first, count))
+            << "seed=0x21aab731 case=" << case_index
+            << " first=" << first << " count=" << count;
+      }
+    }
+  }
+}
+
 TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
   RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
   PrepareResidentGroup(harness.group);
@@ -401,9 +428,15 @@ TEST(EigenRapidResident, PartialAvailabilityMatchesSerialOracle) {
         auto body = [&](size_t i) { visits[i - first].fetch_add(1); };
         // When every worker is blocked, resident execution must use the
         // caller. The other APIs require at least one scheduler worker.
-        if (busy == workers || case_index % 3 == 0) {
+        if (busy == workers || case_index % 4 == 0) {
+          oox::detail::eigen_pool::rapid::ParallelForResidentRanges(
+              harness.group, first, first + size, [&](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i)
+                  body(i);
+              });
+        } else if (case_index % 4 == 1) {
           ParallelForResident(harness.group, first, first + size, body);
-        } else if (case_index % 3 == 1) {
+        } else if (case_index % 4 == 2) {
           ParallelFor(harness.group, first, first + size, body);
         } else {
           oox::detail::eigen_pool::ParallelFor(
@@ -421,6 +454,57 @@ TEST(EigenRapidResident, PartialAvailabilityMatchesSerialOracle) {
       release.set_value();
     }
   }
+}
+
+TEST(EigenRapidResident, ConcurrentRangeRootsComposeWithDemandPartitioning) {
+  RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  std::vector<std::atomic<unsigned>> visits(4 * 257);
+  std::vector<std::future<void>> roots;
+  for (size_t root = 0; root < 4; ++root) {
+    roots.push_back(std::async(std::launch::async, [&, root] {
+      for (unsigned round = 0; round < 16; ++round) {
+        oox::detail::eigen_pool::rapid::ParallelForResidentRanges(
+            harness.group, 0, 257, [&](size_t first, size_t last) {
+              oox::detail::eigen_pool::ParallelFor(
+                  harness.pool, first, last, [&](size_t i) {
+                    visits[root * 257 + i].fetch_add(1);
+                  });
+            });
+      }
+    }));
+  }
+  for (auto &root : roots) {
+    const auto status = root.wait_for(5s);
+    if (status != std::future_status::ready)
+      harness.pool.Cancel();
+    EXPECT_EQ(status, std::future_status::ready);
+    root.get();
+  }
+  for (size_t i = 0; i < visits.size(); ++i)
+    EXPECT_EQ(visits[i].load(), 16u) << "index=" << i;
+}
+
+TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
+  RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
+  EXPECT_THROW(ParallelForResidentRanges(harness.group, 0, 257,
+      [](size_t first, size_t last) {
+        if (first <= 129 && 129 < last)
+          throw std::runtime_error("range callback");
+      }), std::runtime_error);
+  std::vector<std::atomic<unsigned>> visits(257);
+  ParallelForResidentRanges(harness.group, 0, visits.size(),
+      [&](size_t first, size_t last) {
+        ParallelForResidentRanges(harness.group, first, last,
+            [&](size_t begin, size_t end) {
+              for (size_t i = begin; i < end; ++i)
+                visits[i].fetch_add(1);
+            });
+      });
+  for (size_t i = 0; i < visits.size(); ++i)
+    EXPECT_EQ(visits[i].load(), 1u) << "index=" << i;
 }
 
 enum class HybridPolicy : std::uint8_t {

@@ -127,7 +127,8 @@ CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_SIMPLE`, `EIGEN_STATIC`, and `EIGEN_AFFINITY` range policies.
 See [the partitioner API and placement semantics](../../oox/eigen/PARTITIONERS.md).
 The Eigen pool also provides `RAPID_START` (hierarchical activation),
-`RAPID_RESIDENT` (resident worker groups), and the existing mailbox/lazy policy
+`RAPID_RESIDENT` (resident per-item callbacks), `RAPID_GROUP` (one plain range
+callback per captured participant), and the existing mailbox/lazy policy
 variants. All share the upstream workload suite. Resident mode deliberately
 uses busy waiting and is opt-in; ordinary and native Rapid publications can
 release its workers back to scheduler work.
@@ -145,6 +146,11 @@ sources that CMake attaches only to reentrant modes.
 Use `--fresh-process-repetitions N --shuffle-modes --seed S` to interleave
 fresh processes reproducibly; `--benchmarks-only` skips probes and plotting.
 Binary hashes, checkout state, topology, and each round's mode order are saved.
+Configure with `-DOOX_SCHEDULER_EVAL_STATS=OFF` for timing comparisons without
+Eigen's task/steal counter updates. The default remains ON for mechanism
+measurements; the setting is recorded in run metadata. Group and native Rapid
+descriptors are not ordinary tasks, so zero ordinary-task counters do not mean
+zero scheduling work.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, all three
 sparse distributions, convex hull, remove-duplicates, radix sort, and sample

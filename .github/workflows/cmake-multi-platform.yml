@@ -114,7 +114,7 @@ jobs:
       if: matrix.external-backends == 'ON'
       run: >
         cmake --build build-scheduler-eval --target
-        bench_scheduler_eval_TBB_SIMPLE bench_scheduler_eval_RAPID_START
+        bench_scheduler_eval_TBB_SIMPLE bench_scheduler_eval_RAPID_ORIGINAL
         bench_scheduler_eval_OMP_STATIC -j 8
 
   build:

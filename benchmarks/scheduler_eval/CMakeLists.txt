@@ -3,6 +3,7 @@ set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_ORIGINAL RAPID_RESIDENT)
 set(OOX_SCHEDULER_EVAL_TESTS)
 
 option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
+option(OOX_SCHEDULER_EVAL_STATS "Collect Eigen task and stealing counters" ON)
 add_library(oox_eval_papi STATIC metrics/papi_metrics.cpp)
 target_link_libraries(oox_eval_papi PUBLIC OOX)
 if(OOX_SCHEDULER_EVAL_PAPI)
@@ -42,7 +43,7 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    RAPID_START RAPID_RESIDENT RAPID_MAILBOX RAPID_MAILBOX_PERTASK_WAKE
+    RAPID_START RAPID_RESIDENT RAPID_GROUP RAPID_MAILBOX RAPID_MAILBOX_PERTASK_WAKE
     RAPID_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING
     RAPID_SQRTCV_LAZY_STEALING RAPID_HEARTBEAT_LAZY_STEALING
     RAPID_FSC_LAZY_STEALING RAPID_FACTORING_LAZY_STEALING
@@ -53,6 +54,7 @@ endif()
 # Map each RAPID_* evaluation mode onto its EIGEN_MODE value from modes.h.
 set(oox_rapid_eigen_mode_RAPID_START EIGEN_RAPID)
 set(oox_rapid_eigen_mode_RAPID_RESIDENT EIGEN_RAPID_RESIDENT)
+set(oox_rapid_eigen_mode_RAPID_GROUP EIGEN_RAPID_GROUP)
 set(oox_rapid_eigen_mode_RAPID_MAILBOX EIGEN_RAPID_MAILBOX)
 set(oox_rapid_eigen_mode_RAPID_MAILBOX_PERTASK_WAKE EIGEN_RAPID_MAILBOX)
 set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING EIGEN_RAPID_LAZY_STEALING)
@@ -80,11 +82,11 @@ function(oox_configure_scheduler_eval_target target mode)
     target_link_libraries(${target} PRIVATE OOX)
   elseif(mode STREQUAL "OOX_TASKS")
     target_compile_definitions(${target} PRIVATE
-      OOX_TASK_MODE=1 OOX_EIGEN_ENABLE_STATS=1)
+      OOX_TASK_MODE=1 $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE
-      EIGEN_MODE=${mode} OOX_EIGEN_ENABLE_STATS=1)
+      EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_ORIGINAL")
     target_compile_definitions(${target} PRIVATE
@@ -96,7 +98,8 @@ function(oox_configure_scheduler_eval_target target mode)
       message(FATAL_ERROR "No EIGEN_MODE mapping for scheduler eval mode ${mode}")
     endif()
     target_compile_definitions(${target} PRIVATE
-      RAPID_START_MODE=1 EIGEN_MODE=${rapid_eigen_mode} OOX_EIGEN_ENABLE_STATS=1)
+      RAPID_START_MODE=1 EIGEN_MODE=${rapid_eigen_mode}
+      $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     if(mode STREQUAL "RAPID_MAILBOX_PERTASK_WAKE")
       target_compile_definitions(${target} PRIVATE OOX_EIGEN_BATCHED_WAKE=0)
     endif()

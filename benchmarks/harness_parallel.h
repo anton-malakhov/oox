@@ -112,12 +112,14 @@
 #pragma push_macro("TBB_AFFINITY")
 #pragma push_macro("TBB_CONST_AFFINITY")
 #pragma push_macro("TBB_RAPID")
+#pragma push_macro("TBB_STATIC")
 #undef OMP_RUNTIME
 #undef TBB_SIMPLE
 #undef TBB_AUTO
 #undef TBB_AFFINITY
 #undef TBB_CONST_AFFINITY
 #undef TBB_RAPID
+#undef TBB_STATIC
 #if PARALLEL == EIGEN_STEALING_LOOP
 #define EIGEN_MODE EIGEN_STEALING
 #include "eigen/parallel_for.h"
@@ -133,6 +135,7 @@
 #endif
 #include "scheduler_eval/rapid_start_adapter.h"
 #endif
+#pragma pop_macro("TBB_STATIC")
 #pragma pop_macro("TBB_RAPID")
 #pragma pop_macro("TBB_CONST_AFFINITY")
 #pragma pop_macro("TBB_AFFINITY")

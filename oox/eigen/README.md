@@ -85,3 +85,36 @@ greater than 128, matching the vendored aligned allocator's supported range.
 [ParallelFor and partitioners](PARTITIONERS.md) provide auto, simple, static,
 and affinity policies adapted from oneTBB on the ordinary scheduler. They reuse
 the existing scheduler-evaluation workloads.
+
+## Fast resident groups
+
+`WorkerIdleMode::ResidentBusy` is an explicit pool-lifetime choice for latency
+experiments. Idle workers advertise availability and poll a command slot.
+`ParallelForResidentRanges(group, begin, end, callback)` captures currently
+available helpers and partitions the range by the actual participant count,
+including the caller. Each participant calls `callback(first, last)` once.
+The descriptor and completion counter live on the caller's stack; a warm launch
+does not allocate tasks or publish ordinary queue entries. One invocation
+captures at most 64 participants, even when the pool is larger.
+
+The caller joins every captured helper before returning or rethrowing an
+exception. Nested calls sharing the same Rapid state execute their range directly;
+concurrent roots reserve disjoint available helpers. When no helper is
+available, the caller executes the whole range. A non-resident pool falls back
+to hierarchical Rapid activation.
+
+Range callbacks own their loop and cancellation safe points. Cancellation is
+checked before entering a callback; already-running callbacks are not
+interrupted. Use the existing `ParallelForResident` per-item entry point when
+its periodic cancellation checks are wanted.
+
+Ordinary and native Rapid publication can release a resident worker back to the
+scheduler. Periodic queue probes cover publication racing with registration.
+Only queued work triggers that handoff: an already-running ordinary task does
+not prevent other idle workers from joining a group. A callback may invoke the
+ordinary demand partitioner; registered waiters help execute its queued tasks.
+The group itself performs static initial distribution, without adding a new
+stealing or timespan policy.
+
+Busy residence consumes idle CPU. It is not the default pool policy and is not
+equivalent to the historical prototype holding every worker exclusively.

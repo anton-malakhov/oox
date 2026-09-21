@@ -259,11 +259,13 @@ def main():
     raw.mkdir(parents=True, exist_ok=True)
     traces.mkdir(parents=True, exist_ok=True)
     cache = cmake_cache(args.build.resolve())
+    prefixes = ("bench_scheduler_eval",) if args.benchmarks_only else (
+        "bench_scheduler_eval", "scheduling_dist", "trace_spin")
     measured_paths = [executable_dir / f"{prefix}_{mode}"
                       for mode in modes
-                      for prefix in ("bench_scheduler_eval", "scheduling_dist", "trace_spin")]
+                      for prefix in prefixes]
     tuner_path = executable_dir / "timespan_tuner_EIGEN_STEALING"
-    if "EIGEN_STEALING" in modes and tuner_path.exists():
+    if not args.benchmarks_only and "EIGEN_STEALING" in modes and tuner_path.exists():
         measured_paths.append(tuner_path)
     binary_records = provenance.artifacts(measured_paths)
     env = provenance.execution_environment(os.environ)
@@ -284,7 +286,8 @@ def main():
         "machine": platform.machine(),
         "python": platform.python_version(),
         "threads": args.threads,
-        "repetitions": args.repetitions,
+        "repetitions": 1 if args.fresh_process_repetitions else args.repetitions,
+        "repetitions_requested": args.repetitions,
         "benchmark_filter": benchmark_filter,
         "benchmark_min_time": benchmark_min_time,
         "subprocess_timeout_seconds": args.timeout,
@@ -309,6 +312,7 @@ def main():
         "compiler_version": compiler_version,
         "cxx_flags": cache.get("CMAKE_CXX_FLAGS", ""),
         "allocator": cache.get("OOX_ALLOCATOR", "unspecified"),
+        "eigen_scheduler_stats": cache.get("OOX_SCHEDULER_EVAL_STATS", "ON"),
         "environment": {
             "KMP_AFFINITY": env["KMP_AFFINITY"],
             "OMP_PROC_BIND": env["OMP_PROC_BIND"],

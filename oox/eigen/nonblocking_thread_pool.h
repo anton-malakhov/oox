@@ -53,6 +53,19 @@ class RapidDomainState;
 // bit and poll a command slot instead of entering the OS parking protocol.
 enum class WorkerIdleMode { Park, ResidentBusy };
 
+constexpr uint64_t ResidentClaimMask(uint64_t candidates, unsigned first_bit,
+                                     size_t capacity) noexcept {
+  if (static_cast<size_t>(std::popcount(candidates)) <= capacity)
+    return candidates;
+  uint64_t remaining = std::rotr(candidates, static_cast<int>(first_bit));
+  uint64_t selected = 0;
+  for (size_t count = 0; count < capacity; ++count) {
+    selected |= remaining & (~remaining + 1);
+    remaining &= remaining - 1;
+  }
+  return std::rotl(selected, static_cast<int>(first_bit));
+}
+
 struct DomainId {
   unsigned start = 0;
   unsigned limit = 0;
@@ -550,13 +563,8 @@ public:
           resident_available_[word].load(std::memory_order_acquire);
       while (observed & allowed) {
         const uint64_t candidates = observed & allowed;
-        uint64_t selected = 0;
-        for (unsigned step = 0;
-             step < 64 && std::popcount(selected) < capacity - claimed;
-             ++step) {
-          const unsigned bit = (first_bit + step) % 64;
-          selected |= candidates & (uint64_t{1} << bit);
-        }
+        uint64_t selected =
+            ResidentClaimMask(candidates, first_bit, capacity - claimed);
         if (resident_available_[word].compare_exchange_weak(
                 observed, observed & ~selected, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
@@ -623,6 +631,19 @@ public:
     }
     if (inline_task) {
       ExecuteTask(inline_task);
+    }
+  }
+
+  template <typename Region> void HelpResidentUntil(Region &region) {
+    unsigned spins = 0;
+    while (!region.IsComplete()) {
+      if (++spins < kSpinCount) {
+        RelaxResidentWait();
+        continue;
+      }
+      spins = 0;
+      if (!TryExecuteSomething())
+        RelaxResidentWait();
     }
   }
 
@@ -953,6 +974,8 @@ private:
       return result;
     }
 
+    bool Empty() const noexcept { return queue_.empty(); }
+
   private:
     rigtorp::mpmc::Queue<AffinityProxy *> queue_{1024};
   };
@@ -1136,6 +1159,13 @@ private:
         return processed_anything;
       }
 
+      if (idle_mode_ == WorkerIdleMode::ResidentBusy) {
+        if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
+          processed_anything = true;
+        }
+        continue;
+      }
+
       bool found_work = false;
       if (allow_spinning_) {
         const unsigned spin_count =
@@ -1153,13 +1183,6 @@ private:
         }
       }
       if (found_work) {
-        continue;
-      }
-
-      if (idle_mode_ == WorkerIdleMode::ResidentBusy) {
-        if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
-          processed_anything = true;
-        }
         continue;
       }
 
@@ -1406,12 +1429,11 @@ private:
     resident_available_[word].fetch_or(bit, std::memory_order_release);
     bool processed = false;
     unsigned polls = 0;
-    if (!NoOutstandingTasks() && WithdrawResident(worker)) {
-      return processed;
-    }
     for (;;) {
-      if (ResidentTask *task =
-              data.resident_task.exchange(nullptr, std::memory_order_acquire)) {
+      ResidentTask *task = nullptr;
+      if (data.resident_task.load(std::memory_order_relaxed))
+        task = data.resident_task.exchange(nullptr, std::memory_order_acquire);
+      if (task) {
         const size_t slot = data.resident_slot;
         std::atomic<size_t> *completion = data.resident_completion;
         assert(completion != nullptr);
@@ -1422,21 +1444,23 @@ private:
         resident_available_[word].fetch_or(bit, std::memory_order_release);
         completion->fetch_sub(1, std::memory_order_release);
         processed = true;
-        if (!NoOutstandingTasks() && WithdrawResident(worker)) {
-          return processed;
-        }
         continue;
       }
-      if (data.resident_ordinary.exchange(false, std::memory_order_acquire)) {
+      if (data.resident_ordinary.load(std::memory_order_relaxed) &&
+          data.resident_ordinary.exchange(false, std::memory_order_acquire)) {
         return processed;
       }
       // Publication may race with advertising this worker as resident. Probe
       // periodically so a missed availability snapshot cannot strand work.
       if (++polls == kSpinCount) {
         polls = 0;
-        bool pending = !NoOutstandingTasks();
+        // A running ordinary task does not make idle residents unavailable.
+        // Only queued work needs a scheduler worker; remote affinity tasks
+        // also have a stealable sender reference.
+        bool pending = !data.affinity_mailbox.Empty();
         for (const auto &source : thread_data_) {
-          pending |= source.rapid_slot.load(std::memory_order_acquire) != nullptr ||
+          pending |= !source.local_tasks.Empty() || !source.mailbox.empty() ||
+                     source.rapid_slot.load(std::memory_order_acquire) != nullptr ||
                      !source.rapid_overflow.empty();
         }
         if (pending && WithdrawResident(worker))
