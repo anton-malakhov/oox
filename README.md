@@ -6,19 +6,6 @@ Out-of-Order Executor library. Yet another approach to efficient and scalable ta
 * **Build & run**: `make`
 * **Install**: `make install`
 
-## Backend selection
-
-`OOX::OOX` is the backend-neutral interface target. Link `OOX::eigen` to select
-the bundled Eigen-derived scheduler; it links `OOX::OOX` and `Threads::Threads`
-and defines `HAVE_EIGEN=1`. The serial-debug macro intentionally overrides an
-asynchronous backend, while enabling multiple asynchronous backend macros is a
-compile error.
-
-The Eigen worker count defaults to `std::thread::hardware_concurrency()` with a
-one-worker fallback. Set the CMake cache variable `OOX_EIGEN_THREADS` to a
-positive fixed count, or define `OOX_EIGEN_NUM_THREADS` for a direct header
-build.
-
 ## Continuation-focus design
 With nested parallelism, blocking style programming is deadlock-prone and has latency problems. OOX provides semantic way out of these issues.
 
@@ -64,6 +51,7 @@ int Fib(int n, tf::Subflow& sbf) {  // TaskFlow: High-level blocking style progr
 - `oox::var<T>`: Basic representation of data in the OOX graph. In concept, a new form of `std::future` for continuations. It carries both: a value and dependency info
   - `using oox::node = oox::var<void>`: carries solely dependency info
 - `oox::var<T> oox::run(T(Func&)(...), Args...)`: Basic tasking API, spawns a task when arguments are ready and returns `oox::var` as a promise to provide the result of Func in future. If there are `oox::var` arguments, which are not ready yet (i.e. they are "promises" themselves), it makes a continuation task, which depends on completion of pending `oox::var` arguments.
+- `oox::shared_var<T>`: thread-safe, copyable counterpart of `oox::var`. Multiple threads may safely register readers/writers through `oox::run`, call `get()`/`wait()`, copy the handle, or assign a `T` value. Rebinding the same handle object with copy/move `shared_var` assignment is externally synchronized, like assigning the same `std::shared_ptr` object. Writer serialization across threads is guaranteed. `T` must be default-constructible and move- or copy-constructible, cannot itself be a `shared_var`, and `get()` returns a copy. Non-throwing policy additionally requires nothrow value materialization; value assignment requires the matching construction and assignment operations (see `docs/design-shared-var.md`).
 
 ## Design
 Pillars:

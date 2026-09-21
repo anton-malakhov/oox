@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "benchmarks/eigen/intrusive_ptr.h"
+#include "common.h"
+#include "granularity_control.h"
+#include "graph_workloads.h"
+#include "primary_workloads.h"
+#include "extended_workloads.h"
+#include "synthetic_workloads.h"
+#include "workloads.h"
+
+#ifdef EIGEN_MODE
+#include "benchmarks/eigen/eigen_pool.h"
+#endif
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <sstream>
+#include <vector>
+
+namespace {
+
+bool Close(double left, double right) {
+  return std::abs(left - right) <= 1e-9 * std::max(1.0, std::abs(right));
+}
+
+bool Report(const char *name, bool ok) {
+  if (!ok)
+    std::cerr << name << " failed\n";
+  return ok;
+}
+
+bool CheckScan() {
+  std::vector<std::uint64_t> values(1024, 1);
+  scheduler_eval::ExclusiveScan(values);
+  for (std::size_t i = 0; i < values.size(); ++i)
+    if (values[i] != i)
+      return false;
+  return true;
+}
+
+bool CheckSpmv() {
+  for (const auto kind : {scheduler_eval::SparseKind::Balanced,
+                          scheduler_eval::SparseKind::Hyperbolic,
+                          scheduler_eval::SparseKind::Triangle}) {
+    for (const auto order : {scheduler_eval::RowOrder::Sorted,
+                             scheduler_eval::RowOrder::Shuffled,
+                             scheduler_eval::RowOrder::Shifted}) {
+      const auto matrix =
+          scheduler_eval::MakeSparseMatrix(31, 47, kind, 1, order);
+      std::vector<double> input(matrix.columns, 2.0), actual;
+      scheduler_eval::Spmv(matrix, input, actual);
+      const auto expected = scheduler_eval::SpmvSerial(matrix, input);
+      for (std::size_t i = 0; i < actual.size(); ++i)
+        if (!Close(actual[i], expected[i]))
+          return false;
+    }
+  }
+  return true;
+}
+
+// A permutation must preserve the multiset of per-row costs exactly.
+bool CheckPermutationPreservesWork() {
+  const auto sorted = scheduler_eval::MakeSparseMatrix(
+      257, 4099, scheduler_eval::SparseKind::Hyperbolic, 1,
+      scheduler_eval::RowOrder::Sorted);
+  for (const auto order : {scheduler_eval::RowOrder::Shuffled,
+                           scheduler_eval::RowOrder::Shifted}) {
+    const auto permuted = scheduler_eval::MakeSparseMatrix(
+        257, 4099, scheduler_eval::SparseKind::Hyperbolic, 1, order);
+    if (permuted.values.size() != sorted.values.size())
+      return false;
+    std::vector<std::size_t> a, b;
+    for (std::size_t r = 0; r < sorted.rows; ++r) {
+      a.push_back(sorted.row_index[r + 1] - sorted.row_index[r]);
+      b.push_back(permuted.row_index[r + 1] - permuted.row_index[r]);
+    }
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    if (a != b)
+      return false;
+    // And must actually move heavy rows away from the front.
+    if (order != scheduler_eval::RowOrder::Sorted &&
+        permuted.row_index[1] == sorted.row_index[1] &&
+        permuted.row_index[2] == sorted.row_index[2])
+      return false;
+  }
+  return true;
+}
+
+#ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
+bool CheckBfs() {
+  const auto grid = scheduler_eval::MakeGraph(scheduler_eval::GraphKind::PaslSquareGrid, 8);
+  if (grid.offsets != std::vector<std::size_t>{0, 2, 4, 6, 8} ||
+      grid.edges != std::vector<std::uint32_t>{1, 2, 0, 3, 3, 0, 2, 1})
+    return false;
+  const auto cube = scheduler_eval::MakeGraph(scheduler_eval::GraphKind::PaslCubeGrid, 24);
+  if (cube.VertexCount() != 8 || cube.edges.size() != 24 ||
+      scheduler_eval::BfsFlat(cube) != std::vector<int>{0, 1, 1, 2, 1, 2, 2, 3})
+    return false;
+  const auto paths = scheduler_eval::MakeGraph(scheduler_eval::GraphKind::PaslParallelChains100, 400);
+  std::vector<int> path_levels(202);
+  for (std::size_t i = 1; i < 201; ++i)
+    path_levels[i] = 1 + (i - 1) % 2;
+  path_levels.back() = 3;
+  if (paths.edges.size() != 300 || scheduler_eval::BfsNested(paths, 2) != path_levels)
+    return false;
+  for (const auto kind : {scheduler_eval::GraphKind::PaslPhases10Degree2,
+                          scheduler_eval::GraphKind::PaslPhases50Degree5}) {
+    const auto graph = scheduler_eval::MakeGraph(kind, 3000);
+    const auto phases = kind == scheduler_eval::GraphKind::PaslPhases10Degree2 ? 10 : 50;
+    const auto width = (graph.VertexCount() - 1) / phases;
+    std::vector<int> expected(graph.VertexCount());
+    for (std::size_t i = 1; i < expected.size(); ++i)
+      expected[i] = 1 + (i - 1) / width;
+    if (scheduler_eval::BfsFlat(graph) != expected ||
+        scheduler_eval::BfsAdaptive(graph, std::chrono::microseconds(20)) != expected)
+      return false;
+  }
+  std::istringstream input("AdjacencyGraph 4 4 0 2 3 4 1 2 3 3");
+  const auto loaded = scheduler_eval::ReadAdjacencyGraph(input);
+  const std::vector<std::vector<int>> expected_sources{
+      {0, 1, 1, 2}, {-1, 0, -1, 1}, {-1, -1, 0, 1}, {-1, -1, -1, 0}};
+  for (std::uint32_t source = 0; source < expected_sources.size(); ++source) {
+    const auto &expected = expected_sources[source];
+    if (scheduler_eval::BfsSerial(loaded, source) != expected ||
+        scheduler_eval::BfsFlat(loaded, source) != expected ||
+        scheduler_eval::BfsNested(loaded, 1, nullptr, source) != expected ||
+        scheduler_eval::BfsAdaptive(loaded, std::chrono::microseconds(20),
+                                    1.8, nullptr, source) != expected)
+      return false;
+  }
+  try {
+    scheduler_eval::BfsFlat(loaded, 4);
+    return false;
+  } catch (const std::invalid_argument &) {
+  }
+  if (scheduler_eval::BfsSerial(loaded) != std::vector<int>{0, 1, 1, 2} ||
+      scheduler_eval::BfsFlat(loaded) != std::vector<int>{0, 1, 1, 2})
+    return false;
+  for (const auto bytes : {4u, 8u}) {
+    for (const auto little : {false, true}) {
+      std::string binary;
+      const auto append = [&](std::uint64_t value, unsigned width) {
+        for (unsigned i = 0; i < width; ++i)
+          binary.push_back(static_cast<char>(value >>
+              (8 * (little ? i : width - 1 - i))));
+      };
+      for (auto value : {std::uint64_t{0xdeadbeef}, std::uint64_t{bytes * 8},
+                         std::uint64_t{4}, std::uint64_t{4}, std::uint64_t{0}})
+        append(value, 8);
+      for (auto value : {0u, 2u, 3u, 4u, 4u, 1u, 2u, 3u, 3u})
+        append(value, bytes);
+      std::istringstream stream(binary);
+      const auto graph = scheduler_eval::ReadAdjacencyGraph(stream);
+      if (graph.offsets != loaded.offsets || graph.edges != loaded.edges)
+        return false;
+      binary.pop_back();
+      std::istringstream truncated(binary);
+      try {
+        scheduler_eval::ReadAdjacencyGraph(truncated);
+        return false;
+      } catch (const std::runtime_error &) {
+      }
+    }
+  }
+  for (const auto *invalid : {"bad 0 0", "AdjacencyGraph 1 0 1",
+                             "AdjacencyGraph 2 1 0 0 2",
+                             "AdjacencyGraph 1 1 0",
+                             "AdjacencyGraph 0 0 trailing"}) {
+    std::istringstream malformed(invalid);
+    try {
+      scheduler_eval::ReadAdjacencyGraph(malformed);
+      return false;
+    } catch (const std::runtime_error &) {
+    }
+  }
+  const scheduler_eval::CsrGraph empty;
+  if (!scheduler_eval::BfsSerial(empty).empty() ||
+      !scheduler_eval::BfsFlat(empty).empty() ||
+      !scheduler_eval::BfsNested(empty, 8).empty() ||
+      !scheduler_eval::BfsAdaptive(empty, std::chrono::microseconds(20))
+           .empty())
+    return false;
+  for (const auto kind :
+       {scheduler_eval::GraphKind::Tree,
+        scheduler_eval::GraphKind::RandomArity100,
+        scheduler_eval::GraphKind::ParallelChains,
+        scheduler_eval::GraphKind::Phases,
+        scheduler_eval::GraphKind::Phases10Degree2,
+        scheduler_eval::GraphKind::Phases50Degree5,
+        scheduler_eval::GraphKind::TrunkFirst, scheduler_eval::GraphKind::Rmat,
+        scheduler_eval::GraphKind::SquareGrid,
+        scheduler_eval::GraphKind::CubeGrid,
+        scheduler_eval::GraphKind::SmallWorld}) {
+    const auto graph = scheduler_eval::MakeGraph(kind, 1024);
+    const auto expected = scheduler_eval::BfsSerial(graph);
+    if (scheduler_eval::BfsFlat(graph) != expected ||
+        scheduler_eval::BfsNested(graph, 8) != expected ||
+        scheduler_eval::BfsAdaptive(graph, std::chrono::microseconds(20)) !=
+            expected)
+      return false;
+  }
+  return true;
+}
+#endif
+
+bool CheckSyntheticCosts() {
+  using scheduler_eval::CostKind;
+  for (const auto kind :
+       {CostKind::Constant, CostKind::Uniform, CostKind::Exponential,
+        CostKind::Pareto, CostKind::Linear, CostKind::Clustered,
+        CostKind::Periodic, CostKind::Shuffled, CostKind::PhaseChanging}) {
+    const auto costs = scheduler_eval::MakeIterationCosts(kind, 2048, 17);
+    if (scheduler_eval::RunCostLoop(costs) !=
+        scheduler_eval::RunCostLoopSerial(costs))
+      return false;
+  }
+  return true;
+}
+
+bool CheckPrimaryWorkloads() {
+  using scheduler_eval::KeyKind;
+  using scheduler_eval::PointKind;
+  for (const auto kind : {PointKind::UniformSquare, PointKind::InDisk,
+                          PointKind::OnCircle, PointKind::Kuzmin}) {
+    for (const auto size :
+         std::array<std::size_t, 7>{0, 1, 2, 3, 17, 257, 4099}) {
+      const auto points = scheduler_eval::MakePoints(kind, size, 29 + size);
+      auto expected = scheduler_eval::ConvexHullSerial(points);
+      scheduler_eval::ConvexHullMetrics metrics;
+      auto actual = scheduler_eval::ConvexHullParallel(points, &metrics);
+      const auto less = [](const auto &left, const auto &right) {
+        return left.x < right.x || (left.x == right.x && left.y < right.y);
+      };
+      std::sort(expected.begin(), expected.end(), less);
+      std::sort(actual.begin(), actual.end(), less);
+      if (expected.size() != actual.size() ||
+          metrics.hull_vertices != actual.size() ||
+          (size > 2048 && metrics.merge_passes == 0))
+        return false;
+      for (std::size_t i = 0; i < expected.size(); ++i)
+        if (expected[i].x != actual[i].x || expected[i].y != actual[i].y)
+          return false;
+    }
+  }
+  for (const auto kind : {KeyKind::Uniform, KeyKind::Exponential,
+                          KeyKind::DuplicateHeavy, KeyKind::AlmostSorted,
+                          KeyKind::ReverseSorted}) {
+    for (const auto size :
+         std::array<std::size_t, 7>{0, 1, 2, 7, 255, 2047, 4099}) {
+      const auto keys = scheduler_eval::MakeKeys(kind, size, 41 + size);
+      const auto pairs =
+          scheduler_eval::MakeKeyValues(kind, size, 41 + size);
+      scheduler_eval::DedupMetrics dedup_metrics;
+      scheduler_eval::RadixSortMetrics radix_metrics;
+      scheduler_eval::RadixSortMetrics pair_metrics;
+      scheduler_eval::SampleSortMetrics sample_metrics;
+      const auto dedup =
+          scheduler_eval::RemoveDuplicatesParallel(keys, &dedup_metrics);
+      const auto radix =
+          scheduler_eval::RadixSortParallel(keys, &radix_metrics);
+      const auto radix_pairs =
+          scheduler_eval::RadixSortPairsParallel(pairs, &pair_metrics);
+      const auto sample =
+          scheduler_eval::SampleSortParallel(keys, &sample_metrics);
+      if (dedup != scheduler_eval::RemoveDuplicatesSerial(keys) ||
+          radix != scheduler_eval::RadixSortSerial(keys) ||
+          radix_pairs != scheduler_eval::RadixSortPairsSerial(pairs) ||
+          sample != scheduler_eval::SampleSortSerial(keys) ||
+          dedup_metrics.unique_items != dedup.size() ||
+          dedup_metrics.hash_probes < keys.size() ||
+          (size > 0 && dedup_metrics.table_capacity < 2 * size) ||
+          radix_metrics.passes != (size == 0 ? 0u : 4u) ||
+          pair_metrics.passes != (size == 0 ? 0u : 4u) ||
+          sample_metrics.buckets != (size == 0 ? 0u
+                                               : std::min<std::size_t>(
+                                                     256, (size + 2047) / 2048)) ||
+          sample_metrics.largest_bucket > size)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool CheckGranularityEstimator() {
+  scheduler_eval::GranularityEstimator estimator(std::chrono::microseconds(20));
+  if (!estimator.IsSmall(1) || estimator.IsSmall(2))
+    return false;
+  estimator.Report(64, std::chrono::microseconds(10));
+  if (estimator.SequentialComplexityLimit() != 64 || !estimator.IsSmall(115) ||
+      estimator.IsSmall(116))
+    return false;
+  estimator.Report(128, std::chrono::microseconds(21));
+  return estimator.SequentialComplexityLimit() == 64;
+}
+
+bool CheckSchedulerMetrics() {
+#ifdef EIGEN_MODE
+  const auto before = EigenPool().GetStatistics();
+  std::atomic<bool> completed{false};
+  EigenPoolWrapper scheduler;
+  scheduler.run(
+      [&] { completed.store(true, std::memory_order_release); });
+  while (!completed.load(std::memory_order_acquire))
+    scheduler.execute_something_else();
+  const auto after = EigenPool().GetStatistics();
+  return after.scheduled - before.scheduled == 1 &&
+         after.executed - before.executed == 1;
+#else
+  return true;
+#endif
+}
+
+struct PointerValue : intrusive_ref_counter<PointerValue> {};
+
+bool CheckIntrusivePtrOrdering() {
+  IntrusivePtr<PointerValue> left(new PointerValue);
+  IntrusivePtr<PointerValue> right(new PointerValue);
+  return left < right || right < left;
+}
+
+} // namespace
+
+int main() {
+  scheduler_eval::Initialize();
+  const std::vector<double> values(1003, 1.25);
+  const bool bfs_ok =
+#ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
+      CheckBfs();
+#else
+      true;
+#endif
+  bool ok = Report("scan", CheckScan());
+  ok &= Report("spmv", CheckSpmv());
+  ok &= Report("row_permutation", CheckPermutationPreservesWork());
+  ok &= Report("bfs", bfs_ok);
+  ok &= Report("synthetic costs", CheckSyntheticCosts());
+  ok &= Report("primary workloads", CheckPrimaryWorkloads());
+  ok &= Report("extended workloads", scheduler_eval::CheckExtendedWorkloads());
+  ok &= Report("intrusive pointer ordering", CheckIntrusivePtrOrdering());
+  ok &= Report("granularity estimator", CheckGranularityEstimator());
+  ok &= Report("scheduler metrics", CheckSchedulerMetrics());
+  ok &= Report("blocked reduce",
+               Close(scheduler_eval::BlockedReduce(values, 37), 1253.75));
+  if (!ok)
+    std::cerr << "scheduler evaluation correctness test failed\n";
+  return ok ? 0 : 1;
+}

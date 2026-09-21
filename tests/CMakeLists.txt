@@ -16,6 +16,7 @@ endif ()
 
 list(APPEND OOX_UNITTESTS
         test_oox
+        test_shared_var
 )
 
 foreach (unittest IN LISTS OOX_UNITTESTS)
@@ -27,6 +28,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
           ${PROJECT_NAME}
           ${OOX_GTEST_LIB}
   )
+  if (unittest STREQUAL "test_shared_var")
+    target_compile_definitions(${unittest}
+            PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+  endif ()
   gtest_discover_tests(${unittest})
 
   # Serial debugging implementation
@@ -45,6 +50,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     target_compile_definitions(${unittest}_tbb PRIVATE HAVE_TBB)
     if (OOX_EXCEPTIONS_ENABLED)
       target_compile_definitions(${unittest}_tbb PRIVATE TBB_USE_EXCEPTIONS=1)
+    endif ()
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tbb
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
     endif ()
     target_link_libraries(${unittest}_tbb
             PRIVATE
@@ -68,6 +77,10 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
     # build test in TF mode as well
     add_executable(${unittest}_tf ${unittest}.cpp)
     target_compile_definitions(${unittest}_tf PRIVATE HAVE_TF)
+    if (unittest STREQUAL "test_shared_var")
+      target_compile_definitions(${unittest}_tf
+              PRIVATE OOX_TEST_INJECT_TASK_SPAWN_FAILURE=1)
+    endif ()
     target_link_libraries(${unittest}_tf
             PRIVATE
             ${PROJECT_NAME}
@@ -79,12 +92,39 @@ foreach (unittest IN LISTS OOX_UNITTESTS)
 
 endforeach ()
 
+add_test(NAME NonThrowConsumeCompile
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 "-D OOX_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                 "-D OOX_CXX_COMPILER_TARGET=${CMAKE_CXX_COMPILER_TARGET}"
+                 "-D OOX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+                 "-D OOX_SYSROOT=${CMAKE_SYSROOT}"
+                 "-D OOX_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}"
+                 "-D OOX_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+                 "-D OOX_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                 "-D OOX_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_test eigen_pool_test.cpp)
   target_link_libraries(eigen_pool_test PRIVATE
           ${PROJECT_NAME}::eigen
           ${OOX_GTEST_LIB})
   gtest_discover_tests(eigen_pool_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30)
+
+  add_executable(eigen_small_object_pool_test eigen_small_object_pool_test.cpp)
+  target_link_libraries(eigen_small_object_pool_test PRIVATE
+          ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_small_object_pool_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL_TESTING=1)
+  gtest_discover_tests(eigen_small_object_pool_test
           DISCOVERY_MODE PRE_TEST
           DISCOVERY_TIMEOUT 30)
 
@@ -110,6 +150,38 @@ if (OOX_ENABLE_EIGEN)
   add_executable(wake_check wake_check.cpp)
   target_link_libraries(wake_check PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenBatchedWakeCount COMMAND wake_check)
+  add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
+  target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)
+
+  add_executable(eigen_partitioner_allocation_test eigen_partitioner_allocation_test.cpp)
+  target_link_libraries(eigen_partitioner_allocation_test PRIVATE ${PROJECT_NAME}::eigen)
+  # Inject failures at every allocation request, including warm-cache calls.
+  target_compile_definitions(eigen_partitioner_allocation_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL=0)
+  add_executable(eigen_partitioner_lifetime_test eigen_partitioner_lifetime_test.cpp)
+  target_link_libraries(eigen_partitioner_lifetime_test PRIVATE ${PROJECT_NAME}::eigen)
+  # Observe actual Region reclamation rather than retention in the object cache.
+  target_compile_definitions(eigen_partitioner_lifetime_test PRIVATE
+          OOX_EIGEN_SMALL_OBJECT_POOL=0)
+  add_test(NAME EigenPartitionerLifetimeOracle COMMAND eigen_partitioner_lifetime_test)
+
+  add_executable(eigen_partitioner_completion_test eigen_partitioner_completion_test.cpp)
+  target_link_libraries(eigen_partitioner_completion_test PRIVATE ${PROJECT_NAME}::eigen)
+  target_compile_definitions(eigen_partitioner_completion_test PRIVATE
+          OOX_EIGEN_THREAD_POOL_TESTING=1)
+  add_test(NAME EigenPartitionerCompletion COMMAND eigen_partitioner_completion_test)
+  set_tests_properties(EigenPartitionerCompletion PROPERTIES TIMEOUT 60)
+
+  foreach (partitioner IN ITEMS auto simple static affinity)
+    add_test(NAME EigenPartitionerRangeOracle_${partitioner}
+             COMMAND eigen_partitioner_range_test ${partitioner})
+    add_test(NAME EigenPartitionerAllocationFailure_${partitioner}
+             COMMAND eigen_partitioner_allocation_test ${partitioner})
+    set_tests_properties(EigenPartitionerRangeOracle_${partitioner}
+                         PROPERTIES TIMEOUT 120)
+    set_tests_properties(EigenPartitionerAllocationFailure_${partitioner}
+                         PROPERTIES TIMEOUT 60)
+  endforeach ()
 
   find_package(Eigen3 3.4 QUIET NO_MODULE)
   if (TARGET Eigen3::Eigen)
@@ -149,6 +221,17 @@ if (OOX_EXCEPTIONS_ENABLED)
                    -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
                    -P ${CMAKE_CURRENT_LIST_DIR}/exception_policy_compile.cmake)
 endif ()
+
+add_test(NAME NestedCMakePreservesListValues
+         COMMAND ${CMAKE_COMMAND}
+                 -D OOX_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -D OOX_BINARY_DIR=${PROJECT_BINARY_DIR}
+                 "-D OOX_GENERATOR=${CMAKE_GENERATOR}"
+                 "-D OOX_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+                 "-D OOX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+                 "-D OOX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}"
+                 "-D OOX_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                 -P ${CMAKE_CURRENT_LIST_DIR}/nested_cmake_list_values.cmake)
 
 if (OOX_BUILD_TWIST_TESTS)
   add_subdirectory(twist)

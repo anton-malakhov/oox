@@ -105,7 +105,8 @@ public:
   Work PopBack() {
     if (Empty())
       return Work();
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return Work();
     unsigned back = back_.load(std::memory_order_relaxed);
     Elem *e = &array_[back & kMask];
     uint8_t s = e->state.load(std::memory_order_relaxed);
@@ -125,13 +126,6 @@ public:
   // Empty tests whether container is empty.
   // Can be called by any thread at any time.
   bool Empty() const { return SizeOrNotEmpty<false>() == 0; }
-
-  // Delete all the elements from the queue.
-  void Flush() {
-    while (!Empty()) {
-      PopFront();
-    }
-  }
 
 private:
   static const unsigned kMask = kSize - 1;

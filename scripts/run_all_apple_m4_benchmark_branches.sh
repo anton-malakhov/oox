@@ -195,11 +195,14 @@ if [[ -f "${ROOT}/scripts/compare_local_benchmark_branches.py" ]]; then
   echo "=== Building consolidated comparison table ==="
   python3 "${ROOT}/scripts/compare_local_benchmark_branches.py" \
     --results-root "${ROOT}/${OUT_ROOT}" \
-    --suffix=-3s || true
+    --suffix=-3s
+else
+  echo "Missing comparison script: ${ROOT}/scripts/compare_local_benchmark_branches.py" >&2
+  exit 1
 fi
 
 echo ""
 echo "Done."
 echo "Per-branch results: ${ROOT}/${OUT_ROOT}/<branch>-3s/"
-echo "Consolidated report: ${ROOT}/${OUT_ROOT}/full_comparison.md (if compare script succeeded)"
+echo "Consolidated report: ${ROOT}/${OUT_ROOT}/full_comparison.md"
 echo "Worktrees: ${WORKTREE_ROOT} (REUSE_WORKTREES=1 to reuse)"

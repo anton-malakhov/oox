@@ -19,6 +19,7 @@
 #include "max_size_vector.h"
 #include "run_queue.h"
 #include "stl_thread_env.h"
+#include "small_object_pool.h"
 
 #include <atomic>
 #include <bit>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -116,6 +118,12 @@ public:
 private:
   RapidTask &task_;
 };
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+namespace internal {
+inline std::atomic<size_t> completion_notifications{0};
+inline std::atomic<size_t> completion_waits{0};
+}
+#endif
 
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
@@ -152,22 +160,24 @@ private:
   RapidTask *rapid_ = nullptr;
 };
 
-template <typename F> struct UniqueTask : Task {
-  using Function = std::decay_t<F>;
+template <typename F>
+struct UniqueTask final : Task, SmallObjectAllocated<UniqueTask<F>> {
 
-  explicit UniqueTask(F &&function)
-      : function_(std::forward<F>(function)) {}
+  template <typename G> explicit UniqueTask(G &&f) : f(std::forward<G>(f)) {}
 
   void operator()() override {
-    std::unique_ptr<UniqueTask> self(this);
-    self->function_();
+    const auto release = [](UniqueTask *p) { DeleteSmallObject(p); };
+    std::unique_ptr<UniqueTask, decltype(release)> self(this, release);
+    f();
   }
 
-  Function function_;
+  void Discard() noexcept override { DeleteSmallObject(this); }
+
+  F f;
 };
 
 template <typename F> Task *MakeTask(F &&f) {
-  return new UniqueTask<decltype(std::forward<F>(f))>{std::forward<F>(f)};
+  return NewSmallObject<UniqueTask<std::decay_t<F>>>(std::forward<F>(f));
 }
 
 // This defines an interface that ThreadPoolDevice can take to use
@@ -204,7 +214,19 @@ template <typename Environment>
 class ThreadPoolTempl : public ThreadPoolInterface {
 public:
   using TaskPtr = Task *;
-  using Queue = RunQueue<TaskPtr, 1024>;
+  using QueueEntry = uintptr_t;
+  using Queue = RunQueue<QueueEntry, 1024>;
+
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct Statistics {
+    uint64_t scheduled{};
+    uint64_t executed{};
+    uint64_t successful_steals{};
+    uint64_t failed_steal_rounds{};
+    uint64_t sleeps{};
+    uint64_t idle_nanoseconds{};
+  };
+#endif
 
   ThreadPoolTempl(int num_threads, Environment env = Environment())
       : ThreadPoolTempl(num_threads, true, false, env) {}
@@ -249,7 +271,6 @@ public:
     for (int i = 0; i < num_threads_; i++) {
       SetStealPartition(i, EncodePartition(0, num_threads_));
     }
-
     const bool needs_fallback_worker = use_main_thread && num_threads_ == 1;
     if (use_main_thread) {
       RegisterCreator(!needs_fallback_worker);
@@ -284,27 +305,18 @@ public:
     RestoreCreatorRegistration();
   }
 
-  void SetStealPartitions(
-      const std::vector<std::pair<unsigned, unsigned>> &partitions) {
-    assert(partitions.size() == static_cast<std::size_t>(num_threads_));
-
-    // Pass this information to each thread queue.
-    for (int i = 0; i < num_threads_; i++) {
-      const auto &pair = partitions[i];
-      unsigned start = pair.first, end = pair.second;
-      AssertBounds(start, end);
-      unsigned val = EncodePartition(start, end);
-      SetStealPartition(i, val);
-    }
-  }
-
   void Schedule(TaskPtr p) override {
     // schedule on main thread only when explicitly requested
     ScheduleWithHint(p, 0, num_threads_);
   }
 
   void RunOnThread(TaskPtr t, size_t threadIndex) {
+    // The target is a placement hint: another worker may steal the task.
     if (t == nullptr) {
+      return;
+    }
+    if (cancelled_.load(std::memory_order_acquire)) {
+      t->Discard();
       return;
     }
     threadIndex = threadIndex % num_threads_;
@@ -367,11 +379,51 @@ public:
   // Pair with every PublishOrdinaryBatch call, including exceptional exits.
   void FinishOrdinaryBatch() { ReconcileCancelledOrdinaryBatch(); }
 
+  void ScheduleWithAffinity(TaskPtr task, size_t hint) {
+    if (!task)
+      return;
+    PerThread *pt = GetPerThread();
+    hint %= num_threads_;
+    if (!IsRegistered(pt) || !pt->owns_queue ||
+        hint == static_cast<size_t>(pt->thread_id)) {
+      RunOnThread(task, hint);
+      return;
+    }
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (!publication.IsAdmitted() || IsCancelled()) {
+        task->Discard();
+        return;
+      }
+      const auto discard = [](Task *p) { p->Discard(); };
+      std::unique_ptr<Task, decltype(discard)> pending(task, discard);
+      auto *proxy = new AffinityProxy(task);
+      pending.release();
+      AccountTask(task, pt->thread_id);
+      if (!thread_data_[hint].affinity_mailbox.Push(proxy)) {
+        inline_task = proxy->template Extract<AffinityProxy::mailbox_bit>();
+        proxy->template Extract<AffinityProxy::local_bit>();
+      } else {
+        const QueueEntry entry = reinterpret_cast<QueueEntry>(proxy) | proxy_tag;
+        if (!thread_data_[pt->thread_id].local_tasks.PushFront(entry))
+          inline_task = proxy->template Extract<AffinityProxy::local_bit>();
+      }
+      ReleaseOneResidentForOrdinary();
+      WakeOneWorker();
+    }
+    if (inline_task)
+      ExecuteTask(inline_task);
+  }
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
     if (t == nullptr) {
       return;
     }
     AssertBounds(start, limit);
+    if (cancelled_.load(std::memory_order_acquire)) {
+      t->Discard();
+      return;
+    }
     PerThread *pt = GetPerThread();
     if (IsRegistered(pt) && pt->owns_queue && pt->thread_id >= start &&
         pt->thread_id < limit) {
@@ -405,6 +457,10 @@ public:
   }
 
   size_t NumThreads() const final { return num_threads_; }
+
+  bool IsCancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
 
   size_t CurrentThreadId() const final {
     const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
@@ -458,10 +514,6 @@ public:
   // Worker wake notifications that reached a parked worker. Diagnostic.
   size_t WorkerWakeNotifications() const noexcept {
     return worker_event_.Notifications();
-  }
-
-  bool IsCancelled() const noexcept {
-    return cancelled_.load(std::memory_order_acquire);
   }
 
   bool UsesResidentBusyWait() const noexcept {
@@ -552,6 +604,7 @@ public:
         if (cancelled_.load(std::memory_order_acquire)) {
           rapid->Cancel();
         }
+        ReleaseOneResidentForOrdinary();
         WakeOneWorker();
         return;
       }
@@ -589,6 +642,23 @@ public:
       event.Wait(token);
     }
   }
+#ifdef OOX_EIGEN_ENABLE_STATS
+  Statistics GetStatistics() const {
+    Statistics result;
+    for (const auto &data : thread_data_) {
+      result.scheduled += data.statistics.scheduled.load(std::memory_order_relaxed);
+      result.executed += data.statistics.executed.load(std::memory_order_relaxed);
+      result.successful_steals +=
+          data.statistics.successful_steals.load(std::memory_order_relaxed);
+      result.failed_steal_rounds +=
+          data.statistics.failed_steal_rounds.load(std::memory_order_relaxed);
+      result.sleeps += data.statistics.sleeps.load(std::memory_order_relaxed);
+      result.idle_nanoseconds +=
+          data.statistics.idle_nanoseconds.load(std::memory_order_relaxed);
+    }
+    return result;
+  }
+#endif
 
   template <typename Predicate> void Wait(Predicate ready) {
     const bool registered = IsRegistered(GetPerThread());
@@ -598,6 +668,10 @@ public:
     auto &event = registered ? worker_event_ : waiter_event_;
 
     while (!ready()) {
+      // Help before registering; the second check below prevents lost wakeups.
+      if (registered && TryExecuteOne()) {
+        continue;
+      }
       const uint64_t token = event.PrepareWait();
       if (registered && TryExecuteOne()) {
         event.CancelWait();
@@ -607,6 +681,10 @@ public:
         event.CancelWait();
         return;
       }
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+      internal::completion_waits.fetch_add(1);
+      internal::completion_waits.notify_one();
+#endif
       event.Wait(token);
     }
   }
@@ -616,6 +694,9 @@ public:
   }
 
   void NotifyTaskCompletion() {
+#ifdef OOX_EIGEN_THREAD_POOL_TESTING
+    internal::completion_notifications.fetch_add(1);
+#endif
     worker_event_.NotifyAll();
     waiter_event_.NotifyAll();
   }
@@ -779,7 +860,6 @@ private:
                                              unsigned limit) noexcept {
     return (start << kMaxPartitionBits) | limit;
   }
-
   void ExecuteTask(TaskPtr p) {
     struct FinishTask {
       ThreadPoolTempl *pool;
@@ -788,7 +868,14 @@ private:
     } finish{this, p->outstanding};
     PerThread *pt = GetPerThread();
     ScopedRegionContext restore(pt->region_context, p->region_context);
-    (*p)();
+    try {
+      (*p)();
+    } catch (...) {
+      // Exception-aware tasks must publish failure before returning. The pool
+      // cannot repair an arbitrary task's completion state after it unwinds;
+      // continuing here could leave its dependents waiting forever.
+      std::terminate();
+    }
   }
 
   static constexpr DomainId DecodePartition(unsigned value) noexcept {
@@ -828,6 +915,55 @@ private:
 
   typedef typename Environment::EnvThread Thread;
 
+  static constexpr QueueEntry proxy_tag = 1;
+
+  struct AffinityProxy final {
+    static constexpr uintptr_t local_bit = 1;
+    static constexpr uintptr_t mailbox_bit = 2;
+    static constexpr uintptr_t locations = local_bit | mailbox_bit;
+    static_assert(alignof(Task) > locations);
+
+    explicit AffinityProxy(TaskPtr task) noexcept
+        : task_and_locations(reinterpret_cast<uintptr_t>(task) | locations) {}
+
+    template <uintptr_t Location> TaskPtr Extract() noexcept {
+      constexpr uintptr_t other = locations ^ Location;
+      const uintptr_t previous =
+          task_and_locations.fetch_and(other, std::memory_order_acq_rel);
+      // The other location can reclaim this proxy immediately after the RMW.
+      // Only the last location may access it again.
+      if (!(previous & other))
+        delete this;
+      return reinterpret_cast<TaskPtr>(previous & ~locations);
+    }
+
+    std::atomic<uintptr_t> task_and_locations;
+    AffinityProxy *next = nullptr;
+  };
+
+  // Bounded recipient references. Thieves use the sender's local proxy;
+  // cancellation can safely drain the mailbox alongside its owner.
+  class AffinityMailbox {
+  public:
+    bool Push(AffinityProxy *proxy) noexcept { return queue_.try_push(proxy); }
+
+    AffinityProxy *Pop() noexcept {
+      AffinityProxy *result = nullptr;
+      queue_.try_pop(result);
+      return result;
+    }
+
+  private:
+    rigtorp::mpmc::Queue<AffinityProxy *> queue_{1024};
+  };
+
+  static TaskPtr ExtractEntry(QueueEntry entry) noexcept {
+    if (entry & proxy_tag)
+      return reinterpret_cast<AffinityProxy *>(entry & ~proxy_tag)
+          ->template Extract<AffinityProxy::local_bit>();
+    return reinterpret_cast<TaskPtr>(entry);
+  }
+
   struct PerThread {
     constexpr PerThread()
         : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
@@ -841,6 +977,17 @@ private:
     RegionContext *region_context;
   };
 
+#ifdef OOX_EIGEN_ENABLE_STATS
+  struct AtomicStatistics {
+    std::atomic<uint64_t> scheduled{0};
+    std::atomic<uint64_t> executed{0};
+    std::atomic<uint64_t> successful_steals{0};
+    std::atomic<uint64_t> failed_steal_rounds{0};
+    std::atomic<uint64_t> sleeps{0};
+    std::atomic<uint64_t> idle_nanoseconds{0};
+  };
+#endif
+
   struct ThreadData {
     ThreadData()
         : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
@@ -851,6 +998,7 @@ private:
     std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
+    AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
     // High bit rejects new publishers; the remaining bits count active ones.
     std::atomic<size_t> rapid_publication_state;
@@ -899,19 +1047,25 @@ private:
         task->ReleaseTicket();
       }
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    AtomicStatistics statistics;
+#endif
 
     bool PushTask(TaskPtr p, bool localThread) {
       if (localThread) {
-        return local_tasks.PushFront(p);
+        return local_tasks.PushFront(reinterpret_cast<QueueEntry>(p));
       } else {
         return mailbox.try_push(p);
       }
     }
 
     TaskPtr PopFront() {
-      if (auto p = local_tasks.PopFront()) {
-        return p;
-      }
+      while (auto entry = local_tasks.PopFront())
+        if (auto *task = ExtractEntry(entry))
+          return task;
+      while (auto *proxy = affinity_mailbox.Pop())
+        if (auto *task = proxy->template Extract<AffinityProxy::mailbox_bit>())
+          return task;
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
       return task;
@@ -921,7 +1075,9 @@ private:
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
       if (!task && force) {
-        task = local_tasks.PopBack();
+        while (auto entry = local_tasks.PopBack())
+          if ((task = ExtractEntry(entry)))
+            break;
       }
       return task;
     }
@@ -1017,7 +1173,20 @@ private:
         worker_event_.CancelWait();
         return processed_anything;
       }
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_begin = std::chrono::steady_clock::now();
+#endif
       worker_event_.Wait(token);
+#ifdef OOX_EIGEN_ENABLE_STATS
+      const auto idle_end = std::chrono::steady_clock::now();
+      auto &statistics = thread_data_[GetPerThread()->thread_id].statistics;
+      statistics.sleeps.fetch_add(1, std::memory_order_relaxed);
+      statistics.idle_nanoseconds.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(idle_end -
+                                                               idle_begin)
+              .count(),
+          std::memory_order_relaxed);
+#endif
     }
   }
 
@@ -1084,6 +1253,16 @@ private:
     return pt->pool == this && pt->pool_generation == pool_generation_;
   }
 
+  void AccountTask(TaskPtr task, int target) noexcept {
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[target].statistics.scheduled.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
+    auto &outstanding = thread_data_[target].outstanding_tasks;
+    task->outstanding = &outstanding;
+    outstanding.fetch_add(1, std::memory_order_relaxed);
+  }
+
   void PublishOrdinaryTask(TaskPtr task, int target, bool local) {
     TaskPtr inline_task = nullptr;
     {
@@ -1102,9 +1281,7 @@ private:
 
   TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local,
                               bool wake = true) {
-    auto &outstanding = thread_data_[target].outstanding_tasks;
-    task->outstanding = &outstanding;
-    outstanding.fetch_add(1, std::memory_order_relaxed);
+    AccountTask(task, target);
     if (!thread_data_[target].PushTask(task, local)) {
       return task;
     }
@@ -1151,6 +1328,10 @@ private:
       return false;
     }
     pt->rapid_streak = 0;
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.executed.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     ExecuteTask(task);
     return true;
   }
@@ -1224,6 +1405,7 @@ private:
     const uint64_t bit = uint64_t{1} << (worker % 64);
     resident_available_[word].fetch_or(bit, std::memory_order_release);
     bool processed = false;
+    unsigned polls = 0;
     if (!NoOutstandingTasks() && WithdrawResident(worker)) {
       return processed;
     }
@@ -1247,6 +1429,18 @@ private:
       }
       if (data.resident_ordinary.exchange(false, std::memory_order_acquire)) {
         return processed;
+      }
+      // Publication may race with advertising this worker as resident. Probe
+      // periodically so a missed availability snapshot cannot strand work.
+      if (++polls == kSpinCount) {
+        polls = 0;
+        bool pending = !NoOutstandingTasks();
+        for (const auto &source : thread_data_) {
+          pending |= source.rapid_slot.load(std::memory_order_acquire) != nullptr ||
+                     !source.rapid_overflow.empty();
+        }
+        if (pending && WithdrawResident(worker))
+          return processed;
       }
       if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
         if (WithdrawResident(worker)) {
@@ -1279,7 +1473,7 @@ private:
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
     assert(outstanding != nullptr);
-    const size_t previous = outstanding->fetch_sub(1, std::memory_order_release);
+    const size_t previous = outstanding->fetch_sub(1, std::memory_order_seq_cst);
     assert(previous > 0);
     if (previous == 1 && done_.load(std::memory_order_acquire) &&
         NoOutstandingTasks()) {
@@ -1376,6 +1570,11 @@ private:
       assert(start + victim < limit);
       TaskPtr t = thread_data_[start + victim].PopBack(force);
       if (t) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+        if (static_cast<int>(start + victim) != pt->thread_id)
+          thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
+              1, std::memory_order_relaxed);
+#endif
         return t;
       }
       victim += inc;
@@ -1383,6 +1582,10 @@ private:
         victim -= size;
       }
     }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    thread_data_[pt->thread_id].statistics.failed_steal_rounds.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     return nullptr;
   }
 
@@ -1403,7 +1606,6 @@ private:
 
     return Steal(domain.start, domain.limit, force);
   }
-
   // Steals work from any other thread in the pool.
   TaskPtr GlobalSteal(bool force) { return Steal(0, num_threads_, force); }
 

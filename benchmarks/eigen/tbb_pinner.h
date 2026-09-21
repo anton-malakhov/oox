@@ -2,7 +2,9 @@
 
 #include "util.h"
 #include <iostream>
+#if defined(__linux__)
 #include <sched.h>
+#endif
 #include <tbb/tbb.h>
 
 class PinningObserver : public tbb::task_scheduler_observer {

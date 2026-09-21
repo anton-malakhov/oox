@@ -79,3 +79,9 @@ remain in every Eigen-derived file.
 `OOX_EIGEN_CACHE_LINE_SIZE` can override the stable 64-byte cache-line layout
 constant used by the vendored MPMC queue. Its value must be a power of two no
 greater than 128, matching the vendored aligned allocator's supported range.
+
+## Range partitioners
+
+[ParallelFor and partitioners](PARTITIONERS.md) provide auto, simple, static,
+and affinity policies adapted from oneTBB on the ordinary scheduler. They reuse
+the existing scheduler-evaluation workloads.

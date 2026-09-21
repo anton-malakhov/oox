@@ -34,6 +34,7 @@ inline std::string GetParallelMode() {
 #define TBB_AFFINITY 3
 #define TBB_CONST_AFFINITY 4
 #define TBB_RAPID 5
+#define TBB_STATIC 6
 
 #define EIGEN_STEALING 1
 #define EIGEN_SHARING 2
@@ -56,6 +57,10 @@ inline std::string GetParallelMode() {
 #define EIGEN_RAPID_LAZY_PRESSURE 16
 // Dedicated busy-wait pool with a 64-participant resident availability mask.
 #define EIGEN_RAPID_RESIDENT 17
+#define EIGEN_AUTO 18
+#define EIGEN_SIMPLE 19
+#define EIGEN_STATIC 20
+#define EIGEN_AFFINITY 21
 
 #define TASKFLOW_GUIDED 1
 #define TASKFLOW_DYNAMIC 2

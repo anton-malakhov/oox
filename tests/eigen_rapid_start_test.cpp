@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <oox/eigen/rapid_start.h>
+#include <oox/eigen/parallel_for.h>
 
 #include <gtest/gtest.h>
 
@@ -349,6 +350,77 @@ TEST(EigenRapidResident, PropagatesExceptionsAndSupportsLargePools) {
   ParallelForResident(harness.group, 0, 4096,
                       [&](size_t) { completed.fetch_add(1); });
   EXPECT_EQ(completed.load(), 4096u);
+}
+
+TEST(EigenRapidResident, NativeRapidPublicationReleasesIdleResidents) {
+  RapidHarness harness(8, true, 128, WorkerIdleMode::ResidentBusy);
+  PrepareResidentGroup(harness.group);
+  std::vector<std::atomic<unsigned>> visits(257);
+  auto execution = std::async(std::launch::async, [&] {
+    ParallelFor(harness.group, 0, visits.size(), [&](size_t i) {
+      visits[i].fetch_add(1, std::memory_order_relaxed);
+    });
+  });
+  const auto status = execution.wait_for(2s);
+  if (status != std::future_status::ready)
+    harness.pool.Cancel();
+  execution.get();
+  ASSERT_EQ(status, std::future_status::ready);
+  for (size_t i = 0; i < visits.size(); ++i)
+    EXPECT_EQ(visits[i].load(), 1u) << "index=" << i;
+}
+
+TEST(EigenRapidResident, PartialAvailabilityMatchesSerialOracle) {
+  constexpr uint64_t seed = 0x7e572021;
+  for (unsigned workers : {1u, 3u, 8u, 65u}) {
+    for (unsigned busy : {0u, workers / 2, workers}) {
+      RapidHarness harness(workers, true, 128, WorkerIdleMode::ResidentBusy);
+      PrepareResidentGroup(harness.group);
+      std::promise<void> release, entered;
+      auto unblocked = release.get_future().share();
+      std::atomic<unsigned> arrivals{0};
+      for (unsigned i = 0; i < busy; ++i) {
+        harness.pool.Schedule(MakeTask([&, unblocked] {
+          if (arrivals.fetch_add(1) + 1 == busy)
+            entered.set_value();
+          unblocked.wait();
+        }));
+      }
+      if (busy && entered.get_future().wait_for(2s) != std::future_status::ready) {
+        release.set_value();
+        FAIL() << "workers=" << workers << ", busy=" << busy;
+      }
+      uint64_t random = seed;
+      for (size_t case_index = 0; case_index < 98; ++case_index) {
+        random = random * 6364136223846793005ULL + 1;
+        const size_t size = case_index < 64 ? case_index :
+                            case_index < 96 ? (random >> 32) % 1024 :
+                            65537 + (random >> 32) % 65536;
+        const size_t first = random % 97;
+        std::vector<std::atomic<unsigned>> visits(size);
+        auto body = [&](size_t i) { visits[i - first].fetch_add(1); };
+        // When every worker is blocked, resident execution must use the
+        // caller. The other APIs require at least one scheduler worker.
+        if (busy == workers || case_index % 3 == 0) {
+          ParallelForResident(harness.group, first, first + size, body);
+        } else if (case_index % 3 == 1) {
+          ParallelFor(harness.group, first, first + size, body);
+        } else {
+          oox::detail::eigen_pool::ParallelFor(
+              harness.pool, first, first + size, body);
+        }
+        for (size_t i = 0; i < size; ++i) {
+          if (visits[i].load() != 1) {
+            release.set_value();
+            FAIL() << "seed=" << seed << ", case=" << case_index
+                   << ", workers=" << workers << ", busy=" << busy
+                   << ", index=" << i;
+          }
+        }
+      }
+      release.set_value();
+    }
+  }
 }
 
 enum class HybridPolicy : std::uint8_t {

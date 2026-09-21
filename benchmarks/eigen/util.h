@@ -101,7 +101,7 @@ inline void CpuRelax() {
 }
 
 inline void PinThread(size_t slot_number) {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(OOX_EVAL_UNPINNED)
   cpu_set_t mask;
   auto mask_size = sizeof(mask);
   if (sched_getaffinity(0, mask_size, &mask)) {

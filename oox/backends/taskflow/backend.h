@@ -38,6 +38,9 @@ struct task : task_life {
     }
 
     void spawn() {
+#if defined(OOX_TEST_INJECT_TASK_SPAWN_FAILURE) && OOX_TEST_INJECT_TASK_SPAWN_FAILURE
+        maybe_inject_task_spawn_failure();
+#endif
         get_tf_pool().silent_async([this] {
             this->execute();
         });
