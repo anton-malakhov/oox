@@ -6,12 +6,10 @@
 #include "serial_adapter.h"
 #elif defined(OOX_TASK_MODE)
 #include "oox_task_adapter.h"
-#elif defined(RAPID_START_MODE)
-#ifdef EIGEN_MODE
+#elif defined(RAPID_GROUP_MODE)
 #include "eigen_rapid_adapter.h"
-#else
+#elif defined(RAPID_START_MODE)
 #include "rapid_start_adapter.h"
-#endif
 #else
 #include "benchmarks/eigen/parallel_for.h"
 #include "benchmarks/eigen/thread_index.h"

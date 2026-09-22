@@ -24,7 +24,9 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
+#ifdef OOX_EIGEN_ENABLE_STATS
 #include <chrono>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -37,17 +39,7 @@
 #include <utility>
 #include <vector>
 
-// Batch publication wakes parked workers once per batch with a count instead
-// of once per task. Set to 0 to restore per-task notification for A/B runs.
-#ifndef OOX_EIGEN_BATCHED_WAKE
-#define OOX_EIGEN_BATCHED_WAKE 1
-#endif
-
 namespace oox::detail::eigen_pool {
-
-namespace rapid {
-class RapidDomainState;
-}
 
 // ResidentBusy is an explicit pool-lifetime policy. Idle workers advertise a
 // bit and poll a command slot instead of entering the OS parking protocol.
@@ -82,55 +74,12 @@ struct DomainId {
   }
 };
 
-struct RegionContext {
-  DomainId domain;
-  RegionContext *parent = nullptr;
-  bool leave_on_steal = false;
-  rapid::RapidDomainState *rapid_state = nullptr;
-};
-
-class ScopedRegionContext {
-public:
-  ScopedRegionContext(RegionContext *&current, RegionContext *replacement)
-      : current_(current), previous_(std::exchange(current, replacement)) {}
-  ScopedRegionContext(const ScopedRegionContext &) = delete;
-  ScopedRegionContext &operator=(const ScopedRegionContext &) = delete;
-  ~ScopedRegionContext() { current_ = previous_; }
-
-private:
-  RegionContext *&current_;
-  RegionContext *previous_;
-};
-
-struct Task;
-
-class RapidTask {
-public:
-  virtual void AddTickets(size_t count) noexcept = 0;
-  virtual bool TryRun() = 0;
-  virtual void Cancel() noexcept = 0;
-  virtual void ReleaseTicket() noexcept = 0;
-  virtual RegionContext *Context() noexcept = 0;
-  virtual Task *FallbackTicket() noexcept = 0;
-  virtual ~RapidTask() = default;
-};
-
 class ResidentTask {
 public:
   virtual void Run(size_t slot) noexcept = 0;
   virtual ~ResidentTask() = default;
 };
 
-class RapidTicketGuard {
-public:
-  explicit RapidTicketGuard(RapidTask &task) noexcept : task_(task) {}
-  RapidTicketGuard(const RapidTicketGuard &) = delete;
-  RapidTicketGuard &operator=(const RapidTicketGuard &) = delete;
-  ~RapidTicketGuard() { task_.ReleaseTicket(); }
-
-private:
-  RapidTask &task_;
-};
 #ifdef OOX_EIGEN_THREAD_POOL_TESTING
 namespace internal {
 inline std::atomic<size_t> completion_notifications{0};
@@ -140,37 +89,9 @@ inline std::atomic<size_t> completion_waits{0};
 
 struct Task {
   std::atomic<size_t> *outstanding = nullptr;
-  RegionContext *region_context = nullptr;
   virtual void operator()() = 0;
   virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
-};
-
-class RapidFallbackTask final : public Task {
-public:
-  void Bind(RapidTask *task) noexcept {
-    assert(rapid_ == nullptr);
-    rapid_ = task;
-    region_context = task->Context();
-  }
-  void operator()() final {
-    RapidTask *task = rapid_;
-    rapid_ = nullptr;
-    assert(task != nullptr);
-    RapidTicketGuard release(*task);
-    task->TryRun();
-  }
-  void Discard() noexcept final {
-    RapidTask *task = rapid_;
-    rapid_ = nullptr;
-    if (task) {
-      task->Cancel();
-      task->ReleaseTicket();
-    }
-  }
-
-private:
-  RapidTask *rapid_ = nullptr;
 };
 
 template <typename F>
@@ -254,7 +175,6 @@ public:
       : env_(env), num_threads_(ValidateThreadCount(num_threads)),
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
-        global_steal_partition_(EncodePartition(0, num_threads_)),
         pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
         resident_available_words_(
             idle_mode_ == WorkerIdleMode::ResidentBusy
@@ -280,9 +200,6 @@ public:
     thread_data_.resize(num_threads_);
     for (size_t word = 0; word < resident_available_words_; ++word) {
       resident_available_[word].store(0, std::memory_order_relaxed);
-    }
-    for (int i = 0; i < num_threads_; i++) {
-      SetStealPartition(i, EncodePartition(0, num_threads_));
     }
     const bool needs_fallback_worker = use_main_thread && num_threads_ == 1;
     if (use_main_thread) {
@@ -339,59 +256,6 @@ public:
     PublishOrdinaryTask(t, static_cast<int>(threadIndex), local);
   }
 
-  template <typename F> void PublishOrdinaryBatch(F &&publisher) {
-    // Batch publication may overlap cancellation. The final reconciliation
-    // drains any tasks published after cancellation's own drain.
-    if ((ordinary_publication_state_.load(std::memory_order_acquire) &
-         kPublicationCancelled) != 0) {
-      return;
-    }
-    // Wake one worker on the first publication so a parked pool starts
-    // immediately, then defer the remaining notifications to one NotifyN at
-    // the end of the batch (including exceptional exits). Every mature parking
-    // protocol (Eigen EventCount, Rayon's jobs event counter, Tokio) tolerates
-    // a lost wake because the publishing worker will still pop the work.
-    size_t deferred = 0;
-    bool first_publication = true;
-    struct WakeDeferred {
-      ThreadPoolTempl *pool;
-      size_t &count;
-      ~WakeDeferred() {
-        if (count != 0) {
-          pool->worker_event_.NotifyN(count);
-        }
-      }
-    } wake_guard{this, deferred};
-    auto publish_one = [&](TaskPtr task, size_t thread_index) {
-      assert(task != nullptr);
-      thread_index %= static_cast<size_t>(num_threads_);
-      PerThread *pt = GetPerThread();
-      const bool local = IsRegistered(pt) && pt->owns_queue &&
-                         thread_index == static_cast<size_t>(pt->thread_id);
-#if OOX_EIGEN_BATCHED_WAKE
-      const bool wake_now = first_publication;
-      first_publication = false;
-      TaskPtr inline_task = PublishAdmittedTask(
-          task, static_cast<int>(thread_index), local, wake_now);
-      if (!wake_now && !inline_task) {
-        ++deferred;
-      }
-      if (inline_task) {
-        ExecuteTask(inline_task);
-      }
-#else
-      if (TaskPtr inline_task =
-              PublishAdmittedTask(task, static_cast<int>(thread_index), local)) {
-        ExecuteTask(inline_task);
-      }
-#endif
-    };
-    std::forward<F>(publisher)(publish_one);
-  }
-
-  // Pair with every PublishOrdinaryBatch call, including exceptional exits.
-  void FinishOrdinaryBatch() { ReconcileCancelledOrdinaryBatch(); }
-
   void ScheduleWithAffinity(TaskPtr task, size_t hint) {
     if (!task)
       return;
@@ -402,15 +266,15 @@ public:
       RunOnThread(task, hint);
       return;
     }
+    // Discard may reenter Cancel; release publication admission first.
+    const auto discard = [](Task *p) { p->Discard(); };
+    std::unique_ptr<Task, decltype(discard)> pending(task, discard);
     TaskPtr inline_task = nullptr;
     {
       PublicationGuard publication(ordinary_publication_state_);
       if (!publication.IsAdmitted() || IsCancelled()) {
-        task->Discard();
         return;
       }
-      const auto discard = [](Task *p) { p->Discard(); };
-      std::unique_ptr<Task, decltype(discard)> pending(task, discard);
       auto *proxy = new AffinityProxy(task);
       pending.release();
       AccountTask(task, pt->thread_id);
@@ -501,34 +365,6 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
-  RegionContext *CurrentRegionContext() const noexcept {
-    const PerThread *pt = const_cast<ThreadPoolTempl *>(this)->GetPerThread();
-    return pt->region_context;
-  }
-
-  void NotifyRapidRegionStart() noexcept { UpdateRapidLinger(); }
-
-  template <typename F>
-  decltype(auto) ExecuteInRegion(RegionContext *context, F &&function) noexcept(
-      noexcept(std::forward<F>(function)())) {
-    PerThread *pt = GetPerThread();
-    ScopedRegionContext restore(pt->region_context, context);
-    return std::forward<F>(function)();
-  }
-
-  size_t WorkerRegistrationCount() const noexcept {
-    return registrations_started_.load(std::memory_order_acquire);
-  }
-
-  size_t RapidDeregistrationCount() const noexcept {
-    return rapid_deregistrations_.load(std::memory_order_acquire);
-  }
-
-  // Worker wake notifications that reached a parked worker. Diagnostic.
-  size_t WorkerWakeNotifications() const noexcept {
-    return worker_event_.Notifications();
-  }
-
   bool UsesResidentBusyWait() const noexcept {
     return idle_mode_ == WorkerIdleMode::ResidentBusy;
   }
@@ -590,50 +426,6 @@ public:
     data.resident_task.store(&task, std::memory_order_release);
   }
 
-  void ScheduleRapid(RapidTask *rapid, size_t target) {
-    if (rapid == nullptr) {
-      return;
-    }
-    target %= static_cast<size_t>(num_threads_);
-    TaskPtr inline_task = nullptr;
-    {
-      PublicationGuard publication(
-          thread_data_[target].rapid_publication_state);
-      if (!publication.IsAdmitted()) {
-        rapid->Cancel();
-        return;
-      }
-      if (cancelled_.load(std::memory_order_acquire)) {
-        rapid->Cancel();
-        return;
-      }
-      rapid->AddTickets(1);
-      if (thread_data_[target].PushRapid(rapid)) {
-        if (cancelled_.load(std::memory_order_acquire)) {
-          rapid->Cancel();
-        }
-        ReleaseOneResidentForOrdinary();
-        WakeOneWorker();
-        return;
-      }
-
-      TaskPtr fallback = rapid->FallbackTicket();
-      static_cast<RapidFallbackTask *>(fallback)->Bind(rapid);
-      try {
-        inline_task =
-            PublishAdmittedTask(fallback, static_cast<int>(target), false);
-      } catch (...) {
-        // Publication owns the extra ticket. On failure Discard cancels the
-        // activation and releases that ticket before the exception escapes.
-        fallback->Discard();
-        throw;
-      }
-    }
-    if (inline_task) {
-      ExecuteTask(inline_task);
-    }
-  }
-
   template <typename Region> void HelpResidentUntil(Region &region) {
     unsigned spins = 0;
     while (!region.IsComplete()) {
@@ -647,22 +439,6 @@ public:
     }
   }
 
-  template <typename Region> void HelpUntil(Region &region) {
-    const bool registered = IsRegistered(GetPerThread());
-    auto &event = registered ? worker_event_ : waiter_event_;
-    while (!region.IsComplete()) {
-      const uint64_t token = event.PrepareWait();
-      if (registered && TryExecuteOne()) {
-        event.CancelWait();
-        continue;
-      }
-      if (region.IsComplete()) {
-        event.CancelWait();
-        return;
-      }
-      event.Wait(token);
-    }
-  }
 #ifdef OOX_EIGEN_ENABLE_STATS
   Statistics GetStatistics() const {
     Statistics result;
@@ -710,10 +486,6 @@ public:
     }
   }
 
-  void NotifyTaskCompletion(bool worker_waiter) {
-    (worker_waiter ? worker_event_ : waiter_event_).NotifyAll();
-  }
-
   void NotifyTaskCompletion() {
 #ifdef OOX_EIGEN_THREAD_POOL_TESTING
     internal::completion_notifications.fetch_add(1);
@@ -732,23 +504,10 @@ private:
     cancelled_.store(true, std::memory_order_release);
     ordinary_publication_state_.fetch_or(kPublicationCancelled,
                                          std::memory_order_seq_cst);
-    for (auto &data : thread_data_) {
-      // Admission and cancellation share one modification order per target:
-      // either this sets the stop bit first, or it observes the publisher.
-      data.rapid_publication_state.fetch_or(kPublicationCancelled,
-                                            std::memory_order_acq_rel);
-    }
     while ((ordinary_publication_state_.load(std::memory_order_acquire) &
             kPublicationPublisherMask) != 0) {
       std::this_thread::yield();
     }
-    for (auto &data : thread_data_) {
-      while ((data.rapid_publication_state.load(std::memory_order_acquire) &
-              kPublicationPublisherMask) != 0) {
-        std::this_thread::yield();
-      }
-    }
-    CancelRapidQueues();
     DrainCancelledOrdinaryQueues();
     done_.store(true, std::memory_order_release);
 
@@ -763,20 +522,8 @@ private:
     WakeAll();
   }
 
-  // Create a single atomic<int> that encodes start and limit information for
-  // each thread.
-  // We expect num_threads_ < 65536, so we can store them in a single
-  // std::atomic<unsigned>.
-  // The packed representation keeps each worker's steal domain in one atomic.
-  static constexpr int kMaxPartitionBits = 16;
-  static constexpr int kMaxThreads = 1 << kMaxPartitionBits;
+  static constexpr int kMaxThreads = 1 << 16;
   static constexpr int kSpinCount = 64;
-  static constexpr unsigned kRapidFairness = 8;
-  static constexpr uint64_t kFrequentRapidIntervalNs = 50'000;
-  static constexpr uint64_t kOccasionalRapidIntervalNs = 500'000;
-  static constexpr unsigned kFrequentRapidLingerIterations = 256;
-  static constexpr unsigned kOccasionalRapidLingerIterations = 128;
-  static constexpr unsigned kInfrequentRapidLingerIterations = 32;
   static constexpr size_t kPublicationCancelled =
       size_t{1} << (sizeof(size_t) * 8 - 1);
   static constexpr size_t kPublicationPublisherMask =
@@ -822,41 +569,12 @@ private:
     void NotifyOne() { Notify(false); }
     void NotifyAll() { Notify(true); }
 
-    // Wake up to `count` waiters with one epoch advance. Falls back to a
-    // broadcast when the request covers every registered waiter.
-    void NotifyN(size_t count) {
-      if (count == 0) {
-        return;
-      }
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      const size_t waiters = waiters_.load(std::memory_order_seq_cst);
-      if (waiters == 0) {
-        return;
-      }
-      notifications_.fetch_add(1, std::memory_order_relaxed);
-      epoch_.fetch_add(1, std::memory_order_seq_cst);
-      if (count >= waiters) {
-        epoch_.notify_all();
-        return;
-      }
-      for (size_t i = 0; i < count; ++i) {
-        epoch_.notify_one();
-      }
-    }
-
-    // Number of notifications that found at least one waiter (i.e. that
-    // actually reached the OS). Diagnostic only.
-    size_t Notifications() const noexcept {
-      return notifications_.load(std::memory_order_relaxed);
-    }
-
   private:
     void Notify(bool all) {
       std::atomic_thread_fence(std::memory_order_seq_cst);
       if (waiters_.load(std::memory_order_seq_cst) == 0) {
         return;
       }
-      notifications_.fetch_add(1, std::memory_order_relaxed);
       epoch_.fetch_add(1, std::memory_order_seq_cst);
       if (all) {
         epoch_.notify_all();
@@ -867,7 +585,6 @@ private:
 
     std::atomic<uint64_t> epoch_{0};
     std::atomic<size_t> waiters_{0};
-    std::atomic<size_t> notifications_{0};
   };
 
   static int ValidateThreadCount(int count) {
@@ -877,18 +594,18 @@ private:
     return count;
   }
 
-  static constexpr unsigned EncodePartition(unsigned start,
-                                             unsigned limit) noexcept {
-    return (start << kMaxPartitionBits) | limit;
-  }
   void ExecuteTask(TaskPtr p) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+    const PerThread *pt = GetPerThread();
+    const size_t worker = IsRegistered(pt) ? static_cast<size_t>(pt->thread_id) : 0;
+    thread_data_[worker].statistics.executed.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     struct FinishTask {
       ThreadPoolTempl *pool;
       std::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
-    PerThread *pt = GetPerThread();
-    ScopedRegionContext restore(pt->region_context, p->region_context);
     try {
       (*p)();
     } catch (...) {
@@ -899,23 +616,10 @@ private:
     }
   }
 
-  static constexpr DomainId DecodePartition(unsigned value) noexcept {
-    const unsigned limit = value & (kMaxThreads - 1);
-    return {value >> kMaxPartitionBits, limit};
-  }
-
   void AssertBounds(int start, int end) {
     if (start < 0 || start >= end || end > num_threads_) {
       throw std::invalid_argument("invalid scheduling partition");
     }
-  }
-
-  inline void SetStealPartition(size_t i, unsigned val) {
-    thread_data_[i].steal_partition.store(val, std::memory_order_relaxed);
-  }
-
-  inline unsigned GetStealPartition(int i) {
-    return thread_data_[i].steal_partition.load(std::memory_order_relaxed);
   }
 
   void ComputeCoprimes(int N, MaxSizeVector<unsigned> *coprimes) {
@@ -959,7 +663,6 @@ private:
     }
 
     std::atomic<uintptr_t> task_and_locations;
-    AffinityProxy *next = nullptr;
   };
 
   // Bounded recipient references. Thieves use the sender's local proxy;
@@ -990,14 +693,12 @@ private:
   struct PerThread {
     constexpr PerThread()
         : pool(nullptr), pool_generation(0), rand(0), thread_id(-1),
-          owns_queue(false), rapid_streak(0), region_context(nullptr) {}
+          owns_queue(false) {}
     ThreadPoolTempl *pool; // Parent pool, or null for normal threads.
     uint64_t pool_generation;
     uint64_t rand;         // Random generator state.
     int thread_id;         // Worker thread index in pool.
     bool owns_queue;
-    unsigned rapid_streak;
-    RegionContext *region_context;
   };
 
 #ifdef OOX_EIGEN_ENABLE_STATS
@@ -1013,63 +714,19 @@ private:
 
   struct ThreadData {
     ThreadData()
-        : thread(), steal_partition(0), outstanding_tasks(0), local_tasks(),
-          mailbox(1024), rapid_publication_state(0), rapid_slot(nullptr),
-          rapid_overflow(1024), resident_task(nullptr),
+        : thread(), outstanding_tasks(0), local_tasks(),
+          mailbox(1024), resident_task(nullptr),
           resident_ordinary(false) {}
     std::unique_ptr<Thread> thread;
-    std::atomic<unsigned> steal_partition;
     std::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
-    // High bit rejects new publishers; the remaining bits count active ones.
-    std::atomic<size_t> rapid_publication_state;
-    std::atomic<RapidTask *> rapid_slot;
-    rigtorp::mpmc::Queue<RapidTask *> rapid_overflow;
     std::atomic<ResidentTask *> resident_task;
     size_t resident_slot = 0;
     std::atomic<size_t> *resident_completion = nullptr;
     std::atomic<bool> resident_ordinary;
 
-    bool PushRapid(RapidTask *task) {
-      RapidTask *empty = nullptr;
-      if (rapid_slot.compare_exchange_strong(empty, task,
-                                             std::memory_order_release,
-                                             std::memory_order_relaxed)) {
-        return true;
-      }
-      return rapid_overflow.try_push(task);
-    }
-
-    RapidTask *PopRapid() {
-      if (RapidTask *task =
-              rapid_slot.exchange(nullptr, std::memory_order_acquire)) {
-        return task;
-      }
-      RapidTask *task = nullptr;
-      rapid_overflow.try_pop(task);
-      return task;
-    }
-
-    RapidTask *StealRapid() {
-      // Do not take write ownership of an empty remote inbox.
-      RapidTask *task = rapid_slot.load(std::memory_order_relaxed);
-      if (task && rapid_slot.compare_exchange_strong(
-                      task, nullptr, std::memory_order_acquire,
-                      std::memory_order_relaxed)) {
-        return task;
-      }
-      task = nullptr;
-      rapid_overflow.try_pop(task);
-      return task;
-    }
-
-    void FlushRapid() {
-      while (RapidTask *task = PopRapid()) {
-        task->ReleaseTicket();
-      }
-    }
 #ifdef OOX_EIGEN_ENABLE_STATS
     AtomicStatistics statistics;
 #endif
@@ -1111,7 +768,6 @@ private:
   const bool allow_spinning_;
   MaxSizeVector<ThreadData> thread_data_;
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
-  unsigned global_steal_partition_;
   const uint64_t pool_generation_;
   const WorkerIdleMode idle_mode_;
   const size_t resident_available_words_;
@@ -1124,10 +780,6 @@ private:
   EventCount waiter_event_;
   std::atomic<bool> done_;
   std::atomic<bool> cancelled_;
-  std::atomic<size_t> registrations_started_{0};
-  std::atomic<size_t> rapid_deregistrations_{0};
-  std::atomic<unsigned> rapid_linger_iterations_{kSpinCount};
-  std::atomic<uint64_t> last_rapid_region_ns_{0};
 
   bool creator_registered_ = false;
   std::thread::id creator_thread_id_;
@@ -1168,9 +820,7 @@ private:
 
       bool found_work = false;
       if (allow_spinning_) {
-        const unsigned spin_count =
-            rapid_linger_iterations_.load(std::memory_order_relaxed);
-        for (unsigned i = 0; i < spin_count; ++i) {
+        for (int i = 0; i < kSpinCount; ++i) {
           if (cancelled_.load(std::memory_order_acquire)) {
             return processed_anything;
           }
@@ -1218,38 +868,12 @@ private:
     return next.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void UpdateRapidLinger() noexcept {
-    const uint64_t now = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-    const uint64_t previous =
-        last_rapid_region_ns_.exchange(now, std::memory_order_relaxed);
-    if (previous == 0) {
-      return;
-    }
-    const uint64_t interval = now - previous;
-    const unsigned target =
-        interval < kFrequentRapidIntervalNs
-            ? kFrequentRapidLingerIterations
-            : (interval < kOccasionalRapidIntervalNs
-                   ? kOccasionalRapidLingerIterations
-                   : kInfrequentRapidLingerIterations);
-    const unsigned current =
-        rapid_linger_iterations_.load(std::memory_order_relaxed);
-    rapid_linger_iterations_.store((current * 7 + target) / 8,
-                                   std::memory_order_relaxed);
-  }
-
   void RegisterThread(PerThread *pt, int thread_id, bool owns_queue) {
     pt->pool = this;
     pt->pool_generation = pool_generation_;
     pt->rand = GlobalThreadIdHash();
     pt->thread_id = thread_id;
     pt->owns_queue = owns_queue;
-    pt->rapid_streak = 0;
-    pt->region_context = nullptr;
-    registrations_started_.fetch_add(1, std::memory_order_release);
   }
 
   void RegisterCreator(bool owns_queue) {
@@ -1287,31 +911,29 @@ private:
   }
 
   void PublishOrdinaryTask(TaskPtr task, int target, bool local) {
+    const auto discard = [](Task *p) { p->Discard(); };
+    std::unique_ptr<Task, decltype(discard)> pending(task, discard);
     TaskPtr inline_task = nullptr;
     {
       PublicationGuard publication(ordinary_publication_state_);
       if (!publication.IsAdmitted() ||
           cancelled_.load(std::memory_order_acquire)) {
-        task->Discard();
         return;
       }
-      inline_task = PublishAdmittedTask(task, target, local);
+      inline_task = PublishAdmittedTask(pending.release(), target, local);
     }
     if (inline_task) {
       ExecuteTask(inline_task);
     }
   }
 
-  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local,
-                              bool wake = true) {
+  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local) {
     AccountTask(task, target);
     if (!thread_data_[target].PushTask(task, local)) {
       return task;
     }
     ReleaseOneResidentForOrdinary();
-    if (wake) {
-      WakeOneWorker();
-    }
+    WakeOneWorker();
     return nullptr;
   }
 
@@ -1319,71 +941,17 @@ private:
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
-    // Preserve the fairness probe when ordinary work exists, but avoid its
-    // mutex-backed queues during Rapid-only regions.
-    if (pt->rapid_streak >= kRapidFairness && NoOutstandingTasks()) {
-      pt->rapid_streak = 0;
-    }
-    if (pt->rapid_streak < kRapidFairness && TryExecuteRapid()) {
-      ++pt->rapid_streak;
-      return true;
-    }
-
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
       task = thread_data_[pt->thread_id].PopFront();
     }
     if (!task) {
-      task = LocalSteal(true);
-    }
-    if (!task && pt->region_context && pt->region_context->leave_on_steal) {
-      pt->region_context = pt->region_context->parent;
-      rapid_deregistrations_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (!task) {
       task = GlobalSteal(true);
     }
     if (!task) {
-      if (TryExecuteRapid()) {
-        ++pt->rapid_streak;
-        return true;
-      }
       return false;
     }
-    pt->rapid_streak = 0;
-#ifdef OOX_EIGEN_ENABLE_STATS
-    thread_data_[pt->thread_id].statistics.executed.fetch_add(
-        1, std::memory_order_relaxed);
-#endif
     ExecuteTask(task);
-    return true;
-  }
-
-  bool TryExecuteRapid() {
-    PerThread *pt = GetPerThread();
-    RapidTask *rapid = nullptr;
-    if (pt->owns_queue) {
-      rapid = thread_data_[pt->thread_id].PopRapid();
-    }
-    if (!rapid) {
-      unsigned start = 0;
-      unsigned limit = static_cast<unsigned>(num_threads_);
-      if (pt->region_context && pt->region_context->domain.Size() != 0) {
-        start = pt->region_context->domain.start;
-        limit = pt->region_context->domain.limit;
-      }
-      for (unsigned worker = start; worker < limit && !rapid; ++worker) {
-        if (worker != static_cast<unsigned>(pt->thread_id)) {
-          rapid = thread_data_[worker].StealRapid();
-        }
-      }
-    }
-    if (!rapid) {
-      return false;
-    }
-    ScopedRegionContext restore(pt->region_context, rapid->Context());
-    RapidTicketGuard release(*rapid);
-    rapid->TryRun();
     return true;
   }
 
@@ -1459,9 +1027,7 @@ private:
         // also have a stealable sender reference.
         bool pending = !data.affinity_mailbox.Empty();
         for (const auto &source : thread_data_) {
-          pending |= !source.local_tasks.Empty() || !source.mailbox.empty() ||
-                     source.rapid_slot.load(std::memory_order_acquire) != nullptr ||
-                     !source.rapid_overflow.empty();
+          pending |= !source.local_tasks.Empty() || !source.mailbox.empty();
         }
         if (pending && WithdrawResident(worker))
           return processed;
@@ -1527,15 +1093,6 @@ private:
     waiter_event_.NotifyAll();
   }
 
-  void CancelRapidQueues() {
-    for (auto &data : thread_data_) {
-      while (RapidTask *rapid = data.PopRapid()) {
-        rapid->Cancel();
-        rapid->ReleaseTicket();
-      }
-    }
-  }
-
   void CancelOrdinaryQueues() {
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopBack(true)) {
@@ -1549,17 +1106,6 @@ private:
     CancelOrdinaryQueues();
   }
 
-  void ReconcileCancelledOrdinaryBatch() {
-    // This load and cancellation's stop-bit update share the sequentially
-    // consistent order. Either cancellation follows and drains this batch, or
-    // this observes the stop bit and drains after the batch.
-    const size_t state =
-        ordinary_publication_state_.load(std::memory_order_seq_cst);
-    if ((state & kPublicationCancelled) != 0) {
-      DrainCancelledOrdinaryQueues();
-    }
-  }
-
   void JoinThreads() {
     for (auto &data : thread_data_) {
       data.thread.reset();
@@ -1571,7 +1117,6 @@ private:
       while (TaskPtr task = data.PopFront()) {
         DiscardPublishedTask(task);
       }
-      data.FlushRapid();
     }
     assert(NoOutstandingTasks());
   }
@@ -1613,23 +1158,6 @@ private:
     return nullptr;
   }
 
-  // Steals work within threads belonging to the partition.
-  TaskPtr LocalSteal(bool force) {
-    PerThread *pt = GetPerThread();
-    unsigned partition = GetStealPartition(pt->thread_id);
-    if (pt->region_context && pt->region_context->domain.Size() != 0) {
-      partition = EncodePartition(pt->region_context->domain.start,
-                                  pt->region_context->domain.limit);
-    }
-    // If thread steal partition is the same as global partition, there is no
-    // need to go through the steal loop twice.
-    if (global_steal_partition_ == partition)
-      return nullptr;
-    const DomainId domain = DecodePartition(partition);
-    AssertBounds(domain.start, domain.limit);
-
-    return Steal(domain.start, domain.limit, force);
-  }
   // Steals work from any other thread in the pool.
   TaskPtr GlobalSteal(bool force) { return Steal(0, num_threads_, force); }
 

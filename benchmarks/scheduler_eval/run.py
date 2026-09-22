@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import random
 import shutil
 import socket
 import subprocess
@@ -21,7 +20,7 @@ import datasets
 import provenance
 
 
-def capture(command, cwd=None):
+def capture(command, cwd):
     return subprocess.check_output(command, cwd=cwd, text=True,
                                    stderr=subprocess.DEVNULL).strip()
 
@@ -47,68 +46,6 @@ def cmake_cache(build):
     return values
 
 
-def host_topology():
-    """Best-effort core-class and frequency-policy capture, stdlib only."""
-    info = {"os": platform.system(), "cpu_count": os.cpu_count()}
-    try:
-        if platform.system() == "Darwin":
-            keys = ["hw.perflevel0.physicalcpu", "hw.perflevel0.logicalcpu",
-                    "hw.perflevel0.name", "hw.perflevel1.physicalcpu",
-                    "hw.perflevel1.logicalcpu", "hw.perflevel1.name",
-                    "hw.nperflevels", "machdep.cpu.brand_string", "hw.memsize"]
-            for key in keys:
-                try:
-                    info[key] = capture(["sysctl", "-n", key])
-                except (subprocess.CalledProcessError, OSError):
-                    pass
-            info["note"] = ("macOS exposes no thread affinity API; use "
-                            "`powermetrics --samplers cpu_power` externally to "
-                            "attribute time to P/E clusters.")
-        elif platform.system() == "Linux":
-            try:
-                info["lscpu"] = capture(["lscpu"]).splitlines()
-            except (subprocess.CalledProcessError, OSError):
-                pass
-            governors = set()
-            for path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor"):
-                try:
-                    governors.add(path.read_text().strip())
-                except OSError:
-                    pass
-            info["cpufreq_governors"] = sorted(governors)
-            try:
-                info["sched_affinity"] = sorted(os.sched_getaffinity(0))
-            except (AttributeError, OSError):
-                pass
-            try:
-                info["taskset_available"] = shutil.which("taskset") is not None
-                info["numactl_available"] = shutil.which("numactl") is not None
-            except OSError:
-                pass
-    except Exception as error:  # noqa: BLE001 - diagnostics must not abort a run
-        info["error"] = repr(error)
-    return info
-
-
-def merge_benchmark_json(paths, destination):
-    """Concatenate Google Benchmark outputs from several fresh processes into
-    one file with the same schema (context from the first, all benchmarks)."""
-    merged = None
-    for index, path in enumerate(paths):
-        data = json.loads(path.read_text())
-        if merged is None:
-            merged = data
-            merged["context"]["fresh_process_rounds"] = len(paths)
-            for entry in merged["benchmarks"]:
-                entry["fresh_process_round"] = 0
-            continue
-        for entry in data["benchmarks"]:
-            entry["fresh_process_round"] = index
-            entry["repetition_index"] = index
-        merged["benchmarks"].extend(data["benchmarks"])
-    destination.write_text(json.dumps(merged, indent=1) + "\n")
-
-
 def parse_args(root):
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", type=Path, default=root / "cmake-build-release")
@@ -116,11 +53,6 @@ def parse_args(root):
     parser.add_argument("--mode", action="append")
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--repetitions", type=int, default=3)
-    parser.add_argument("--fresh-process-repetitions", type=int, default=0,
-                        help="run each mode binary N times in fresh processes, "
-                             "interleaved and shuffled per round (overrides --repetitions)")
-    parser.add_argument("--shuffle-modes", action="store_true")
-    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--benchmark-min-time", default="0.5s")
     parser.add_argument("--filter", dest="benchmark_filter", default="")
     parser.add_argument("--smoke", action="store_true")
@@ -133,7 +65,6 @@ def parse_args(root):
     parser.add_argument("--paper-scale", action="store_true",
                         help="also register 100-million-element primary cases")
     parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument("--benchmarks-only", action="store_true")
     parser.add_argument("--timeout", type=int, default=600,
                         help="maximum seconds for each subprocess")
     parser.add_argument("--cpu-node", type=int)
@@ -259,13 +190,11 @@ def main():
     raw.mkdir(parents=True, exist_ok=True)
     traces.mkdir(parents=True, exist_ok=True)
     cache = cmake_cache(args.build.resolve())
-    prefixes = ("bench_scheduler_eval",) if args.benchmarks_only else (
-        "bench_scheduler_eval", "scheduling_dist", "trace_spin")
     measured_paths = [executable_dir / f"{prefix}_{mode}"
                       for mode in modes
-                      for prefix in prefixes]
+                      for prefix in ("bench_scheduler_eval", "scheduling_dist", "trace_spin")]
     tuner_path = executable_dir / "timespan_tuner_EIGEN_STEALING"
-    if not args.benchmarks_only and "EIGEN_STEALING" in modes and tuner_path.exists():
+    if "EIGEN_STEALING" in modes and tuner_path.exists():
         measured_paths.append(tuner_path)
     binary_records = provenance.artifacts(measured_paths)
     env = provenance.execution_environment(os.environ)
@@ -286,8 +215,7 @@ def main():
         "machine": platform.machine(),
         "python": platform.python_version(),
         "threads": args.threads,
-        "repetitions": 1 if args.fresh_process_repetitions else args.repetitions,
-        "repetitions_requested": args.repetitions,
+        "repetitions": args.repetitions,
         "benchmark_filter": benchmark_filter,
         "benchmark_min_time": benchmark_min_time,
         "subprocess_timeout_seconds": args.timeout,
@@ -343,48 +271,25 @@ def main():
     env["BENCH_NUM_THREADS"] = str(args.threads)
     env["OMP_NUM_THREADS"] = str(args.threads)
     env["PARLAY_NUM_THREADS"] = str(args.threads)
-    if args.fresh_process_repetitions < 0:
-        raise ValueError("fresh-process-repetitions must be nonnegative")
-    rng = random.Random(args.seed)
-    metadata.update(fresh_process_repetitions=args.fresh_process_repetitions,
-                    shuffle_modes=args.shuffle_modes, seed=args.seed,
-                    topology=host_topology(), mode_order=[])
-    round_files = {mode: [] for mode in modes}
-    for round_index in range(max(1, args.fresh_process_repetitions)):
-        order = list(modes)
-        if args.shuffle_modes or args.fresh_process_repetitions:
-            rng.shuffle(order)
-        metadata["mode_order"].append(order)
-        (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-        for mode in order:
-            out_path = raw / (f"bench_scheduler_eval_{mode}.round{round_index}.json"
-                              if args.fresh_process_repetitions else
-                              f"bench_scheduler_eval_{mode}.json")
-            benchmark = executable_dir / f"bench_scheduler_eval_{mode}"
-            if not benchmark.exists():
-                raise RuntimeError(f"Missing executable for mode {mode}: {benchmark}")
-            command = [str(benchmark), "--benchmark_out_format=json",
-                       f"--benchmark_out={out_path}",
-                       f"--benchmark_repetitions={1 if args.fresh_process_repetitions else args.repetitions}"]
-            command.append(f"--benchmark_min_time={benchmark_min_time}")
-            if benchmark_filter:
-                command.append(f"--benchmark_filter={benchmark_filter}")
-            command = placement + command
-            counter_tool = "perf" if args.perf else "likwid"
-            counter_output = raw / f"{counter_tool}_{mode}.round{round_index}.csv"
-            command = hardware.counter_prefix(args, counter_output) + command
-            subprocess.run(command, env=env, check=True, timeout=args.timeout)
-            if (args.perf or args.likwid_group) and (
-                    not counter_output.is_file() or not counter_output.stat().st_size):
-                raise RuntimeError(f"counter collection produced no output: {counter_output}")
-            json.loads(out_path.read_text())
-            round_files[mode].append(out_path)
-    if args.fresh_process_repetitions:
-        for mode in modes:
-            merge_benchmark_json(round_files[mode], raw / f"bench_scheduler_eval_{mode}.json")
     for mode in modes:
-        if args.benchmarks_only:
-            continue
+        benchmark = executable_dir / f"bench_scheduler_eval_{mode}"
+        if not benchmark.exists():
+            raise RuntimeError(f"Missing executable for mode {mode}: {benchmark}")
+        command = [str(benchmark), "--benchmark_out_format=json",
+                   f"--benchmark_out={raw / f'bench_scheduler_eval_{mode}.json'}",
+                   f"--benchmark_repetitions={args.repetitions}"]
+        command.append(f"--benchmark_min_time={benchmark_min_time}")
+        if benchmark_filter:
+            command.append(f"--benchmark_filter={benchmark_filter}")
+        command = placement + command
+        counter_tool = "perf" if args.perf else "likwid"
+        counter_output = raw / f"{counter_tool}_{mode}.csv"
+        command = hardware.counter_prefix(args, counter_output) + command
+        subprocess.run(command, env=env, check=True, timeout=args.timeout)
+        if (args.perf or args.likwid_group) and (
+                not counter_output.is_file() or not counter_output.stat().st_size):
+            raise RuntimeError(f"counter collection produced no output: {counter_output}")
+        json.loads((raw / f"bench_scheduler_eval_{mode}.json").read_text())
         scenarios = ["spin"] if args.smoke else ["spin", "barrier", "multitask"]
         if not args.smoke and mode == "EIGEN_STEALING_GRAINSIZE":
             scenarios.remove("barrier")
@@ -400,14 +305,14 @@ def main():
                   "2" if args.smoke else "1024"],
                  traces / f"trace_spin_{mode}.json", env, args.timeout)
     tuner = executable_dir / "timespan_tuner_EIGEN_STEALING"
-    if not args.benchmarks_only and tuner.exists() and "EIGEN_STEALING" in modes:
+    if tuner.exists() and "EIGEN_STEALING" in modes:
         run_json(placement + [str(tuner), "--iterations",
                   "2" if args.smoke else "10000"],
                  raw / "timespan_tuner_EIGEN_STEALING.json", env, args.timeout)
     write_heartbeat_comparison(raw, output, modes)
     if provenance.artifacts(measured_paths) != binary_records:
         raise RuntimeError("benchmark executables changed during the run")
-    if not args.no_plot and not args.benchmarks_only:
+    if not args.no_plot:
         subprocess.run([sys.executable, str(Path(__file__).parent / "tools" / "plot.py"),
                         str(output)], check=True, timeout=args.timeout)
     metadata["complete"] = True

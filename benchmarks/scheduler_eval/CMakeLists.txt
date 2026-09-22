@@ -1,9 +1,9 @@
 set(OOX_SCHEDULER_EVAL_MODES SERIAL_ELISION)
-set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_ORIGINAL RAPID_RESIDENT)
+set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
 set(OOX_SCHEDULER_EVAL_TESTS)
 
-option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
 option(OOX_SCHEDULER_EVAL_STATS "Collect Eigen task and stealing counters" ON)
+option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
 add_library(oox_eval_papi STATIC metrics/papi_metrics.cpp)
 target_link_libraries(oox_eval_papi PUBLIC OOX)
 if(OOX_SCHEDULER_EVAL_PAPI)
@@ -27,46 +27,19 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    OOX_TASKS
+    OOX_TASKS RAPID_GROUP
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_AUTO EIGEN_SIMPLE EIGEN_STATIC EIGEN_AFFINITY
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
 endif()
 if(TBB_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    TBB_SIMPLE TBB_AUTO TBB_STATIC TBB_AFFINITY RAPID_ORIGINAL)
+    TBB_SIMPLE TBB_AUTO TBB_STATIC TBB_AFFINITY RAPID_START)
 endif()
 if(OpenMP_FOUND)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
     OMP_STATIC OMP_DYNAMIC_NONMONOTONIC OMP_GUIDED_NONMONOTONIC)
 endif()
-
-if(OOX_ENABLE_EIGEN)
-  list(APPEND OOX_SCHEDULER_EVAL_MODES
-    RAPID_START RAPID_RESIDENT RAPID_GROUP RAPID_MAILBOX RAPID_MAILBOX_PERTASK_WAKE
-    RAPID_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING
-    RAPID_SQRTCV_LAZY_STEALING RAPID_HEARTBEAT_LAZY_STEALING
-    RAPID_FSC_LAZY_STEALING RAPID_FACTORING_LAZY_STEALING
-    RAPID_GUIDED_LAZY_STEALING RAPID_TIMESPAN_LAZY_STEALING_PROFILED
-    RAPID_LAZY_STEALING_HIERARCHICAL RAPID_LAZY_STEALING_PRESSURE)
-endif()
-
-# Map each RAPID_* evaluation mode onto its EIGEN_MODE value from modes.h.
-set(oox_rapid_eigen_mode_RAPID_START EIGEN_RAPID)
-set(oox_rapid_eigen_mode_RAPID_RESIDENT EIGEN_RAPID_RESIDENT)
-set(oox_rapid_eigen_mode_RAPID_GROUP EIGEN_RAPID_GROUP)
-set(oox_rapid_eigen_mode_RAPID_MAILBOX EIGEN_RAPID_MAILBOX)
-set(oox_rapid_eigen_mode_RAPID_MAILBOX_PERTASK_WAKE EIGEN_RAPID_MAILBOX)
-set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING EIGEN_RAPID_LAZY_STEALING)
-set(oox_rapid_eigen_mode_RAPID_TIMESPAN_LAZY_STEALING EIGEN_RAPID_TIMESPAN_LAZY_STEALING)
-set(oox_rapid_eigen_mode_RAPID_SQRTCV_LAZY_STEALING EIGEN_RAPID_SQRTCV_LAZY)
-set(oox_rapid_eigen_mode_RAPID_HEARTBEAT_LAZY_STEALING EIGEN_RAPID_HEARTBEAT_LAZY)
-set(oox_rapid_eigen_mode_RAPID_FSC_LAZY_STEALING EIGEN_RAPID_FSC_LAZY)
-set(oox_rapid_eigen_mode_RAPID_FACTORING_LAZY_STEALING EIGEN_RAPID_FACTORING_LAZY)
-set(oox_rapid_eigen_mode_RAPID_GUIDED_LAZY_STEALING EIGEN_RAPID_GUIDED_LAZY)
-set(oox_rapid_eigen_mode_RAPID_TIMESPAN_LAZY_STEALING_PROFILED EIGEN_RAPID_TIMESPAN_LAZY_PROFILED)
-set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING_HIERARCHICAL EIGEN_RAPID_LAZY_HIERARCHICAL)
-set(oox_rapid_eigen_mode_RAPID_LAZY_STEALING_PRESSURE EIGEN_RAPID_LAZY_PRESSURE)
 
 function(oox_configure_scheduler_eval_target target mode)
   target_link_libraries(${target} PRIVATE oox_eval_papi)
@@ -88,22 +61,14 @@ function(oox_configure_scheduler_eval_target target mode)
     target_compile_definitions(${target} PRIVATE
       EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
-  elseif(mode STREQUAL "RAPID_ORIGINAL")
+  elseif(mode STREQUAL "RAPID_GROUP")
+    target_compile_definitions(${target} PRIVATE
+      RAPID_GROUP_MODE=1 EIGEN_MODE=EIGEN_RAPID_GROUP $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
       RAPID_START_MODE=1 TBB_MODE=TBB_RAPID)
     target_link_libraries(${target} PRIVATE OOX TBB::tbb)
-  elseif(mode MATCHES "^RAPID")
-    set(rapid_eigen_mode ${oox_rapid_eigen_mode_${mode}})
-    if(NOT rapid_eigen_mode)
-      message(FATAL_ERROR "No EIGEN_MODE mapping for scheduler eval mode ${mode}")
-    endif()
-    target_compile_definitions(${target} PRIVATE
-      RAPID_START_MODE=1 EIGEN_MODE=${rapid_eigen_mode}
-      $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
-    if(mode STREQUAL "RAPID_MAILBOX_PERTASK_WAKE")
-      target_compile_definitions(${target} PRIVATE OOX_EIGEN_BATCHED_WAKE=0)
-    endif()
-    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^TBB")
     target_compile_definitions(${target} PRIVATE TBB_MODE=${mode})
     target_link_libraries(${target} PRIVATE OOX TBB::tbb)
@@ -137,7 +102,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     "--benchmark_filter=(QuickHull|TrigramDedup|RadixSort64|TrigramSampleSort|SampleSortRecords|RadixPassWidth).*/1024(/|$)"
     --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
   list(APPEND OOX_SCHEDULER_EVAL_TESTS ${benchmark_target}_extended_smoke)
-  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS")
+  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS" OR mode STREQUAL "RAPID_GROUP")
     add_test(NAME ${benchmark_target}_availability_smoke COMMAND ${benchmark_target}
       "--benchmark_filter=(ChangingWorkerAvailability/4096|OversubscribedLoops/4096/2|FirstTouch<.*>/16384)(/|$)"
       --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
@@ -238,14 +203,6 @@ if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)
       --smoke)
   set_tests_properties(scheduler_eval_runner_smoke PROPERTIES TIMEOUT 180)
   list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_runner_smoke)
-  add_test(NAME scheduler_eval_fresh_process_runner_smoke
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
-      --build ${PROJECT_BINARY_DIR}
-      --output ${CMAKE_CURRENT_BINARY_DIR}/fresh-runner-smoke
-      --mode RAPID_START --threads 2 --fresh-process-repetitions 2
-      --shuffle-modes --seed 1 --timeout 120 --smoke)
-  set_tests_properties(scheduler_eval_fresh_process_runner_smoke PROPERTIES TIMEOUT 240)
-  list(APPEND OOX_SCHEDULER_EVAL_TESTS scheduler_eval_fresh_process_runner_smoke)
   add_test(NAME scheduler_eval_graph_runner_smoke
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
       --build ${PROJECT_BINARY_DIR}
@@ -263,7 +220,7 @@ if(TBB_FOUND AND Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/run.py
       --build ${PROJECT_BINARY_DIR}
       --output ${CMAKE_CURRENT_BINARY_DIR}/rapid-runner-smoke
-      --mode RAPID_ORIGINAL
+      --mode RAPID_START
       --threads 2
       --repetitions 1
       --timeout 120

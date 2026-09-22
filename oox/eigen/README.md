@@ -4,62 +4,17 @@ This directory contains OOX's private scheduler port. Its immediate source is
 [`EgorkaZ/pbbsbench`](https://github.com/EgorkaZ/pbbsbench/tree/396a299f03c58dbe9e7604daab38a65781227b75/parlaylib/include/parlay/internal/scheduler_plugins/eigen),
 pinned at commit `396a299f03c58dbe9e7604daab38a65781227b75`.
 The mailbox changes first appeared there in commit `e857cdd`, although OOX now
-releases publication admission before executing work rejected by those bounded
-paths.
+uses inline backpressure when bounded publication paths fill.
 
 All implementation symbols live in `oox::detail::eigen_pool`; none are part of
 Eigen's namespace or OOX's public API. Workers briefly spin only when requested,
 then park with C++20 atomic wait/notify. Queue publication advances a worker
 generation without taking a global mutex, and task completion only notifies
 registered waiters. Published-task accounting keeps workers alive during
-destructor draining and nested waits. Local deques and mailboxes remain bounded;
-when one fills, the submitting thread executes the rejected task only after its
-publication guard is released. This provides finite queue storage without making
-reentrant cancellation wait on its own publication.
-
-Cancellation closes generic publication before draining either queue family.
-Ordinary submission uses one pool-wide admission state, while Rapid submission
-uses one state per target inbox. Cancellation is idempotent for concurrent and
-re-entrant callers. Mailbox batches avoid a synchronization operation per range
-task: a batch overlapping cancellation performs a final, serialized drain so no
-task can be stranded after cancellation's first drain.
-
-`rapid_start.h` builds a reentrant rapid-region layer on this pool, while
-`rapid_start_model.h` isolates the block-size and timespan calculations so they
-can be reviewed and tested independently. Workers keep
-their pool-lifetime, generation-stamped registrations; loop invocations do not
-register or trap workers. Immutable groups name contiguous domains, activation
-trees split both workers and iterations proportionally, and TLS region contexts
-propagate subdomains into nested loops. A per-worker atomic inbox with a bounded
-lock-free overflow is checked with a fairness budget before ordinary work. If
-that bounded rapid path fills, the activation's embedded ticket falls back to
-the ordinary queue. Descriptors come from a preallocated slab with an
-ABA-stamped free-list head. A completion ticket makes the transition to zero
-the unique descriptor-recycling claim, and completion follows the activation
-tree.
-Optional elastic lending leases one balanced topology subtree with one stamped
-CAS.
-
-Four parallel-for policies share that activation layer. `ParallelFor` keeps
-each proportional range inside Rapid Start for its whole lifetime.
-`ParallelForMailbox` uses Rapid Start to publish a bounded set of adaptive
-range blocks to the ordinary mailboxes, then lets the ordinary deques steal
-them freely. Ordinary tasks retain their logical proportional domain for
-nested calls without remaining registered in a Rapid region.
-`ParallelForLazyStealing` claims adaptive blocks directly from a shared range
-coordinator: one first block is reserved for every proportional owner before
-execution is published. Each worker starts with its protected block and leaves
-the Rapid domain once before taking otherwise idle later blocks.
-`ParallelForTimespanLazyStealing` adds a per-owner elapsed-time estimate to that
-lazy policy. It calibrates clock and atomic-claim overhead once on the running
-CPU, scales that cost by the effective domain, and derives each target from
-the projected owner-range time and live steal pressure. Blocks preserve at least
-four later steal opportunities; peer thieves consume the last published
-estimate without perturbing it. A nonzero target can still be supplied
-explicitly for experiments, but the default contains no duration constant. All
-hybrid policies run one-worker domains directly and preserve nested calls,
-exception propagation, pool cancellation, and caller-supplied minimum grain
-sizes.
+destructor draining and nested waits. Local queues and affinity mailboxes are
+bounded. A rejected task runs inline after publication admission is released.
+Cancellation closes publication before draining, including concurrent or
+reentrant cancellation; arbitrary nested callbacks can still recurse inline.
 
 ## File provenance and license
 
@@ -88,33 +43,22 @@ the existing scheduler-evaluation workloads.
 
 ## Fast resident groups
 
-`WorkerIdleMode::ResidentBusy` is an explicit pool-lifetime choice for latency
-experiments. Idle workers advertise availability and poll a command slot.
-`ParallelForResidentRanges(group, begin, end, callback)` captures currently
-available helpers and partitions the range by the actual participant count,
-including the caller. Each participant calls `callback(first, last)` once.
-The descriptor and completion counter live on the caller's stack; a warm launch
-does not allocate tasks or publish ordinary queue entries. One invocation
-captures at most 64 participants, even when the pool is larger.
+An opt-in pool using `WorkerIdleMode::ResidentBusy` advertises idle workers.
+`rapid::ParallelForResidentRanges(group, begin, end, callback)` captures
+available helpers and invokes `callback(first, last)` once per participant,
+partitioning by the captured count rather than the nominal pool size.
+A warm launch uses a stack descriptor and no ordinary task allocation.
 
-The caller joins every captured helper before returning or rethrowing an
-exception. Nested calls sharing the same Rapid state execute their range directly;
-concurrent roots reserve disjoint available helpers. When no helper is
-available, the caller executes the whole range. A non-resident pool falls back
-to hierarchical Rapid activation.
+The caller joins helpers before returning or rethrowing. Same-state nested
+calls run directly; concurrent roots reserve disjoint helpers. With no helper
+available, the caller executes the range. One launch uses at most 64 participants;
+larger pools are supported. Default parking pools reject resident-group calls.
 
-Range callbacks own their loop and cancellation safe points. Cancellation is
-checked before entering a callback; already-running callbacks are not
-interrupted. Use the existing `ParallelForResident` per-item entry point when
-its periodic cancellation checks are wanted.
+Ordinary publication releases residents into the scheduler. Idle workers rejoin
+immediately; periodic queue probes cover publication/registration races. The
+caller waits with processor hints and periodically helps queued work. Callbacks
+may use the ordinary demand partitioner, and own their cancellation safe points:
+cancellation prevents new callback entry but does not interrupt a running body.
 
-Ordinary and native Rapid publication can release a resident worker back to the
-scheduler. Periodic queue probes cover publication racing with registration.
-Only queued work triggers that handoff: an already-running ordinary task does
-not prevent other idle workers from joining a group. A callback may invoke the
-ordinary demand partitioner; registered waiters help execute its queued tasks.
-The group itself performs static initial distribution, without adding a new
-stealing or timespan policy.
-
-Busy residence consumes idle CPU. It is not the default pool policy and is not
-equivalent to the historical prototype holding every worker exclusively.
+Busy residence consumes idle CPU and is not the default policy. The group
+performs initial distribution only; it adds no stealing or grain-size policy.

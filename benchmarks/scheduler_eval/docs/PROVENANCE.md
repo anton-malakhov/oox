@@ -81,12 +81,6 @@ No runner clones the historical thesis reference at execution time.
 
 ## Evaluation rules
 
-The branch's `RAPID_START` mode uses pool-backed hierarchical activation;
-`RAPID_GROUP` uses resident range callbacks. The historical bitmask prototype
-remains available as `RAPID_ORIGINAL`. Its reference checkout is not a build
-dependency. The Eigen adapter lives in `runtime/eigen_rapid_adapter.h`;
-the historical TBB adapter lives in `runtime/rapid_start_adapter.h`.
-
 1. Keep research code isolated to benchmarks. PBBS sources are vendored with
    licenses and a checksum manifest; do not add research submodule dependencies.
    Dataset acquisition is separate from network-free benchmark execution.

@@ -95,9 +95,7 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
-  list(APPEND EIGEN_LOOP_MODES
-    EIGEN_STEALING_LOOP EIGEN_RAPID_LOOP EIGEN_RAPID_MAILBOX_LOOP
-    EIGEN_RAPID_LAZY_STEALING_LOOP EIGEN_RAPID_TIMESPAN_LAZY_STEALING_LOOP)
+  list(APPEND EIGEN_LOOP_MODES EIGEN_AUTO_LOOP EIGEN_RAPID_GROUP_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
@@ -167,7 +165,6 @@ if(TBB_FOUND)
                    --benchmark_repetitions=1
                    --benchmark_min_warmup_time=0
                    --benchmark_filter=/128/16)
-  set_tests_properties(bench_taskbench_alt_failures PROPERTIES TIMEOUT 60)
 endif()
 
 if(OOX_BUILD_TASKBENCH)

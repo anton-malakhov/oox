@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "common.h"
-#include "workloads.h"
 #include "scheduler_metrics.h"
+#include "workloads.h"
 
 #include <benchmark/benchmark.h>
 
@@ -24,61 +24,7 @@ void Launch(benchmark::State &state) {
                 [](std::size_t i) { benchmark::DoNotOptimize(i); });
 }
 
-#ifdef EIGEN_MODE
-void MixedOrdinary(benchmark::State &state) {
-  SchedulerMetricsScope metrics(state);
-  const auto ordinary_tasks = static_cast<std::size_t>(state.range(0));
-  const auto ordinary_work = static_cast<std::size_t>(state.range(1));
-  const auto parallel_tasks = static_cast<std::size_t>(state.range(2));
-  const auto parallel_work = static_cast<std::size_t>(state.range(3));
-  for (auto _ : state) {
-    std::atomic<std::size_t> remaining{ordinary_tasks};
-    for (std::size_t task = 0; task < ordinary_tasks; ++task) {
-      EigenPool().Schedule(oox::detail::eigen_pool::MakeTask([&] {
-        for (std::size_t work = 0; work < ordinary_work; ++work)
-          CpuRelax();
-        if (remaining.fetch_sub(1, std::memory_order_release) == 1)
-          EigenPool().NotifyTaskCompletion();
-      }));
-    }
-    EvalParallelFor(0, parallel_tasks, [&](std::size_t) {
-      for (std::size_t work = 0; work < parallel_work; ++work)
-        CpuRelax();
-    });
-    EigenPool().Wait(
-        [&] { return remaining.load(std::memory_order_acquire) == 0; });
-  }
-  state.SetItemsProcessed(state.iterations() *
-                          (ordinary_tasks * ordinary_work +
-                           parallel_tasks * parallel_work));
-}
-#endif
-
 enum class SpinPayload { Relax, Atomic, DistributedRead, ThreadLocal };
-
-const SparseMatrix &CachedSparseMatrix(std::size_t rows, std::size_t columns,
-                                       SparseKind kind, RowOrder order) {
-  struct Cache {
-    SparseMatrix matrix;
-    SparseKind kind{};
-    RowOrder order{};
-    std::size_t rows{};
-    std::size_t columns{};
-  };
-  static Cache cache;
-  if (cache.rows != rows || cache.columns != columns || cache.kind != kind ||
-      cache.order != order) {
-    cache.rows = 0;
-    cache.columns = 0;
-    cache.matrix = {};
-    cache.matrix = MakeSparseMatrix(rows, columns, kind, 1, order);
-    cache.kind = kind;
-    cache.order = order;
-    cache.rows = rows;
-    cache.columns = columns;
-  }
-  return cache.matrix;
-}
 
 struct alignas(hardware_constructive_interference_size) IsolatedValue {
   std::uint64_t value{1};
@@ -150,14 +96,13 @@ void Scan(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * size);
 }
 
-template <SparseKind Kind, RowOrder Order = RowOrder::Sorted>
-void SpmvBenchmark(benchmark::State &state) {
+template <SparseKind Kind> void SpmvBenchmark(benchmark::State &state) {
   SchedulerMetricsScope metrics(state);
   const auto rows = (static_cast<std::size_t>(GetNumThreads()) << 9) +
                     (static_cast<std::size_t>(GetNumThreads()) << 4) + 7;
   const auto columns = static_cast<std::size_t>(state.range(0)) +
                        (static_cast<std::size_t>(GetNumThreads()) << 2) + 3;
-  const auto &matrix = CachedSparseMatrix(rows, columns, Kind, Order);
+  const auto matrix = MakeSparseMatrix(rows, columns, Kind);
   std::vector<double> input(columns, 1.0), output;
   for (auto _ : state) {
     Spmv(matrix, input, output);
@@ -175,24 +120,11 @@ void SpmvBenchmark(benchmark::State &state) {
       ->Args({GetNumThreads(), 1, 1024})                                       \
       ->Args({1 << 20, 1, 1})
 
-#define SCHEDULER_SPMV_RANGE                                                   \
-  ->Setup(Setup)->RangeMultiplier(2)->Range(1 << 12, 1 << 17)->UseRealTime()
-
 BENCHMARK(Launch)
     ->Setup(Setup)
     ->RangeMultiplier(4)
     ->Range(64, 1 << 18)
     ->UseRealTime();
-#ifdef EIGEN_MODE
-BENCHMARK(MixedOrdinary)
-    ->Setup(Setup)
-    ->ArgNames({"ordinary_tasks", "ordinary_work", "parallel_tasks",
-               "parallel_work"})
-    ->Args({1, 1 << 15, 1 << 13, 64})
-    ->Args({4, 1 << 15, 1 << 13, 64})
-    ->Args({8, 1 << 15, 1 << 13, 64})
-    ->UseRealTime();
-#endif
 BENCHMARK_TEMPLATE(Spin, SpinPayload::Relax)
     ->Setup(Setup) SCHEDULER_SPIN_ARGS(1)
     ->UseRealTime();
@@ -211,20 +143,28 @@ BENCHMARK(Reduce)
     ->Range(1 << 12, 1 << 19)
     ->UseRealTime();
 BENCHMARK(Scan)->Setup(Setup)->DenseRange(10, 24, 2)->UseRealTime();
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Balanced) SCHEDULER_SPMV_RANGE;
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic) SCHEDULER_SPMV_RANGE;
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle) SCHEDULER_SPMV_RANGE;
-// Same per-row cost multiset, different contiguous structure. A scheduler whose
-// time changes across these three has a spatial (not purely statistical)
-// balancing story; one that does not is explained by mu/sigma alone.
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shuffled)
-SCHEDULER_SPMV_RANGE;
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic, RowOrder::Shifted)
-SCHEDULER_SPMV_RANGE;
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shuffled)
-SCHEDULER_SPMV_RANGE;
-BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle, RowOrder::Shifted)
-SCHEDULER_SPMV_RANGE;
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Balanced)
+    ->Setup(Setup)
+    ->RangeMultiplier(2)
+    ->Range(1 << 12, 1 << 17)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Hyperbolic)
+    ->Setup(Setup)
+    ->RangeMultiplier(2)
+    ->Range(1 << 12, 1 << 17)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(SpmvBenchmark, SparseKind::Triangle)
+    ->Setup(Setup)
+    ->RangeMultiplier(2)
+    ->Range(1 << 12, 1 << 17)
+    ->UseRealTime();
 } // namespace
 
-BENCHMARK_MAIN();
+int main(int argc, char **argv) {
+  benchmark::Initialize(&argc, argv);
+  if (benchmark::ReportUnrecognizedArguments(argc, argv))
+    return 1;
+  scheduler_eval::Initialize();
+  benchmark::RunSpecifiedBenchmarks();
+  benchmark::Shutdown();
+}

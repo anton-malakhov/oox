@@ -126,31 +126,15 @@ CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_SHARING_STEALING`, plus the oneTBB-derived `EIGEN_AUTO`,
 `EIGEN_SIMPLE`, `EIGEN_STATIC`, and `EIGEN_AFFINITY` range policies.
 See [the partitioner API and placement semantics](../../oox/eigen/PARTITIONERS.md).
-The Eigen pool also provides `RAPID_START` (hierarchical activation),
-`RAPID_RESIDENT` (resident per-item callbacks), `RAPID_GROUP` (one plain range
-callback per captured participant), and the existing mailbox/lazy policy
-variants. All share the upstream workload suite. Resident mode deliberately
-uses busy waiting and is opt-in; ordinary and native Rapid publications can
-release its workers back to scheduler work.
-
-TBB contributes simple, automatic, static, and affinity partitioners, plus the historical bitmask `RAPID_ORIGINAL` prototype. OpenMP
+TBB contributes simple, automatic, static, and affinity partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
-`RAPID_ORIGINAL` waits for every requested trapper task to register before its
+`RAPID_START` waits for every requested trapper task to register before its
 warm-up publication. It supports at most 64 workers. Because the prototype has
 one global publication descriptor and is not reentrant, its target omits nested
 matrix multiplication and transpose; normalized reports use only cases present
 in every selected mode. Nested workloads and registrations live in separate
 sources that CMake attaches only to reentrant modes.
-
-Use `--fresh-process-repetitions N --shuffle-modes --seed S` to interleave
-fresh processes reproducibly; `--benchmarks-only` skips probes and plotting.
-Binary hashes, checkout state, topology, and each round's mode order are saved.
-Configure with `-DOOX_SCHEDULER_EVAL_STATS=OFF` for timing comparisons without
-Eigen's task/steal counter updates. The default remains ON for mechanism
-measurements; the setting is recorded in run metadata. Group and native Rapid
-descriptors are not ordinary tasks, so zero ordinary-task counters do not mean
-zero scheduling work.
 
 The `test_scheduler_eval_*` executables validate scan, reduction, all three
 sparse distributions, convex hull, remove-duplicates, radix sort, and sample
@@ -302,8 +286,14 @@ research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).
 
-The Rapid-specific structural fits and holdout analysis run through
-`tools/rapid_model.py`, which reuses the generic helpers in `tools/model.py`.
-See also the [Rapid integration results](docs/RAPID_GROUP_INTEGRATION.md),
-[policy matrix](docs/SOTA_MATRIX.md), and
-[Rapid/Eigen study](docs/RAPID_START_VS_EIGEN.md).
+## Fast-group comparison
+
+`RAPID_GROUP` runs the Eigen pool's resident range groups on the existing
+workload suite, including nested and worker-availability checks. `RAPID_START`
+retains upstream's historical TBB prototype. Compare with `EIGEN_AUTO` and
+`EIGEN_STATIC`; resident mode is opt-in and consumes idle CPU.
+
+Configure `OOX_SCHEDULER_EVAL_STATS=OFF` for timings without Eigen's diagnostic
+counter updates (default ON). The runner records this setting. For direct
+backend loops, use `bench_loops_EIGEN.EIGEN_AUTO_LOOP` and
+`bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`.

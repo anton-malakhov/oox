@@ -76,8 +76,37 @@ void verify_affinity_publication_failure() {
   }
 }
 
+void verify_reentrant_discard_after_allocation_failure() {
+  using namespace oox::detail::eigen_pool;
+  struct Reentrant final : Task {
+    Reentrant(ThreadPool &pool, bool &discarded) : pool(pool), discarded(discarded) {}
+    void operator()() override { delete this; }
+    void Discard() noexcept override {
+      pool.Cancel();
+      discarded = true;
+      delete this;
+    }
+    ThreadPool &pool;
+    bool &discarded;
+  };
+  ThreadPool pool(2, false, true);
+  bool discarded = false;
+  auto *task = new Reentrant(pool, discarded);
+  fail_after = 0;
+  bool caught = false;
+  try {
+    pool.ScheduleWithAffinity(task, 1);
+  } catch (const std::bad_alloc &) {
+    caught = true;
+  }
+  fail_after = -1;
+  if (!caught || !discarded || !pool.IsCancelled())
+    std::_Exit(6);
+}
+
 int main(int argc, char **argv) {
   eigen_partitioner_test::Select(argc, argv);
+  verify_reentrant_discard_after_allocation_failure();
   verify_affinity_publication_failure();
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(8, true, true);

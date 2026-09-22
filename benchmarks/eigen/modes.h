@@ -41,22 +41,6 @@ inline std::string GetParallelMode() {
 #define EIGEN_STEALING_GRAINSIZE 3
 #define EIGEN_SHARING_STEALING 4
 #define EIGEN_RAPID 5
-#define EIGEN_RAPID_MAILBOX 6
-#define EIGEN_RAPID_LAZY_STEALING 7
-#define EIGEN_RAPID_TIMESPAN_LAZY_STEALING 8
-// Grain-law family on the lazy coordinator (see oox/eigen/rapid_start_model.h).
-#define EIGEN_RAPID_SQRTCV_LAZY 9
-#define EIGEN_RAPID_HEARTBEAT_LAZY 10
-#define EIGEN_RAPID_FSC_LAZY 11
-#define EIGEN_RAPID_FACTORING_LAZY 12
-#define EIGEN_RAPID_GUIDED_LAZY 13
-// Sqrt law with a cross-call loop profile warming the first block.
-#define EIGEN_RAPID_TIMESPAN_LAZY_PROFILED 14
-// Fixed block with alternative victim orders.
-#define EIGEN_RAPID_LAZY_HIERARCHICAL 15
-#define EIGEN_RAPID_LAZY_PRESSURE 16
-// Dedicated busy-wait pool with a 64-participant resident availability mask.
-#define EIGEN_RAPID_RESIDENT 17
 #define EIGEN_AUTO 18
 #define EIGEN_SIMPLE 19
 #define EIGEN_STATIC 20

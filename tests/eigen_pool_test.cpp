@@ -7,96 +7,18 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
-#include <functional>
 #include <cstdlib>
 #include <future>
 #include <memory>
 #include <thread>
-#include <utility>
 #include <vector>
 
 namespace {
 
 using oox::detail::eigen_pool::MakeTask;
-using oox::detail::eigen_pool::RapidFallbackTask;
-using oox::detail::eigen_pool::RapidTask;
-using oox::detail::eigen_pool::RegionContext;
 using oox::detail::eigen_pool::Task;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
-
-struct CountingRapidTask final : RapidTask {
-  CountingRapidTask(std::atomic<int> &count, int total,
-                    std::promise<void> &completed,
-                    std::promise<void> *publishing = nullptr,
-                    std::shared_future<void> published = {})
-      : count(count), total(total), completed(completed), publishing(publishing),
-        published(std::move(published)) {}
-
-  void AddTickets(size_t count) noexcept final {
-    tickets.fetch_add(count);
-    if (publishing) {
-      publishing->set_value();
-      published.wait();
-    }
-  }
-  bool TryRun() final {
-    if (claimed.exchange(true)) {
-      return false;
-    }
-    if (count.fetch_add(1) + 1 == total) {
-      completed.set_value();
-    }
-    return true;
-  }
-  void Cancel() noexcept final { claimed.store(true); }
-  void ReleaseTicket() noexcept final { tickets.fetch_sub(1); }
-  RegionContext *Context() noexcept final { return &context; }
-  oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
-    return &fallback;
-  }
-
-  std::atomic<int> &count;
-  int total;
-  std::promise<void> &completed;
-  std::atomic<bool> claimed{false};
-  std::atomic<size_t> tickets{0};
-  RegionContext context;
-  RapidFallbackTask fallback;
-  std::promise<void> *publishing;
-  std::shared_future<void> published;
-};
-
-struct StreamingRapidTask final : RapidTask {
-  StreamingRapidTask(ThreadPool &pool, std::promise<void> &entered,
-                     std::atomic<bool> &stop)
-      : pool(pool), entered(entered), stop(stop) {}
-
-  void AddTickets(size_t count) noexcept final { tickets.fetch_add(count); }
-  bool TryRun() final {
-    if (runs.fetch_add(1) == 0) {
-      entered.set_value();
-    }
-    if (!stop.load(std::memory_order_acquire)) {
-      pool.ScheduleRapid(this, 0);
-    }
-    return true;
-  }
-  void Cancel() noexcept final { stop.store(true, std::memory_order_release); }
-  void ReleaseTicket() noexcept final { tickets.fetch_sub(1); }
-  RegionContext *Context() noexcept final { return &context; }
-  oox::detail::eigen_pool::Task *FallbackTicket() noexcept final {
-    return &fallback;
-  }
-
-  ThreadPool &pool;
-  std::promise<void> &entered;
-  std::atomic<bool> &stop;
-  std::atomic<int> runs{0};
-  std::atomic<size_t> tickets{0};
-  RegionContext context;
-  RapidFallbackTask fallback;
-};
 
 struct FinalizingTask final : Task {
   explicit FinalizingTask(std::atomic<size_t> &finalized)
@@ -186,21 +108,6 @@ TEST(EigenPool, OneMainSlotHasFallbackWorker) {
   EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
 }
 
-TEST(EigenPool, CopiesLvalueCallablesWithoutMovingFromTheCaller) {
-  ThreadPool pool(1, false, true);
-  std::atomic<unsigned> calls{0};
-  std::promise<void> completed;
-  auto result = completed.get_future();
-  std::function<void()> callable = [&] {
-    calls.fetch_add(1, std::memory_order_relaxed);
-    completed.set_value();
-  };
-  pool.Schedule(MakeTask(callable));
-  EXPECT_TRUE(callable);
-  EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
-  EXPECT_EQ(calls.load(), 1u);
-}
-
 TEST(EigenPool, SurvivesCreatorThreadExit) {
   std::unique_ptr<ThreadPool> pool;
   std::thread creator([&] { pool = std::make_unique<ThreadPool>(2); });
@@ -286,113 +193,9 @@ TEST(EigenPool, InlineFallbackReleasesPublicationBeforeCancellation) {
   EXPECT_TRUE(cancelled.load(std::memory_order_acquire));
   release.set_value();
   EXPECT_EQ(completed_result.wait_for(2s), std::future_status::ready);
-}
-
-TEST(EigenPool, RapidOverflowUsesOrdinaryQueueFallback) {
-  ThreadPool pool(1, false, false);
-  std::promise<void> entered, release, completed;
-  auto entered_result = entered.get_future();
-  auto release_result = release.get_future().share();
-  auto completed_result = completed.get_future();
-  pool.Schedule(MakeTask([&] {
-    entered.set_value();
-    release_result.wait();
-  }));
-  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
-
-  constexpr int task_count = 1026;
-  std::atomic<int> count{0};
-  std::vector<std::unique_ptr<CountingRapidTask>> tasks;
-  for (int i = 0; i < task_count; ++i) {
-    tasks.push_back(
-        std::make_unique<CountingRapidTask>(count, task_count, completed));
-    pool.ScheduleRapid(tasks.back().get(), 0);
-  }
-  release.set_value();
-  EXPECT_EQ(completed_result.wait_for(5s), std::future_status::ready);
-  EXPECT_EQ(count.load(), task_count);
-  for (const auto &task : tasks) {
-    EXPECT_EQ(task->tickets.load(), 0u);
-  }
-}
-
-TEST(EigenPool, CancellationWaitsForRapidPublication) {
-  ThreadPool pool(1, false, false);
-  std::atomic<int> count{0};
-  std::promise<void> completed, publishing, release;
-  auto publishing_result = publishing.get_future();
-  CountingRapidTask task(count, 1, completed, &publishing,
-                         release.get_future().share());
-  auto schedule = std::async(std::launch::async,
-                             [&] { pool.ScheduleRapid(&task, 0); });
-  ASSERT_EQ(publishing_result.wait_for(2s), std::future_status::ready);
-  auto cancel = std::async(std::launch::async, [&] { pool.Cancel(); });
-  EXPECT_EQ(cancel.wait_for(10ms), std::future_status::timeout);
-  release.set_value();
-  EXPECT_EQ(schedule.wait_for(2s), std::future_status::ready);
-  EXPECT_EQ(cancel.wait_for(2s), std::future_status::ready);
-  EXPECT_EQ(task.tickets.load(), 0u);
-  EXPECT_EQ(count.load(), 0);
-}
-
-TEST(EigenPool, CancellationDrainsRapidOrdinaryFallbacks) {
-  ThreadPool pool(1, false, false);
-  std::promise<void> entered, release, blocker_done, completed;
-  auto entered_result = entered.get_future();
-  auto release_result = release.get_future().share();
-  auto blocker_done_result = blocker_done.get_future();
-  pool.Schedule(MakeTask([&] {
-    entered.set_value();
-    release_result.wait();
-    blocker_done.set_value();
-  }));
-  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
-
-  constexpr int task_count = 1026;
-  std::atomic<int> count{0};
-  std::vector<std::unique_ptr<CountingRapidTask>> tasks;
-  for (int i = 0; i < task_count; ++i) {
-    tasks.push_back(
-        std::make_unique<CountingRapidTask>(count, task_count, completed));
-    pool.ScheduleRapid(tasks.back().get(), 0);
-  }
-  pool.Cancel();
-  for (const auto &task : tasks) {
-    EXPECT_EQ(task->tickets.load(), 0u);
-  }
-  EXPECT_EQ(count.load(), 0);
-  release.set_value();
-  EXPECT_EQ(blocker_done_result.wait_for(2s), std::future_status::ready);
-}
-
-TEST(EigenPool, OrdinaryTaskPreemptsSustainedRapidStream) {
-  ThreadPool pool(1, false, false);
-  std::promise<void> entered, ordinary_completed;
-  auto entered_result = entered.get_future();
-  auto ordinary_result = ordinary_completed.get_future();
-  std::atomic<bool> stop{false};
-  std::atomic<bool> measure_ready{false};
-  std::atomic<int> ordinary_run_count{0};
-  StreamingRapidTask rapid(pool, entered, stop);
-
-  pool.ScheduleRapid(&rapid, 0);
-  ASSERT_EQ(entered_result.wait_for(2s), std::future_status::ready);
-  pool.Schedule(MakeTask([&] {
-    measure_ready.wait(false, std::memory_order_acquire);
-    ordinary_run_count.store(rapid.runs.load());
-    stop.store(true, std::memory_order_release);
-    ordinary_completed.set_value();
-  }));
-  const int published_run_count = rapid.runs.load();
-  measure_ready.store(true, std::memory_order_release);
-  measure_ready.notify_one();
-
-  EXPECT_EQ(ordinary_result.wait_for(2s), std::future_status::ready);
-  while (rapid.tickets.load() != 0) {
-    std::this_thread::yield();
-  }
-  EXPECT_GE(rapid.runs.load(), 1);
-  EXPECT_LE(ordinary_run_count.load() - published_run_count, 16);
+  const auto statistics = pool.GetStatistics();
+  EXPECT_EQ(statistics.scheduled, 1026u);
+  EXPECT_EQ(statistics.executed, 2u); // Blocker plus inline cancellation.
 }
 
 TEST(EigenPool, AcceptsConcurrentExternalProducers) {
@@ -404,7 +207,6 @@ TEST(EigenPool, AcceptsConcurrentExternalProducers) {
   std::promise<void> completed;
   auto result = completed.get_future();
   std::vector<std::thread> producers;
-  producers.reserve(producer_count);
 
   for (int producer = 0; producer < producer_count; ++producer) {
     producers.emplace_back([&] {
