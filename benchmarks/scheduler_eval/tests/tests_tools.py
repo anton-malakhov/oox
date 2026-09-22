@@ -15,9 +15,23 @@ from input_graphs import recipe, validate_graph
 import hardware
 import provenance
 import model
+import rapid_model
 
 
 class HistoricalToolsTest(unittest.TestCase):
+    def test_rapid_model_reuses_validated_helpers(self):
+        self.assertIs(rapid_model.through_origin, model.through_origin)
+        self.assertIs(rapid_model.launch_time, model.launch_time)
+        for points in ([], [(0, 1)], [(1, float("nan"))], [(1, -1)]):
+            with self.subTest(points=points), self.assertRaises(ValueError):
+                rapid_model.fit_launch(points)
+        fit = rapid_model.fit_launch([(1, 4), (2, 4), (4, 4)])
+        self.assertAlmostEqual(rapid_model.launch_time(fit, 8), 4)
+        self.assertAlmostEqual(fit["holdout_mape_percent"], 0)
+        fit = rapid_model.fit_launch([(1, 4)])
+        self.assertAlmostEqual(rapid_model.launch_time(fit, 1), 4)
+        self.assertIsNone(fit["holdout_mape_percent"])
+
     def test_model_rejects_degenerate_samples(self):
         for points in ([], [(0, 1)], [(-1, 2)], [(float("nan"), 1)], [(1, float("inf"))]):
             with self.subTest(points=points), self.assertRaises(ValueError):

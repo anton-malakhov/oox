@@ -6,7 +6,7 @@ every result. It is to make each major source of time explicit, fit only terms t
 current experiment can identify, and expose the measurements still needed for a
 causal model.
 
-The companion `model.py` is the first executable version of that model. Its
+The companion `tools/rapid_model.py` is the first executable version of that model. Its
 coefficients are diagnostics for one result directory, not universal properties of
 a scheduler. This article also separates what earlier sources actually established
 from the estimation and tuning methodology proposed for OOX.
@@ -33,11 +33,15 @@ Vorkozhokov, Vitaly Aksenov, and Anton Malakhov as authors. Its placeholder
 conference metadata must not be used as evidence that the manuscript appeared in
 those proceedings.
 
+The historical measurements in this document predate the pool-backed Rapid
+Start rewrite. References to persistent trappers, one bitmask descriptor, and
+the 64-worker limit describe the preserved research artifact and old result
+files, not the current `RAPID_START` executable.
+
 Two mechanisms in OOX are also distinct:
 
-- **Rapid Start** is the bitmask prototype: the publisher and a persistent group
-  of registered trappers observe one shared descriptor, and every participating
-  slot computes its static range locally.
+- **Rapid Start** now uses independent rapid regions, inherited worker domains,
+  and a hierarchical activation/completion tree on the fixed Eigen pool.
 - **Eigen sharing-stealing** is the historical hybrid method: it first distributes
   ranges through targeted mailboxes, waits for a calibrated timespan before exposing
   balancing work, and derives a grain from iterations completed during that time.
@@ -350,7 +354,10 @@ gate is optimal. OOX must estimate those quantities from its own traces.
 
 | Mode | Initial distribution | Grain and later balancing |
 | --- | --- | --- |
-| `RAPID_START` | One shared epoch/descriptor observed by publisher plus persistent trappers | One contiguous block per participating slot; no stealing |
+| `RAPID_START` | Hierarchical region activation through bounded rapid inboxes with ordinary inline backpressure | Proportional contiguous worker/data subtrees with inherited nested domains |
+| `RAPID_MAILBOX` | Rapid activation publishes adaptive, bounded range blocks to targeted ordinary mailboxes, then exits | Unrestricted deque stealing without recursive grain-one task creation |
+| `RAPID_LAZY_STEALING` | Rapid activation starts a proportional range on each worker and exposes it after the first local claim | Atomic adaptive block claims; a worker leaves its Rapid domain once, only when a started peer range has unclaimed work |
+| `RAPID_TIMESPAN_LAZY_STEALING` | The same protected Rapid owner ranges as lazy stealing | Each owner combines calibrated platform overhead, projected owner-range time, and live steal pressure, then publishes its smoothed block estimate to thieves |
 | `EIGEN_STEALING` | One root range | Binary splitting to a caller-supplied fixed grain (1 in this benchmark), then deque stealing |
 | `EIGEN_SHARING` | `K_SPLIT=2` targeted mailbox tree | Binary splitting to a caller-supplied fixed grain (1 here), then stealing |
 | `EIGEN_STEALING_GRAINSIZE` | One root range | Root measures a timespan-derived grain, then chunk stealing |
@@ -360,10 +367,8 @@ Two details are easy to miss:
 
 1. Eigen's `Balancing::STATIC` means a fixed grain, not immutable static worker
    blocks. The range is still recursively split and can be stolen.
-2. A targeted Eigen publication inserts the same execute-once proxy into the
-   target mailbox and the normal scheduling path. In sharing modes, an idle
-   worker may also consume another worker's mailbox. The duplicate references
-   improve availability; an atomic state ensures that the body runs once.
+2. A rapid publication normally uses one targeted inbox ticket. If the bounded
+   rapid path fills, its embedded ordinary-queue ticket preserves progress.
 
 With enough iterations, the Eigen sharing tree performs at most
 $\min(P,N)-1$ targeted publications. For fixed `K_SPLIT=2`, sufficient work at
@@ -526,7 +531,7 @@ The parameters do not all belong to every mode:
 | --- | --- | --- | --- |
 | Worker count $P$ | Yes | Yes | Enumerate topology-aware choices; include one-worker and performance-core-only baselines |
 | Reuse $q$ / lifetime | Exogenous: process-static runtime today | Exogenous pool lifetime | Report $I(P)/q$ for realistic application lifetimes; do not optimize it without a lifetime/resource cost |
-| Membership/topology | Future knob: all trappers stay registered until destruction | Mailbox targets are implementation-defined | Instrument first; parameterize before claiming a search over membership |
+| Membership/topology | Immutable inherited domains; optional whole-subtree leases | Mailbox targets are implementation-defined | Enumerate balanced topology subtrees and measure before adding affinity policy |
 | Tree fanout $K$ | No | Yes, but compile-time today | Rebuild or make it runtime-configurable, then enumerate small integers |
 | Gate $\tau$ | No | Yes, but `INIT_TIME` is compile-time today | Rebuild or parameterize; seed from an upper-confidence p99 of mode-specific $G_{m,P,z}$ |
 | Grain $g$ | No: ranges follow $N/P$ and membership | Caller-supplied fixed or timespan-derived | Seed Eigen from observed work during $\tau$, then test multiplicative neighbors |
@@ -609,7 +614,115 @@ objective, workload distribution, and machine configuration.
 
 ## 7. The executable first-order OOX model
 
-For SpMV family $k$ and mode $m$, `model.py` fits the warm-call quantity
+The executable model now starts from one policy-independent decomposition:
+
+$$
+\boxed{
+\widehat T_m(N,W,P,q)=
+\frac{I_m(P)}q+A_m+u_m C(N,P)+v_m E_m(N,P)
++T_{\text{work},m}(W,P)+T_{\text{imbalance},m}
+}
+$$
+
+Here $C=\lceil N/\min(P,N)\rceil$ is the number of callbacks on an ideally
+balanced critical worker. $E_m$ is a policy-specific scheduling-event proxy.
+The fitted $u_m$ and $v_m$ are machine costs, while the event definitions come
+from the implementation:
+
+| Policy | $E_m(N,P)$ used for empty-loop calibration |
+| --- | --- |
+| Fixed-grain work stealing | $\lceil\log_2s\rceil+\lceil(\lceil N/g\rceil-1)/s\rceil$ |
+| Work sharing | $\lceil\log_2s\rceil+\lceil(\lceil N/g\rceil-s)/s\rceil_+$; the first $s-1$ generated nodes are targeted publications |
+| Timespan work stealing | A serial $\widehat g$ prefix, then the fixed-grain expression on $(N-\widehat g)_+$ |
+| Sharing plus timespan stealing | The sharing expression with a fitted effective $\widehat g$ |
+| Static Rapid Start | $\lceil\log_2s\rceil$ activation depth |
+| Rapid mailbox | $\lceil\log_2s\rceil+\lceil B/s\rceil$ |
+| Lazy Rapid stealing | $\lceil\log_2s\rceil+\lceil B/s\rceil$; $s$ first reservations and $B-s$ later claims are reported separately |
+| Timespan-lazy Rapid stealing | $\lceil\log_2s\rceil+\lceil \widehat B/s\rceil$; $\widehat B$ is a deterministic initial-block proxy until adaptive block counters are recorded |
+
+In this table $s=\min(P,N)$, $g=1$ in the benchmark, and
+
+$$
+B=\sum_{j=0}^{s-1}\left\lceil\frac{n_j}{b}\right\rceil,
+\qquad
+b=\max\left(g,1,
+\left\lceil\frac{N}{P\,d(N/P)}\right\rceil\right).
+$$
+
+The block-density function $d$ exactly mirrors `HybridBlockSize`: 2, 8, 32,
+or 64 blocks per worker at work-per-worker boundaries 8, 64, and 4096. The
+mailbox policy halves that density through 512 iterations per worker. These
+counts are deterministic opportunities, not observed steal counts. In
+particular, lazy failed probes and cache migration require counters before they
+can become separately identifiable model terms.
+
+For the timespan-lazy policy, a one-time runtime probe measures the local cost
+$h$ of two steady-clock reads plus the atomic load, claim, load, and publication
+sequence. For effective domain size $s$, use $H=sh$. After owner $j$ completes
+$c_{j,k}$ iterations in elapsed time $t_{j,k}$ and owns a full proportional
+range of $n_j$ iterations, estimate
+
+$$
+\widehat T_{j,k}=t_{j,k}\frac{n_j}{c_{j,k}},
+\qquad
+\tau_{j,k}=\sqrt{\frac{H\widehat T_{j,k}}{1+p_k}},
+$$
+
+where $p_k=z_k/s$ is the fraction of the $s$ owners that have exhausted their
+local ranges and entered the stealing phase. Keeping $\widehat T$ based on the
+full owner range avoids shrinking the target twice near the tail; the separate
+balance cap below already preserves later stealing opportunities.
+
+The target minimizes the local cost model
+
+$$
+C(\tau)=\frac{H\widehat T}{\tau}+(1+p)\tau.
+$$
+
+The first term prices the approximate number of scheduling decisions and the
+second prices the exposed tail when another worker needs work. Setting
+$C'(\tau)=0$ gives the square-root target above. With $u_{j,k}$ iterations
+currently unclaimed, the next raw block uses
+
+$$
+r_{j,k}=\operatorname{clamp}\!\left(\frac{\tau_{j,k}}{t_{j,k}},\frac14,8\right),
+\qquad
+q_{j,k}=\operatorname{clamp}\!\left(c_{j,k}r_{j,k},g,
+\left\lceil\frac{u_{j,k}}4\right\rceil\right).
+$$
+
+After the first sample, the published size is smoothed by
+$b_{j,k+1}=b_{j,k}+(q_{j,k}-b_{j,k})/4$, with integer rounding toward the old
+size. The implementation also bounds the unsmoothed change to
+$[b_{j,k}/4,8b_{j,k}]$. Only the owner updates $b_j$; thieves load it and claim
+work atomically, so migration and contention do not poison the estimator. The
+unitless baseline $1$ represents the possibility of one tail worker before an
+idle owner is observed; no time duration or iteration-count cutoff is built
+into the default. Consequently, the actual $\widehat B=\sum_j B_j$ depends on
+measured platform and body time and cannot be inferred from $N$ alone;
+`tools/rapid_model.py` uses the initial `HybridBlockSize` count solely as a structural proxy.
+
+Root timespan stealing also replaces the ordinary critical-worker callback count
+with
+
+$$
+C_{\text{timespan}}=min(N,\widehat g)
++\left\lceil\frac{(N-\widehat g)_+}{s}\right\rceil.
+$$
+
+The fixed term $A_m$ is enabled only if that root has residual work to publish.
+This piecewise term is essential: a short empty loop can finish wholly inside
+the calibration prefix without launching parallel work.
+
+The empty-body effective grain is selected over powers of two from timespan
+stealing's training sizes and reused by sharing-timespan, since both execute the
+same body under the same elapsed-time gate. All nonnegative time coefficients
+minimize relative squared error.
+Every third ordered size and the largest sampled size are held out from fitting.
+The report gives training and holdout MAPE separately and validates a
+policy selector by its exact-winner accuracy and observed regret.
+
+For SpMV family $k$ and mode $m$, `tools/rapid_model.py` fits the warm-call quantity
 
 $$
 \boxed{
@@ -702,7 +815,7 @@ This model is intentionally
 not obtained by blindly summing empty-body `Launch` values: doing that already
 overpredicts some Eigen scan cases.
 
-## 8. What the current full run says
+## 8. What the 2026-07-29 reference run said
 
 The local run `20260729T201647Z_Kirills-MacBook-Pro-3.local` used 16 workers,
 Release Clang 19, and ten repetitions. It is a development snapshot under the
@@ -758,6 +871,40 @@ workers exactly once, whereas median distinct workers are only 7 for stealing,
 requires origin-to-maximum timing plus required-slot coverage, as in the blocking
 tuner probe.
 
+### 8.1 Seven-policy calibration on 2026-08-31
+
+A fresh local calibration at commit `b051105`, Release Apple Clang 16, 16
+workers, seven repetitions, and 0.1 seconds minimum time per case included all
+seven Eigen/Rapid policies. `Launch`, Scan, and the three SpMV shapes were
+measured. Every third ordered size and every family's largest size were excluded
+from fitting.
+
+| Mode | Fitted empty-body grain | Launch holdout MAPE | SpMV holdout MAPE | Scan holdout MAPE |
+| --- | ---: | ---: | ---: | ---: |
+| Eigen stealing | 1 | 8.8% | 12.1% | 6.0% |
+| Eigen sharing | 1 | 7.1% | 12.0% | 5.7% |
+| Eigen timespan stealing | 4096 | 33.4% | 6.9% | 28.1% |
+| Eigen sharing-timespan | 4096 shared | 57.2% | 13.1% | 3.5% |
+| Static Rapid | 1 | 10.6% | 3.3% | 13.5% |
+| Rapid mailbox | 1 | 9.1% | 12.2% | 40.1% |
+| Lazy Rapid stealing | 1 | 9.3% | 17.0% | 8.9% |
+
+The fitted `4096` is an effective callback grain for this empty body on this
+host. It is not a replacement value for `INIT_TIME`: changing the body changes
+how many callbacks fit inside the same elapsed-time gate.
+
+Selecting the lowest predicted mode gave 91.7% exact winners on 12 held-out
+cases, 0.2% mean observed regret, and 2.8% maximum regret. That result is useful
+for a candidate selector, but it does not rescue the poor absolute-time fits in
+the table. The winners often have wide margins. Sharing-timespan's sublinear
+large-loop curve, timespan stealing's piecewise serial prefix, and mailbox Scan's
+repeated synchronization need observed grain, split, claim, failed-probe, and
+worker-coverage counters before their costs can be separated.
+
+The ignored local result is
+`results/scheduler_eval/20260831_model_all_policies`. As with the older run, raw
+JSON must be archived with checksums before these values are used in a paper.
+
 ## 9. Why these coefficients are not publishable yet
 
 1. The host has 12 performance and 4 efficiency cores. macOS pinning is currently
@@ -767,8 +914,9 @@ tuner probe.
 3. The two complete same-commit runs disagree materially. For the overlapping
    cases, Rapid is stable, but several Eigen medians change by much more than 20%.
    The mode order is fixed and recorded system load was very high.
-4. The full run omits `EIGEN_STEALING_GRAINSIZE`. Without it, initial sharing and
-   adaptive grain selection cannot be isolated.
+4. The older full run omitted `EIGEN_STEALING_GRAINSIZE`. The new calibration
+   includes it, but does not record the actual derived grain, so the fitted
+   effective grain still cannot isolate gate timing from body and worker speed.
 5. `Launch` is not a universally transferable scheduler term. In a timespan mode,
    the body determines the measured grain and hence the number of generated tasks.
 6. The three SpMV families need different $\kappa_k$ values. One nonzero is not
@@ -791,7 +939,7 @@ After a complete non-smoke evaluation containing Rapid Start, at least three
 `Launch` sizes, and the SpMV families:
 
 ```sh
-python3 benchmarks/scheduler_eval/tools/model.py \
+python3 benchmarks/scheduler_eval/tools/rapid_model.py \
   results/scheduler_eval/<result-directory>
 ```
 
@@ -813,7 +961,7 @@ not an invitation to add arbitrary polynomial terms.
 
 The next evaluation should add, in this order:
 
-1. Run all four Eigen policies, especially `EIGEN_STEALING_GRAINSIZE`.
+1. Repeat all eight Eigen/Rapid policies in counterbalanced fresh processes.
 2. Randomize or counterbalance process/mode order and repeat complete runs in
    fresh processes.
 3. Sweep $P=1,2,4,8,12,16$, and compare performance cores only with all cores.

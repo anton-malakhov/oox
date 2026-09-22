@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """Fit an explainable scheduler model to one scheduler_eval result directory."""
 
-import argparse
-import csv
 import html
 import json
 import math
-from pathlib import Path
-import re
-import statistics
+
+from model import (
+    SPMV_RE, SCAN_RE, LAUNCH_RE,
+    parse_args, write_csv, benchmark_medians, nonnegative_line_fit,
+    launch_time, mean_absolute_percentage, through_origin,
+    nonnegative_least_squares, sparse_weights, static_maximum, startup_parameters,
+    fit_launch as fit_launch_all,
+)
 
 
-TIME_TO_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
-SPMV_RE = re.compile(
-    r"^SpmvBenchmark<SparseKind::(Balanced|Hyperbolic|Triangle)>/(\d+)/real_time$")
-SCAN_RE = re.compile(r"^Scan/(\d+)/real_time$")
-LAUNCH_RE = re.compile(r"^Launch/(\d+)/real_time$")
 COLORS = {
     "RAPID_START": "#3973ac",
     "RAPID_MAILBOX": "#1b9e77",
@@ -62,54 +60,6 @@ POLICY_MODELS = {
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("result", type=Path,
-                        help="a complete results/scheduler_eval directory")
-    return parser.parse_args()
-
-
-def write_csv(path, fieldnames, rows):
-    with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def benchmark_medians(result, modes):
-    samples = {}
-    for path in sorted((result / "raw").glob("bench_scheduler_eval_*.json")):
-        mode = path.stem.removeprefix("bench_scheduler_eval_")
-        if mode not in modes:
-            continue
-        for row in json.loads(path.read_text()).get("benchmarks", []):
-            if row.get("run_type", "iteration") != "iteration":
-                continue
-            value = float(row["real_time"]) * TIME_TO_US[row.get("time_unit", "ns")]
-            samples.setdefault((row["name"], mode), []).append(value)
-    return {key: statistics.median(values) for key, values in samples.items()}
-
-
-def nonnegative_line_fit(xs, ys):
-    """Least squares y=a+b*x with a,b >= 0."""
-    candidates = []
-    count = len(xs)
-    sx, sy = sum(xs), sum(ys)
-    sxx = sum(x * x for x in xs)
-    sxy = sum(x * y for x, y in zip(xs, ys))
-    denominator = count * sxx - sx * sx
-    if denominator:
-        b = (count * sxy - sx * sy) / denominator
-        a = (sy - b * sx) / count
-        if a >= 0 and b >= 0:
-            candidates.append((a, b))
-    candidates.append((max(0.0, sy / count), 0.0))
-    candidates.append((0.0, max(0.0, sxy / sxx) if sxx else 0.0))
-    return min(candidates,
-               key=lambda ab: sum((y - ab[0] - ab[1] * x) ** 2
-                                   for x, y in zip(xs, ys)))
-
-
 def holdout_values(values):
     """Deterministic interpolation plus largest-size holdout."""
     ordered = sorted(set(values))
@@ -121,6 +71,13 @@ def holdout_values(values):
 def fit_launch(points):
     """Fit H(N)=a+b*(N/scale)^gamma by a bounded grid search."""
     points = sorted(points)
+    if not points or any(not math.isfinite(x) or x <= 0 or
+                         not math.isfinite(y) or y < 0 for x, y in points):
+        raise ValueError("launch fit requires finite positive task counts and nonnegative timings")
+    if len(set(x for x, _ in points)) < 3 or any(y == 0 for _, y in points):
+        fit = fit_launch_all(points)
+        return dict(fit, training_mape_percent=fit["mape_percent"],
+                    holdout_mape_percent=None)
     held_out = holdout_values(x for x, _ in points)
     training = [(x, y) for x, y in points if x not in held_out]
     scale = float(max(x for x, _ in training))
@@ -151,64 +108,6 @@ def fit_launch(points):
         "mape_percent": mean_absolute_percentage(
             [y for _, y in points], [predictions[x] for x, _ in points]),
     }
-
-
-def launch_time(fit, tasks):
-    return (fit["intercept_us"] + fit["scale_us"] *
-            (max(1, tasks) / fit["task_scale"]) ** fit["exponent"])
-
-
-def mean_absolute_percentage(observed, predicted):
-    values = [abs(actual - estimate) / actual
-              for actual, estimate in zip(observed, predicted) if actual]
-    return 100.0 * sum(values) / len(values) if values else math.nan
-
-
-def through_origin(xs, ys):
-    denominator = sum(x * x for x in xs)
-    return max(0.0, sum(x * y for x, y in zip(xs, ys)) / denominator)
-
-
-def solve_linear(matrix, vector):
-    size = len(vector)
-    rows = [list(matrix[index]) + [vector[index]] for index in range(size)]
-    for column in range(size):
-        pivot = max(range(column, size), key=lambda row: abs(rows[row][column]))
-        if abs(rows[pivot][column]) < 1e-12:
-            return None
-        rows[column], rows[pivot] = rows[pivot], rows[column]
-        divisor = rows[column][column]
-        rows[column] = [value / divisor for value in rows[column]]
-        for row in range(size):
-            if row == column:
-                continue
-            factor = rows[row][column]
-            rows[row] = [left - factor * right
-                         for left, right in zip(rows[row], rows[column])]
-    return [rows[index][-1] for index in range(size)]
-
-
-def nonnegative_least_squares(columns, targets):
-    """Small exhaustive active-set NNLS."""
-    width = len(columns[0])
-    candidates = [tuple(0.0 for _ in range(width))]
-    for mask in range(1, 1 << width):
-        active = [index for index in range(width) if mask & (1 << index)]
-        gram = [[sum(row[left] * row[right] for row in columns)
-                 for right in active] for left in active]
-        rhs = [sum(row[index] * target
-                   for row, target in zip(columns, targets)) for index in active]
-        solution = solve_linear(gram, rhs)
-        if solution is None or any(value < 0 for value in solution):
-            continue
-        candidate = [0.0] * width
-        for index, value in zip(active, solution):
-            candidate[index] = value
-        candidates.append(tuple(candidate))
-    return min(candidates,
-               key=lambda values: sum((target - sum(value * x for value, x
-                                                     in zip(values, row))) ** 2
-                                      for row, target in zip(columns, targets)))
 
 
 def hybrid_block_size(work, workers, divisor=1):
@@ -337,33 +236,6 @@ def fit_structural_launch(points, mode, threads, shared_effective_grain=None):
             [row["observed_us"] for row in selected],
             [row["predicted_us"] for row in selected])
     return parameter, rows
-
-
-def sparse_weights(rows, columns, kind):
-    harmonic = sum(1.0 / index for index in range(1, rows + 1))
-    average = max(1, (columns + 8) // 9)
-    weights = []
-    for row in range(rows):
-        count = average
-        if kind == "Hyperbolic":
-            count = max(1, int(average * rows / harmonic / (row + 1)))
-        elif kind == "Triangle":
-            count = max(1, 2 * average * (rows - row) // (rows + 1))
-        width = (max(1, columns * (row + 1) // rows)
-                 if kind == "Triangle" else columns)
-        weights.append(min(count, width))
-    return weights
-
-
-def static_maximum(weights, parts):
-    step, remainder = divmod(len(weights), parts)
-    cursor = 0
-    loads = []
-    for part in range(parts):
-        length = step + (part < remainder)
-        loads.append(sum(weights[cursor:cursor + length]))
-        cursor += length
-    return max(loads)
 
 
 def spmv_cases(medians, threads):
@@ -539,30 +411,6 @@ def fit_scan(medians, launch_fits, modes, threads):
                 [row["observed_us"] for row in valid],
                 [row["launch_sum_us"] for row in valid]))
     return coefficients, predictions
-
-
-def startup_parameters(result, modes):
-    values = {}
-    for path in sorted((result / "raw").glob("scheduling_dist_spin_*.json")):
-        data = json.loads(path.read_text())
-        mode = data.get("mode")
-        if mode not in modes:
-            continue
-        distinct = [len(set(row["worker"])) for row in data.get("iterations", [])]
-        maximum = []
-        for row in data.get("iterations", []):
-            counts = {}
-            for worker in row["worker"]:
-                counts[worker] = counts.get(worker, 0) + 1
-            maximum.append(max(counts.values(), default=0))
-        values[mode] = {
-            "initialization_us": float(data["initialization_ns"]) / 1000.0,
-            "p99_publication_spread_us":
-                float(data["spread_summary_ns"]["p99"]) / 1000.0,
-            "median_distinct_workers": statistics.median(distinct) if distinct else 0,
-            "median_max_tasks_per_worker": statistics.median(maximum) if maximum else 0,
-        }
-    return values
 
 
 def policy_selection(predictions):

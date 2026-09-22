@@ -301,3 +301,9 @@ amortization, and an observed-versus-predicted SpMV plot to that result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).
+
+The Rapid-specific structural fits and holdout analysis run through
+`tools/rapid_model.py`, which reuses the generic helpers in `tools/model.py`.
+See also the [Rapid integration results](docs/RAPID_GROUP_INTEGRATION.md),
+[policy matrix](docs/SOTA_MATRIX.md), and
+[Rapid/Eigen study](docs/RAPID_START_VS_EIGEN.md).

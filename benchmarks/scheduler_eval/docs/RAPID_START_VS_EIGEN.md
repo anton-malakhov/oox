@@ -354,5 +354,5 @@ ownership first; the scheduler exposes and steals work only when the execution
 shows that doing so is worthwhile.
 
 The benchmark construction and reproduction commands are documented in
-[the scheduler evaluation README](README.md). The full event-count and
+[the scheduler evaluation README](../README.md). The full event-count and
 parameter-selection model is in [the performance model](PERFORMANCE_MODEL.md).

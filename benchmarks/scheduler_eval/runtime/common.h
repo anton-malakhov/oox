@@ -8,7 +8,7 @@
 #include "oox_task_adapter.h"
 #elif defined(RAPID_START_MODE)
 #ifdef EIGEN_MODE
-#include "../rapid_start_adapter.h"
+#include "eigen_rapid_adapter.h"
 #else
 #include "rapid_start_adapter.h"
 #endif

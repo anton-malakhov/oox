@@ -133,7 +133,7 @@
 #else
 #define EIGEN_MODE EIGEN_RAPID_TIMESPAN_LAZY_STEALING
 #endif
-#include "scheduler_eval/rapid_start_adapter.h"
+#include "scheduler_eval/runtime/eigen_rapid_adapter.h"
 #endif
 #pragma pop_macro("TBB_STATIC")
 #pragma pop_macro("TBB_RAPID")
