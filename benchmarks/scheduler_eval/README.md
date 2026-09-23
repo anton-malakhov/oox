@@ -285,3 +285,15 @@ amortization, and an observed-versus-predicted SpMV plot to that result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).
+
+## Fast-group comparison
+
+`RAPID_GROUP` runs the Eigen pool's resident range groups on the existing
+workload suite, including nested and worker-availability checks. `RAPID_START`
+retains upstream's historical TBB prototype. Compare with `EIGEN_AUTO` and
+`EIGEN_STATIC`; resident mode is opt-in and consumes idle CPU.
+
+Configure `OOX_SCHEDULER_EVAL_STATS=OFF` for timings without Eigen's diagnostic
+counter updates (default ON). The runner records this setting. For direct
+backend loops, use `bench_loops_EIGEN.EIGEN_AUTO_LOOP` and
+`bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`.

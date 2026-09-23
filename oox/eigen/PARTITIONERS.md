@@ -115,13 +115,13 @@ For a different target worker, a registered sender publishes one proxy to
 both its local LIFO queue and a dedicated recipient mailbox, following oneTBB's
 two-location affinity protocol. A packed atomic word contains the task pointer
 and the two location bits. Extraction claims the useful task once and releases
-that queue location; the final location recycles the proxy. Rejected sender publication claims and discards any still-unclaimed work, so
-an unavailable recipient cannot strand a failed operation. The recipient
-location then owns only proxy cleanup.
+that queue location; the final location recycles the proxy. If either queue is
+full, the sender claims any unclaimed task and executes it inline after
+publication admission is released. Proxy-allocation failure discards the task.
 
-The affinity mailbox uses intrusive links, an atomic incoming list, and an
-owner-only FIFO batch. It has no fixed slot capacity and does not route remote
-proxies through the ordinary overflow deque. Thieves use the sender's local
+The affinity mailbox is a bounded 1024-slot queue. There is no global overflow
+deque. Both queued references and stale proxies have bounded storage.
+Thieves use the sender's local
 proxy; ordinary external submissions retain their existing mailbox. Already-
 claimed proxies are cleaned up during queue search rather than executed as
 ordinary tasks. This preserves the sender's ability to help its newest child
@@ -176,9 +176,8 @@ a Rapid group, publish Rapid activations, inherit Rapid worker domains, or
 use a Rapid completion region. No OOX dependency or task API changes are required.
 
 The pool retains its task-publication and cancellation contracts. Affinity
-publication is integrated through ScheduleWithAffinity. Queue searches check an
-atomic overflow hint before taking the overflow mutex and skip a victim whose
-steal mutex is busy. Registered callers of Wait try helping before registering
+publication is integrated through ScheduleWithAffinity. Queue searches skip a
+victim whose steal mutex is busy. Registered callers of Wait try helping before registering
 as waiters. If no task is available, they retain the registration, recheck, and
 parking protocol.
 
@@ -238,7 +237,7 @@ normal builds.
 Affinity-specific checks cover learned placement, sequential history reuse,
 overlap isolation, pool changes, and queued tasks outliving a temporary history.
 Proxy regressions cover both claim orders, a blocked recipient with more than
-65,000 sender-completed tasks, overflowed sender entries, and cancellation.
+65,000 sender-completed tasks, bounded saturation, and cancellation.
 The small-object allocator runs generated value/destructor oracles for local
 returns, remote returns, closed owners, and owner-exit races, plus large cases.
 

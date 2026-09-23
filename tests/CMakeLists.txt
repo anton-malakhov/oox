@@ -112,6 +112,7 @@ add_test(NAME NonThrowConsumeCompile
                  -P ${CMAKE_CURRENT_LIST_DIR}/nonthrow_consume_compile.cmake)
 if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_test eigen_pool_test.cpp)
+  target_compile_definitions(eigen_pool_test PRIVATE OOX_EIGEN_ENABLE_STATS=1)
   target_link_libraries(eigen_pool_test PRIVATE
           ${PROJECT_NAME}::eigen
           ${OOX_GTEST_LIB})
@@ -131,6 +132,23 @@ if (OOX_ENABLE_EIGEN)
   add_executable(eigen_pool_instantiation eigen_pool_instantiation.cpp)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
+
+  add_executable(eigen_rapid_start_test eigen_rapid_start_test.cpp)
+  target_link_libraries(eigen_rapid_start_test PRIVATE
+          ${PROJECT_NAME}::eigen
+          ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_rapid_start_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30)
+
+  add_executable(eigen_rapid_mailbox_test eigen_rapid_mailbox_test.cpp)
+  target_link_libraries(eigen_rapid_mailbox_test PRIVATE
+          ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_rapid_mailbox_test PRIVATE
+          OOX_EIGEN_ENABLE_STATS=1)
+  gtest_discover_tests(eigen_rapid_mailbox_test
+          DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
+          PROPERTIES TIMEOUT 90)
 
   add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
   target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)

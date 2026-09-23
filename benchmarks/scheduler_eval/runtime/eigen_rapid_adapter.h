@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "benchmarks/eigen/resident_test_support.h"
+#include "benchmarks/eigen/eigen_pool.h"
+#include "benchmarks/eigen/thread_index.h"
+#include "benchmarks/eigen/util.h"
+#include "oox/eigen/rapid_start.h"
+
+#include <cstddef>
+#include <stdexcept>
+#include <utility>
+
+namespace rapid_start_eval {
+
+namespace rapid = oox::detail::eigen_pool::rapid;
+
+class Runtime {
+public:
+  explicit Runtime(std::size_t threads)
+      : threads_(Validate(threads)), state_(EigenPool()),
+        group_{&state_, {0, static_cast<unsigned>(threads_)}} {
+    eigen_test_support::WaitForResidentWorkers(group_, std::chrono::seconds(5));
+    Run(0, threads_, [](std::size_t) {});
+  }
+
+  template <typename F>
+  void Run(std::size_t from, std::size_t to, F &&func) {
+    if (from >= to) {
+      return;
+    }
+    rapid::ParallelForResidentRanges(group_, from, to,
+        [&](std::size_t first, std::size_t last) {
+          for (std::size_t i = first; i < last; ++i)
+            func(i);
+        });
+  }
+
+private:
+  static std::size_t Validate(std::size_t threads) {
+    if (threads == 0 || threads >= (std::size_t{1} << 16))
+      throw std::invalid_argument(
+          "Rapid Start requires between 1 and 65535 workers");
+    return threads;
+  }
+
+  std::size_t threads_;
+  rapid::RapidDomainState state_;
+  rapid::RapidStartGroup group_;
+};
+
+inline Runtime &GetRuntime() {
+  static Runtime runtime(static_cast<std::size_t>(GetNumThreads()));
+  return runtime;
+}
+
+} // namespace rapid_start_eval
+
+template <typename F>
+void ParallelFor(std::size_t from, std::size_t to, F &&func,
+                 std::size_t = 1) {
+  rapid_start_eval::GetRuntime().Run(from, to, std::forward<F>(func));
+}
+
+inline void InitParallel(std::size_t threads) {
+  if (threads != static_cast<std::size_t>(GetNumThreads()))
+    throw std::invalid_argument("Rapid Start worker-count mismatch");
+  rapid_start_eval::GetRuntime();
+}

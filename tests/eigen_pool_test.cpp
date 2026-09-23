@@ -16,9 +16,39 @@
 namespace {
 
 using oox::detail::eigen_pool::MakeTask;
+using oox::detail::eigen_pool::Task;
 using oox::detail::eigen_pool::ThreadPool;
 using namespace std::chrono_literals;
 
+struct FinalizingTask final : Task {
+  explicit FinalizingTask(std::atomic<size_t> &finalized)
+      : finalized(finalized) {}
+
+  void operator()() final { Finalize(); }
+  void Discard() noexcept final { Finalize(); }
+
+  void Finalize() noexcept {
+    finalized.fetch_add(1, std::memory_order_release);
+    delete this;
+  }
+
+  std::atomic<size_t> &finalized;
+};
+
+struct ReentrantCancelTask final : Task {
+  ReentrantCancelTask(ThreadPool &pool, std::atomic<bool> &discarded)
+      : pool(pool), discarded(discarded) {}
+
+  void operator()() final { delete this; }
+  void Discard() noexcept final {
+    pool.Cancel();
+    discarded.store(true, std::memory_order_release);
+    delete this;
+  }
+
+  ThreadPool &pool;
+  std::atomic<bool> &discarded;
+};
 struct MoveAwareCallable {
   bool *moved_from;
   bool *ran;
@@ -118,7 +148,7 @@ TEST(EigenPool, NestedWaitsMakeProgressWithAllWorkersOccupied) {
   EXPECT_EQ(result.wait_for(2s), std::future_status::ready);
 }
 
-TEST(EigenPool, QueueOverflowDoesNotRecurseInline) {
+TEST(EigenPool, QueueSaturationCompletesAllTasks) {
   ThreadPool pool(2, false, false);
   constexpr int task_count = 5000;
   std::atomic<int> completed_count{0};
@@ -138,6 +168,34 @@ TEST(EigenPool, QueueOverflowDoesNotRecurseInline) {
 
   EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(completed_count.load(), task_count);
+}
+
+TEST(EigenPool, InlineFallbackReleasesPublicationBeforeCancellation) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> entered, release, completed;
+  auto release_result = release.get_future().share();
+  auto completed_result = completed.get_future();
+  pool.Schedule(MakeTask([&] {
+    entered.set_value();
+    release_result.wait();
+    completed.set_value();
+  }));
+  ASSERT_EQ(entered.get_future().wait_for(2s), std::future_status::ready);
+
+  for (int task = 0; task < 1024; ++task) {
+    pool.Schedule(MakeTask([] {}));
+  }
+  std::atomic<bool> cancelled{false};
+  pool.Schedule(MakeTask([&] {
+    pool.Cancel();
+    cancelled.store(true, std::memory_order_release);
+  }));
+  EXPECT_TRUE(cancelled.load(std::memory_order_acquire));
+  release.set_value();
+  EXPECT_EQ(completed_result.wait_for(2s), std::future_status::ready);
+  const auto statistics = pool.GetStatistics();
+  EXPECT_EQ(statistics.scheduled, 1026u);
+  EXPECT_EQ(statistics.executed, 2u); // Blocker plus inline cancellation.
 }
 
 TEST(EigenPool, AcceptsConcurrentExternalProducers) {
@@ -170,6 +228,45 @@ TEST(EigenPool, AcceptsConcurrentExternalProducers) {
   EXPECT_EQ(completed_count.load(), task_count);
 }
 
+TEST(EigenPool, CancellationAccountsForConcurrentPublications) {
+  constexpr size_t rounds = 25;
+  constexpr size_t producer_count = 4;
+  constexpr size_t tasks_per_producer = 256;
+  constexpr size_t task_count = producer_count * tasks_per_producer;
+  for (size_t round = 0; round < rounds; ++round) {
+    ThreadPool pool(4, false, false);
+    std::atomic<bool> start{false};
+    std::atomic<size_t> submitted{0};
+    std::atomic<size_t> finalized{0};
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+    for (size_t producer = 0; producer < producer_count; ++producer) {
+      producers.emplace_back([&] {
+        start.wait(false, std::memory_order_acquire);
+        for (size_t task = 0; task < tasks_per_producer; ++task) {
+          submitted.fetch_add(1, std::memory_order_release);
+          pool.Schedule(new FinalizingTask(finalized));
+        }
+      });
+    }
+    start.store(true, std::memory_order_release);
+    start.notify_all();
+    while (submitted.load(std::memory_order_acquire) < producer_count) {
+      std::this_thread::yield();
+    }
+    pool.Cancel();
+    for (auto &producer : producers) {
+      producer.join();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (finalized.load(std::memory_order_acquire) != task_count &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    ASSERT_EQ(finalized.load(), task_count) << "round " << round;
+  }
+}
+
 TEST(EigenPool, NonWorkerWaitParks) {
   ThreadPool pool(1, false, false);
   std::atomic<bool> done{false};
@@ -191,6 +288,7 @@ TEST(EigenPool, PublicationWakesWorkerInsteadOfExternalWaiter) {
   std::atomic<bool> done{false};
   std::atomic<int> waiting{0};
   std::vector<std::thread> waiters;
+  waiters.reserve(8);
   for (int i = 0; i < 8; ++i) {
     waiters.emplace_back([&] {
       waiting.fetch_add(1, std::memory_order_release);
@@ -276,6 +374,59 @@ TEST(EigenPool, CancellationWakesParkedWorkers) {
   pool.Cancel();
 }
 
+TEST(EigenPool, ConcurrentCancellationIsIdempotent) {
+  constexpr size_t caller_count = 8;
+  ThreadPool pool(4, false, false);
+  std::atomic<size_t> ready{0};
+  std::atomic<bool> cancel{false};
+  std::vector<std::thread> callers;
+  callers.reserve(caller_count);
+  for (size_t caller = 0; caller < caller_count; ++caller) {
+    callers.emplace_back([&] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!cancel.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      pool.Cancel();
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != caller_count) {
+    std::this_thread::yield();
+  }
+  cancel.store(true, std::memory_order_release);
+  for (auto &caller : callers) {
+    caller.join();
+  }
+
+  std::atomic<unsigned> executed{0};
+  pool.Schedule(MakeTask(
+      [&] { executed.fetch_add(1, std::memory_order_relaxed); }));
+  EXPECT_EQ(executed.load(), 0u);
+}
+
+TEST(EigenPool, DiscardedTaskCanReenterCancellation) {
+  ThreadPool pool(1, false, false);
+  std::promise<void> blocker_entered;
+  std::promise<void> release_blocker;
+  auto release = release_blocker.get_future().share();
+  pool.RunOnThread(MakeTask([&blocker_entered, release] {
+                     blocker_entered.set_value();
+                     release.wait();
+                   }),
+                   0);
+  const auto blocker_status = blocker_entered.get_future().wait_for(2s);
+  if (blocker_status != std::future_status::ready) {
+    release_blocker.set_value();
+  }
+  ASSERT_EQ(blocker_status, std::future_status::ready);
+
+  std::atomic<bool> discarded{false};
+  pool.RunOnThread(new ReentrantCancelTask(pool, discarded), 0);
+  pool.Cancel();
+  EXPECT_TRUE(discarded.load(std::memory_order_acquire));
+  release_blocker.set_value();
+}
+
 TEST(EigenPool, MakeTaskSupportsPolymorphicDeletion) {
   auto token = std::make_shared<int>(17);
   std::weak_ptr<int> lifetime = token;
@@ -341,7 +492,7 @@ TEST(EigenPool, AffinityRecipientWinsAndSenderEntriesRemainSafe) {
           done.set_value();
       }), 1);
     EXPECT_EQ(result.wait_for(5s), std::future_status::ready);
-    // Destruction drains already-claimed sender entries, including overflow.
+    // Destruction drains already-claimed sender entries.
   }
   for (size_t i = 0; i < count; ++i)
     EXPECT_EQ(visits[i].load(), 1u) << "case=recipient-wins item=" << i;
@@ -373,7 +524,9 @@ TEST(EigenPool, AffinityCancellationDiscardsEachUsefulTaskOnce) {
     released.store(true, std::memory_order_release);
     released.notify_one();
   }
-  EXPECT_EQ(ran.load(), 0u);
+  // The bounded mailbox retains 1024 tasks; the rest execute inline before
+  // cancellation. Cancelling discards only the still-pending tasks.
+  EXPECT_EQ(ran.load(), count - 1024);
   EXPECT_EQ(destroyed.load(), count);
 }
 

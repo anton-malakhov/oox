@@ -240,6 +240,7 @@ def main():
         "compiler_version": compiler_version,
         "cxx_flags": cache.get("CMAKE_CXX_FLAGS", ""),
         "allocator": cache.get("OOX_ALLOCATOR", "unspecified"),
+        "eigen_scheduler_stats": cache.get("OOX_SCHEDULER_EVAL_STATS", "ON"),
         "environment": {
             "KMP_AFFINITY": env["KMP_AFFINITY"],
             "OMP_PROC_BIND": env["OMP_PROC_BIND"],

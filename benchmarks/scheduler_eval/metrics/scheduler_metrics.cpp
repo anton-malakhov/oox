@@ -10,11 +10,14 @@
 #elif defined(EIGEN_MODE)
 #include "benchmarks/eigen/eigen_pool.h"
 #endif
+#ifdef RAPID_MAILBOX_MODE
+#include "eigen_mailbox_adapter.h"
+#endif
 
 namespace scheduler_eval {
 
 SchedulerMetrics ReadSchedulerMetrics() {
-#if defined(EIGEN_MODE) || defined(OOX_TASK_MODE)
+#if defined(OOX_EIGEN_ENABLE_STATS) && (defined(EIGEN_MODE) || defined(OOX_TASK_MODE))
 #ifdef OOX_TASK_MODE
   const auto value = oox::internal::get_eigen_pool().GetStatistics();
 #else
@@ -30,7 +33,7 @@ SchedulerMetrics ReadSchedulerMetrics() {
 void ReportSchedulerMetrics(benchmark::State &state,
                             const SchedulerMetrics &before,
                             const SchedulerMetrics &after) {
-#if defined(EIGEN_MODE) || defined(OOX_TASK_MODE)
+#if defined(OOX_EIGEN_ENABLE_STATS) && (defined(EIGEN_MODE) || defined(OOX_TASK_MODE))
   state.counters["tasks_scheduled"] = after.scheduled - before.scheduled;
   state.counters["tasks_executed"] = after.executed - before.executed;
   state.counters["successful_steals"] =
@@ -44,6 +47,16 @@ void ReportSchedulerMetrics(benchmark::State &state,
   static_cast<void>(state);
   static_cast<void>(before);
   static_cast<void>(after);
+#endif
+#ifdef RAPID_MAILBOX_MODE
+  const auto &calibration = rapid_mailbox_eval::GetRuntime().Calibration();
+  state.counters["rapid_resident_limit"] = EigenPool().ResidentLimit();
+  state.counters["rapid_background_residents"] = EigenPool().ResidentCapacity(
+      {0, static_cast<unsigned>(EigenPool().NumThreads())});
+  state.counters["rapid_cost_multiplier"] = EigenPool().CalibrationMultiplier();
+  state.counters["rapid_calibration_ns"] = calibration.elapsed_ns;
+  state.counters["rapid_calibration_trials"] = calibration.trials.size();
+  state.counters["rapid_calibration_budget_exhausted"] = calibration.budget_exhausted;
 #endif
 }
 
