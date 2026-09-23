@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "benchmarks/eigen/resident_test_support.h"
 
 #include <oox/eigen/rapid_start.h>
 #include <oox/eigen/parallel_for.h>
@@ -18,7 +19,6 @@ namespace {
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
 using oox::detail::eigen_pool::WorkerIdleMode;
-using oox::detail::eigen_pool::rapid::PrepareResidentGroup;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
 using namespace std::chrono_literals;
@@ -46,7 +46,7 @@ struct RapidHarness {
 
 TEST(EigenRapidResident, MatchesExactOnceOracleAcrossSmallRanges) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   for (size_t size = 0; size <= 257; ++size) {
     std::vector<std::atomic<unsigned>> visits(size);
     ParallelForResident(harness.group, 0, size, [&](size_t index) {
@@ -86,9 +86,44 @@ TEST(EigenRapidResident, ClaimMaskMatchesScanningOracle) {
   }
 }
 
+TEST(EigenRapidResident, InterleavedPublicationsMatchSerialOracle) {
+  constexpr uint64_t seed = 0x220929;
+  uint64_t random = seed;
+  RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
+  for (size_t case_index = 0; case_index < 256; ++case_index) {
+    random = random * 6364136223846793005ULL + 1;
+    const size_t size = case_index < 128
+                            ? case_index
+                            : (case_index == 255 ? size_t{1} << 20 : random % 4096);
+    SCOPED_TRACE(::testing::Message()
+                 << "seed=" << seed << " case=" << case_index);
+    std::vector<std::atomic<unsigned>> actual(size);
+    std::vector<unsigned> expected(size);
+    for (size_t i = 0; i < size; ++i)
+      expected[i] += i % 7 + 1;
+    for (size_t i = 0; i < size; ++i)
+      expected[i] += i % 13 + 3;
+    auto ordinary = std::async(std::launch::async, [&] {
+      oox::detail::eigen_pool::ParallelFor(harness.pool, 0, size, [&](size_t i) {
+        actual[i].fetch_add(i % 7 + 1, std::memory_order_relaxed);
+      });
+    });
+    ParallelForResident(harness.group, 0, size, [&](size_t i) {
+      actual[i].fetch_add(i % 13 + 3, std::memory_order_relaxed);
+    });
+    const auto status = ordinary.wait_for(5s);
+    if (status != std::future_status::ready)
+      harness.pool.Cancel();
+    ordinary.get();
+    ASSERT_EQ(status, std::future_status::ready);
+    for (size_t i = 0; i < size; ++i)
+      ASSERT_EQ(actual[i].load(), expected[i]) << i;
+  }
+}
+
 TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   constexpr size_t tasks = 1000;
   std::atomic<size_t> ordinary{0};
   for (size_t task = 0; task < tasks; ++task) {
@@ -111,7 +146,7 @@ TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
 
 TEST(EigenRapidResident, PropagatesExceptionsAndSupportsLargePools) {
   RapidHarness harness(65, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   EXPECT_THROW(ParallelForResident(harness.group, 0, 1024,
                                    [](size_t index) {
                                      if (index == 517) {
@@ -127,7 +162,7 @@ TEST(EigenRapidResident, PropagatesExceptionsAndSupportsLargePools) {
 
 TEST(EigenRapidResident, OrdinaryPublicationReleasesIdleResidents) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   std::vector<std::atomic<unsigned>> visits(257);
   auto execution = std::async(std::launch::async, [&] {
     oox::detail::eigen_pool::ParallelFor(harness.pool, 0, visits.size(), [&](size_t i) {
@@ -148,7 +183,7 @@ TEST(EigenRapidResident, PartialAvailabilityMatchesSerialOracle) {
   for (unsigned workers : {1u, 3u, 8u, 65u}) {
     for (unsigned busy : {0u, workers / 2, workers}) {
       RapidHarness harness(workers, true, WorkerIdleMode::ResidentBusy);
-      PrepareResidentGroup(harness.group);
+      eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
       std::promise<void> release, entered;
       auto unblocked = release.get_future().share();
       std::atomic<unsigned> arrivals{0};
@@ -212,7 +247,7 @@ TEST(EigenRapidResident, PartialAvailabilityMatchesSerialOracle) {
 
 TEST(EigenRapidResident, ConcurrentRangeRootsComposeWithDemandPartitioning) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   std::vector<std::atomic<unsigned>> visits(4 * 257);
   std::vector<std::future<void>> roots;
   for (size_t root = 0; root < 4; ++root) {
@@ -241,7 +276,7 @@ TEST(EigenRapidResident, ConcurrentRangeRootsComposeWithDemandPartitioning) {
 
 TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
   EXPECT_THROW(ParallelForResidentRanges(harness.group, 0, 257,
       [](size_t first, size_t last) {
@@ -264,7 +299,7 @@ TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
 TEST(EigenRapidResident, EmptyGroupsAndInvalidDomains) {
   using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
   bool called = false;
-  PrepareResidentGroup({});
+  eigen_test_support::WaitForResidentWorkers({}, std::chrono::seconds(5));
   ParallelForResidentRanges({}, 0, 8, [&](size_t, size_t) { called = true; });
   EXPECT_FALSE(called);
   RapidHarness harness(2, true, WorkerIdleMode::ResidentBusy);
@@ -273,14 +308,41 @@ TEST(EigenRapidResident, EmptyGroupsAndInvalidDomains) {
   EXPECT_THROW(ParallelForResidentRanges(invalid, 0, 8,
       [](size_t, size_t) {}), std::invalid_argument);
   RapidHarness parked(2);
-  EXPECT_THROW(PrepareResidentGroup(parked.group), std::invalid_argument);
+  EXPECT_THROW(eigen_test_support::WaitForResidentWorkers(parked.group, std::chrono::seconds(5)), std::invalid_argument);
   EXPECT_THROW(ParallelForResidentRanges(parked.group, 0, 8,
       [](size_t, size_t) {}), std::invalid_argument);
 }
 
+TEST(EigenRapidResident, LaunchDoesNotRequireAllWorkersReady) {
+  std::promise<void> entered, release;
+  auto ready = entered.get_future();
+  auto unblocked = release.get_future().share();
+  ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
+  RapidDomainState state(pool);
+  RapidStartGroup group{&state, {0, 2}};
+  eigen_test_support::WaitForResidentWorkers(group, 5s);
+  pool.RunOnThread(MakeTask([&, unblocked] {
+    entered.set_value();
+    unblocked.wait();
+  }), 1);
+  const auto status = ready.wait_for(2s);
+  if (status != std::future_status::ready) {
+    release.set_value();
+    FAIL() << "worker did not start the blocking task";
+  }
+  EXPECT_THROW(eigen_test_support::WaitForResidentWorkers(group, 0s),
+               std::runtime_error);
+  size_t visits = 0;
+  ParallelForResident(group, 0, 17, [&](size_t i) {
+    EXPECT_EQ(i, visits++);
+  });
+  release.set_value();
+  EXPECT_EQ(visits, 17u);
+}
+
 TEST(EigenRapidResident, CancellationJoinsCapturedHelpers) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
-  PrepareResidentGroup(harness.group);
+  eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
   oox::detail::eigen_pool::rapid::ParallelForResidentRanges(
       harness.group, 0, 257, [&](size_t first, size_t) {
         if (first == 0)

@@ -68,13 +68,16 @@ struct Metrics {
 
 class Region final : public SmallObjectAllocated<Region> {
 public:
-  explicit Region(ThreadPool &pool, Metrics *metrics)
-      : pool(pool), metrics(metrics) {}
+  explicit Region(ThreadPool &pool, Metrics *metrics,
+                  bool asynchronous_roots = false)
+      : pool(pool), metrics(metrics), asynchronous_roots_(asynchronous_roots) {}
   void AddTask() noexcept { remaining.fetch_add(1, std::memory_order_relaxed); }
   void TaskComplete(bool notify = true) noexcept {
     // The caller and the adaptive tree (or each non-adaptive task) retain us.
     // Copy the pool before releasing: completion may release the caller too.
     ThreadPool *saved_pool = &pool;
+    // Mailbox roots have no synchronous root owner whose wakeup can be elided.
+    notify = notify || asynchronous_roots_;
     const size_t previous = remaining.fetch_sub(1, std::memory_order_acq_rel);
     if (previous == 1)
       DeleteSmallObject(this);
@@ -123,6 +126,7 @@ public:
   Metrics *const metrics;
 
 private:
+  const bool asynchronous_roots_;
   std::atomic<size_t> remaining{1};
   static constexpr size_t closed = size_t{1} << (max_depth - 1);
   std::atomic<size_t> active{0};

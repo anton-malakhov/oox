@@ -49,6 +49,14 @@ available helpers and invokes `callback(first, last)` once per participant,
 partitioning by the captured count rather than the nominal pool size.
 A warm launch uses a stack descriptor and no ordinary task allocation.
 
+No readiness barrier is required: launching does not wait for busy workers to
+become available. Test and benchmark startup may explicitly call
+`eigen_test_support::WaitForResidentWorkers` from
+`benchmarks/eigen/resident_test_support.h`, with a caller-supplied timeout.
+That polling helper observes an idle snapshot, reserves nothing, and is not
+installed with the scheduler. A timed-out warmup throws; ordinary launches
+have no such readiness timeout. They still join their captured work below.
+
 The caller joins helpers before returning or rethrowing. Same-state nested
 calls run directly; concurrent roots reserve disjoint helpers. With no helper
 available, the caller executes the range. One launch uses at most 64 participants;
@@ -62,3 +70,78 @@ cancellation prevents new callback entry but does not interrupt a running body.
 
 Busy residence consumes idle CPU and is not the default policy. The group
 performs initial distribution only; it adds no stealing or grain-size policy.
+
+## Experimental mailbox handoff
+
+`rapid_mailbox.h` adds `rapid::ParallelForMailbox`. Its Rapid participants
+produce ordinary, stealable tasks: self-submissions use the owner's local deque,
+while remote submissions use bounded worker mailboxes. As an exception, captured
+participants process their own initial range directly. Range owners donate unfinished work
+when resident or parked workers appear idle, using measured callback cost to
+adjust private chunks. Ranges no larger than the grain run inline without
+activating a group.
+
+* `MailboxHandoff::Immediate` leaves Rapid participation after production and
+  resumes the normal scheduler. Benchmark mode: `RAPID_MAILBOX_EAGER`.
+* `MailboxHandoff::LocalFirst` processes local queues first and leaves before
+  attempting a remote steal. Benchmark mode: `RAPID_MAILBOX_LOCAL`.
+
+The producer domain is not an execution-affinity restriction: seeds target all
+pool workers, including uncaptured ones, and can be stolen. The opt-in
+`prefer_nonmembers` argument gives workers outside the captured-membership
+snapshot two seeds and twice the initial work share instead of one. Benchmark
+runs enable it with `OOX_RAPID_MAILBOX_PREFER_NONMEMBERS=1`. This is a hypothesis
+to measure, not a load estimate: an uncaptured worker may already be busy.
+
+Queue bounds are unchanged. Saturation ends participation before running the
+rejected task inline. A nested wait also leaves before its first remote steal.
+Calls made from an ordinary task use auto partitioning directly instead of
+recursively activating more groups. Thread registration and these dynamic
+execution contexts are tracked separately.
+
+Deregistration does not release borrowed callback storage: the caller first
+joins every producer command, then joins/closes the adaptive task region before
+returning or rethrowing. Both modes can allocate seed tasks, unlike fixed-range
+`ParallelForResidentRanges`; their startup costs must be measured separately.
+
+## Automatic hardware calibration
+
+`rapid_calibration.h` provides `rapid::CalibrateMailbox(group, policy, options)`.
+Call it once, from a serialized control/startup context, with the full pool's
+domain. It measures launch, uniform-work and skewed-work probes on the current
+machine and load, then selects a resident-cohort limit and polling-cost multiplier.
+The benchmark mailbox runtimes call it automatically during initialization.
+Ordinary default thread pools still use parking; calibration is opt-in for
+applications using these internal scheduler APIs.
+
+Workers outside the selected cohort park when idle but remain available for
+ordinary tasks and stealing. `ResidentLimit()` is a logical worker-ID prefix,
+not CPU affinity; with a main-thread slot, a limit of two normally means one
+background spinner plus the caller. Limit zero uses the ordinary auto partitioner.
+In-flight resident commands finish even if eligibility is reduced.
+
+Each thread measures polling/clock cost and scales the selected budget by that
+cost. Chunks start at the requested grain and adapt from elapsed callback time;
+there is no CPU-model table or fixed microsecond chunk target. The local cost
+cache is keyed by pool generation and resident limit, including pool-address reuse.
+The probe grid and a default 5% tolerance are policy choices, not a guarantee of
+optimal performance for every workload. Calibration favors the smaller cohort
+within that band and, for equal cohorts, less frequent polling.
+
+The default startup probe budget is 50 ms, checked between synchronous probes.
+Every started probe is joined, so OS preemption can extend total wall-clock time.
+Unavailable cohorts are skipped instead of waiting five seconds or throwing a
+busy-pool error. With no completed trial, calibration selects ordinary auto.
+Loop launches never run this startup search. Recalibrate explicitly at a quiet
+control point if the machine's load or resource allocation changes significantly.
+
+The result records completed trials, selected settings, elapsed startup time and
+budget/cancellation status. Benchmark output additionally records these settings
+outside the timed loop. For reproducible diagnostic runs,
+`OOX_RAPID_AUTOCALIBRATE=0` keeps fixed settings;
+`OOX_RAPID_RESIDENT_LIMIT=N` selects a fixed cohort and disables startup search.
+These environment controls belong to the benchmark adapter, not the core API.
+
+Queued seeds keep the callback as an opaque pointer until the callback lease is
+acquired. Cancellation may end callback storage before a dequeued-but-not-started
+seed runs; that seed must reject admission without forming a callback reference.

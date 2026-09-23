@@ -1,6 +1,7 @@
 // Copyright (c) 2005-2021 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 #include <oox/eigen/parallel_for.h>
+#include <oox/eigen/rapid_mailbox.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -85,6 +86,32 @@ int main() {
     }
     ++cases;
   } while (std::next_permutation(order.begin(), order.end()));
+  for (bool discard : {false, true}) {
+    for (bool close : {false, true}) {
+      for (bool parent_first : {false, true}) {
+        watched = nullptr;
+        regions_destroyed = 0;
+        unsigned visits = 0;
+        auto body = [&](size_t) { ++visits; };
+        auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
+        auto *seed = NewSmallObject<rapid::mailbox_detail::Seed<decltype(body)>>(
+            *region, body, 0, 1, 1);
+        watched = region;
+        if (close) region->CloseAndWait();
+        if (parent_first) region->TaskComplete();
+        if (discard) seed->Discard(); else (*seed)();
+        if (visits != unsigned(!discard && !close) ||
+            regions_destroyed.load() != unsigned(parent_first) ||
+            (!parent_first && !region->IsComplete())) {
+          std::cerr << "seed lifetime: discard=" << discard << " close=" << close
+                    << " parent_first=" << parent_first << '\n';
+          return 2;
+        }
+        if (!parent_first) region->TaskComplete();
+        if (regions_destroyed.load() != 1) return 3;
+      }
+    }
+  }
   watched = nullptr;
   std::cout << "root/owner lifecycle orders=" << cases << " PASS\n";
 }

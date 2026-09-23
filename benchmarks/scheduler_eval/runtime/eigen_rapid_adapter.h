@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "benchmarks/eigen/resident_test_support.h"
 #include "benchmarks/eigen/eigen_pool.h"
 #include "benchmarks/eigen/thread_index.h"
 #include "benchmarks/eigen/util.h"
@@ -20,7 +21,7 @@ public:
   explicit Runtime(std::size_t threads)
       : threads_(Validate(threads)), state_(EigenPool()),
         group_{&state_, {0, static_cast<unsigned>(threads_)}} {
-    rapid::PrepareResidentGroup(group_);
+    eigen_test_support::WaitForResidentWorkers(group_, std::chrono::seconds(5));
     Run(0, threads_, [](std::size_t) {});
   }
 

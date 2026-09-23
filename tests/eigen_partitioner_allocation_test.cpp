@@ -4,6 +4,7 @@
 #include <iostream>
 #include <new>
 #include "eigen_partitioner_test_support.h"
+#include <oox/eigen/rapid_mailbox.h>
 
 thread_local int fail_after = -1;
 thread_local bool injected = false;
@@ -104,9 +105,36 @@ void verify_reentrant_discard_after_allocation_failure() {
     std::_Exit(6);
 }
 
+void verify_mailbox_allocation_failures() {
+  using namespace oox::detail::eigen_pool;
+  using namespace oox::detail::eigen_pool::rapid;
+  ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
+  RapidDomainState state(pool);
+  for (auto policy : {MailboxHandoff::Immediate, MailboxHandoff::LocalFirst}) {
+    unsigned hits = 0;
+    for (int ordinal = 0; ordinal < 16; ++ordinal) {
+      injected = false;
+      fail_after = ordinal;
+      bool caught = false;
+      try {
+        ParallelForMailbox({&state, {0, 1}}, 0, 4097, [](size_t) {}, policy, true);
+      } catch (const std::bad_alloc &) { caught = true; }
+      fail_after = -1;
+      if (caught != injected) std::_Exit(7);
+      hits += injected;
+      std::array<std::atomic<unsigned>, 257> visits{};
+      ParallelForMailbox({&state, {0, 4}}, 0, visits.size(),
+          [&](size_t i) { ++visits[i]; }, policy);
+      for (auto &v : visits) if (v != 1) std::_Exit(8);
+    }
+    if (!hits) std::_Exit(9);
+  }
+}
+
 int main(int argc, char **argv) {
   eigen_partitioner_test::Select(argc, argv);
   verify_reentrant_discard_after_allocation_failure();
+  verify_mailbox_allocation_failures();
   verify_affinity_publication_failure();
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(8, true, true);

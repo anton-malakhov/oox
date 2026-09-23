@@ -27,7 +27,7 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    OOX_TASKS RAPID_GROUP
+    OOX_TASKS RAPID_GROUP RAPID_MAILBOX_EAGER RAPID_MAILBOX_LOCAL
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_AUTO EIGEN_SIMPLE EIGEN_STATIC EIGEN_AFFINITY
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
@@ -60,6 +60,11 @@ function(oox_configure_scheduler_eval_target target mode)
   elseif(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE
       EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode MATCHES "^RAPID_MAILBOX_")
+    target_compile_definitions(${target} PRIVATE RAPID_GROUP_MODE=1
+      RAPID_MAILBOX_MODE=1 EIGEN_MODE=EIGEN_${mode}
+      $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_GROUP")
     target_compile_definitions(${target} PRIVATE
@@ -102,7 +107,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     "--benchmark_filter=(QuickHull|TrigramDedup|RadixSort64|TrigramSampleSort|SampleSortRecords|RadixPassWidth).*/1024(/|$)"
     --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
   list(APPEND OOX_SCHEDULER_EVAL_TESTS ${benchmark_target}_extended_smoke)
-  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS" OR mode STREQUAL "RAPID_GROUP")
+  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS" OR mode STREQUAL "RAPID_GROUP" OR mode MATCHES "^RAPID_MAILBOX_")
     add_test(NAME ${benchmark_target}_availability_smoke COMMAND ${benchmark_target}
       "--benchmark_filter=(ChangingWorkerAvailability/4096|OversubscribedLoops/4096/2|FirstTouch<.*>/16384)(/|$)"
       --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})

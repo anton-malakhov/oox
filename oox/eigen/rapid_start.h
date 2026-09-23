@@ -7,13 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <exception>
 #include <functional>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -123,31 +121,6 @@ private:
   std::mutex exception_mutex_;
   std::exception_ptr exception_;
 };
-
-inline void PrepareResidentGroup(RapidStartGroup group) {
-  if (group.IsEmpty())
-    return;
-  group.Validate();
-  ThreadPool &pool = group.state->Pool();
-  if (!pool.UsesResidentBusyWait()) {
-    throw std::invalid_argument("resident Rapid requires a resident-busy pool");
-  }
-  const size_t current = pool.CurrentThreadId();
-  const size_t expected =
-      group.domain.Size() - (current < pool.NumThreads() &&
-                                     group.domain.Contains(current)
-                                 ? 1
-                                 : 0);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (pool.ResidentAvailableWorkers(group.domain) < expected &&
-         !pool.IsCancelled()) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::runtime_error("resident Rapid workers did not become ready");
-    }
-    std::this_thread::yield();
-  }
-}
 
 // One callback per captured participant. The callback owns its range's loop
 // and checks cancellation at its own safe points, like an ordinary pool task.
