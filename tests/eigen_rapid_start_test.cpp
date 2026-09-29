@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+namespace resident_test_hook { void Acquired(unsigned); }
+#define OOX_EIGEN_TEST_RESIDENT_ACQUIRED(worker) resident_test_hook::Acquired(worker)
 #include "benchmarks/eigen/resident_test_support.h"
+#undef OOX_EIGEN_TEST_RESIDENT_ACQUIRED
 
 #include <oox/eigen/rapid_start.h>
 #include <oox/eigen/parallel_for.h>
@@ -13,6 +16,15 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+namespace resident_test_hook {
+std::atomic<bool> armed{false}, acquired{false}, resume{false};
+void Acquired(unsigned) {
+  if (!armed.exchange(false)) return;
+  acquired.store(true);
+  while (!resume.load()) std::this_thread::yield();
+}
+}
 
 namespace {
 
@@ -142,6 +154,60 @@ TEST(EigenRapidResident, OrdinaryTasksAndNestedFallbackMakeProgress) {
   harness.pool.Wait([&] { return ordinary.load() == tasks; });
   EXPECT_EQ(ordinary.load(), tasks);
   EXPECT_EQ(nested.load(), 25152u);
+}
+
+TEST(EigenRapidResident, CapturedWorkerKeepsStolenTaskAvailableToRapidWait) {
+  // Force the otherwise narrow steal -> claim -> command-publication race.
+  // The independent oracle is one execution (or one discard on cancellation).
+  for (unsigned test = 0; test < 64; ++test) {
+    SCOPED_TRACE(::testing::Message() << "seed=240924 case=" << test);
+    ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
+    RapidDomainState state(pool);
+    eigen_test_support::WaitForResidentWorkers({&state, {0, 2}}, 2s);
+    std::atomic<unsigned> executed{0}, discarded{0};
+    struct Ordinary final : oox::detail::eigen_pool::Task {
+      Ordinary(std::atomic<unsigned> &e, std::atomic<unsigned> &d) : executions(e), discards(d) {}
+      void operator()() override { ++executions; delete this; }
+      void Discard() noexcept override { ++discards; delete this; }
+      std::atomic<unsigned> &executions, &discards;
+    };
+    resident_test_hook::acquired = false;
+    resident_test_hook::resume = false;
+    resident_test_hook::armed = true;
+    pool.RunOnThread(new Ordinary(executed, discarded), 0);
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!resident_test_hook::acquired && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    if (!resident_test_hook::acquired) {
+      resident_test_hook::armed = false;
+      resident_test_hook::resume = true;
+      FAIL() << "worker did not acquire ordinary work";
+    }
+    unsigned worker = 0;
+    const auto claimed = pool.ClaimResidentWorkers({1, 2}, &worker, 1);
+    if (!claimed) {
+      resident_test_hook::resume = true;
+      FAIL() << "worker withdrew before capture arbitration";
+    }
+    struct Command final : oox::detail::eigen_pool::ResidentTask {
+      Command(ThreadPool &p, bool c) : pool(p), cancelled(c) {}
+      void Run(size_t) noexcept override {
+        helped = pool.TryExecuteSomething();
+      }
+      ThreadPool &pool;
+      bool cancelled;
+      bool helped = false;
+    } command(pool, test % 2 != 0);
+    std::atomic<size_t> remaining{1};
+    if (command.cancelled) pool.Cancel();
+    // Keep publication delayed until after the worker has already lost its bit.
+    resident_test_hook::resume = true;
+    pool.PublishResident(command, remaining, worker, 0);
+    while (remaining.load(std::memory_order_acquire)) std::this_thread::yield();
+    EXPECT_EQ(command.helped, !command.cancelled);
+    EXPECT_EQ(executed.load(), command.cancelled ? 0u : 1u);
+    EXPECT_EQ(discarded.load(), command.cancelled ? 1u : 0u);
+  }
 }
 
 TEST(EigenRapidResident, PropagatesExceptionsAndSupportsLargePools) {

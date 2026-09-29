@@ -71,76 +71,120 @@ cancellation prevents new callback entry but does not interrupt a running body.
 Busy residence consumes idle CPU and is not the default policy. The group
 performs initial distribution only; it adds no stealing or grain-size policy.
 
-## Experimental mailbox handoff
+## Rapid activation with the existing AutoPartitioner
 
-`rapid_mailbox.h` adds `rapid::ParallelForMailbox`. Its Rapid participants
-produce ordinary, stealable tasks: self-submissions use the owner's local deque,
-while remote submissions use bounded worker mailboxes. As an exception, captured
-participants process their own initial range directly. Range owners donate unfinished work
-when resident or parked workers appear idle, using measured callback cost to
-adjust private chunks. Ranges no larger than the grain run inline without
-activating a group.
+`rapid_auto.h` adds `rapid::ParallelForAuto(group, begin, end, callback, grain)`.
+It creates one ordinary AutoPartitioner root. Child tasks inherit its split
+state, private range buffer and sibling-demand feedback through the existing
+executor. It does not implement a second range controller, measure callback
+duration or use a calibration multiplier.
 
-* `MailboxHandoff::Immediate` leaves Rapid participation after production and
-  resumes the normal scheduler. Benchmark mode: `RAPID_MAILBOX_EAGER`.
-* `MailboxHandoff::LocalFirst` processes local queues first and leaves before
-  attempting a remote steal. Benchmark mode: `RAPID_MAILBOX_LOCAL`.
+If one binary split produces two grain-sized, indivisible halves, the launch
+uses a stack resident command and captures exactly one helper. It preserves
+Auto's floor/ceil midpoint and joins the helper even after cancellation or an
+exception. There are no descendant tasks from that terminal split, so it needs
+neither a heap Region nor a heap frontier. Nested calls still use ordinary Auto.
+If no helper can be captured, ordinary Auto handles the call. This is a range/
+grain rule, not a workload-name or timing heuristic.
 
-The producer domain is not an execution-affinity restriction: seeds target all
-pool workers, including uncaptured ones, and can be stolen. The opt-in
-`prefer_nonmembers` argument gives workers outside the captured-membership
-snapshot two seeds and twice the initial work share instead of one. Benchmark
-runs enable it with `OOX_RAPID_MAILBOX_PREFER_NONMEMBERS=1`. This is a hypothesis
-to measure, not a load estimate: an uncaptured worker may already be busy.
+The initial frontier is built in one launch-owned allocation. Available workers
+are captured in one batch, with at most 63 helpers. Prefix ranges and states use
+the existing binary split rules. Where a branch has at most one worker's Auto
+budget, its remaining initial subdivision is also prebuilt. Larger budgets stay
+with ordinary Auto so that work spreads to other workers. This bounds the
+prebuilt frontier by 256 leaves, including for larger pools. Terminal
+sibling pairs have a direct owner continuation and a stealable continuation
+embedded in the same allocation. No readiness barrier runs in a launch.
+Each owner publishes its queued leaves
+in one batch and shares callback admission only across synchronous direct leaves.
+A single-helper launch prefers the first ready recipient; multi-helper launches
+rotate their starting point. A busy preferred recipient is never awaited.
 
-Queue bounds are unchanged. Saturation ends participation before running the
-rejected task inline. A nested wait also leaves before its first remote steal.
-Calls made from an ordinary task use auto partitioning directly instead of
-recursively activating more groups. Thread registration and these dynamic
-execution contexts are tracked separately.
+Direct and locally recovered initial continuations resume after initial division
+without repeating task-entry steal checks. A genuinely stolen continuation runs
+the usual Auto steal check and can signal sibling demand. Subsequent subdivision
+uses ordinary Auto Work tasks with no dispatcher pointer or publication hook.
+This changes initial activation and ownership handling. The existing range buffer
+also responds to a waiting helper after its sibling has completed, allowing the
+last busy branch to donate its tail through ordinary bounded queues. The waiter
+count is a demand hint, not a reservation or a guarantee that stealing succeeds.
 
-Deregistration does not release borrowed callback storage: the caller first
-joins every producer command, then joins/closes the adaptive task region before
-returning or rethrowing. Both modes can allocate seed tasks, unlike fixed-range
-`ParallelForResidentRanges`; their startup costs must be measured separately.
+There are still a Region allocation and a frontier allocation; this is not an
+allocation-free loop API. Frontier storage is selected from capacities of
+2, 8, 16 or 64 participants using the maximum eligible helper count and range
+size. A later eligibility change cannot exceed the capacity passed to capture.
+Completion on the originating caller skips notification, as in ordinary Auto;
+remote completion still wakes registered or external waits. External initial
+publishers use ordinary scheduling instead of treating an invalid worker ID as
+an affinity hint.
+
+There is one shared Auto completion tree, not one new pool-sized Auto root per
+resident. A command executes its initial ranges under task-ancestry tracking;
+nested calls use the ordinary Auto path. The shared prefix remains alive until
+the caller, Auto tree and embedded queued continuations have all released it.
+Cancellation can return before queued tasks are discarded, so the prefix cannot
+live on the caller's stack. Pinned join nodes keep their execution bit set; their
+shared completion record releases the tree reference without treating those
+nodes as allocated Work objects.
+
+Helpers use the fixed-command resident return path: they advertise availability
+before acknowledging completion. There is no mandatory ordinary steal round
+between a finished command and renewed availability. Existing resident checks
+still release them for cancellation and residency changes. Ordinary publication
+only signals a queue probe: an idle resident first acquires an ordinary task,
+then atomically withdraws its availability before executing it. A failed steal
+does not withdraw the worker. If a Rapid publisher wins that arbitration, its
+command takes priority; the acquired ordinary task is published in one bounded
+atomic slot on that worker, available to other thieves and nested helping.
+This avoids hiding a task that the winning command may need to join. The slot
+retains the task's original accounting and participates in cancellation draining.
+No unbounded overflow queue is introduced.
+
+Benchmark modes `RAPID_AUTO` and `EIGEN_AUTO_RESIDENT` use resident-capable pools.
+The former calibrates its cohort at startup by default; the latter runs ordinary
+Auto without Rapid transport or automatic calibration. Explicitly fixing the
+same cohort in both provides a matched idle-policy control.
+`OOX_RAPID_RESIDENT_LIMIT=N` sets the cohort in both.
+`OOX_RAPID_AUTOCALIBRATE=0` keeps fixed settings; an explicit resident limit
+also disables calibration.
+The usual `EIGEN_AUTO` remains a separate parking-pool comparison.
+
+Ordinary pool task counters exclude tasks transported directly through resident
+commands. The optional `activated` output of `ParallelForAuto` counts those
+commands; partitioner `Metrics::range_tasks` counts allocated Auto Work objects,
+not compact prefix nodes or embedded continuation tasks. Ordinary task counters
+include the latter when queued. Do not confuse these distinct counts with the
+total number of logical splits.
 
 ## Automatic hardware calibration
 
-`rapid_calibration.h` provides `rapid::CalibrateMailbox(group, policy, options)`.
-Call it once, from a serialized control/startup context, with the full pool's
-domain. It measures launch, uniform-work and skewed-work probes on the current
-machine and load, then selects a resident-cohort limit and polling-cost multiplier.
-The benchmark mailbox runtimes call it automatically during initialization.
-Ordinary default thread pools still use parking; calibration is opt-in for
-applications using these internal scheduler APIs.
+`rapid_auto_calibration.h` provides `rapid::CalibrateAutoGroup(group, options)`
+for the batched Auto kernel. Applications call it explicitly from a
+serialized, quiet startup/control context on the full pool. It compares launch,
+uniform and two-ended skew probes, taking a median of three measurements after
+warmup. Cohorts zero through sixteen are considered individually, followed by
+larger powers of two and the maximum, capped at 64. Within the default 5%
+geometric-mean band it prefers fewer resident workers. This is an empirical
+startup policy, not workload profiling or a per-loop search. No timed-chunk
+multiplier is selected for Auto.
+
+The Auto search has a soft 50 ms budget checked between synchronous probes;
+started work is always joined. Unready cohorts are skipped after a short
+readiness attempt. With no completed trial, or on cancellation, it selects zero
+residents (ordinary Auto on the resident-capable pool). Allocation failure resets
+residency to zero before propagating. Results and benchmark metadata record
+selected limits, trial counts, startup time and budget exhaustion. Recalibrate
+explicitly at a quiet point if resource allocation or machine load changes.
+
+Short startup probes can select a cohort that performs poorly on later workloads.
+Do not treat a completed calibration as a performance guarantee; validate its
+choice on representative workloads and retain an explicit limit override.
 
 Workers outside the selected cohort park when idle but remain available for
 ordinary tasks and stealing. `ResidentLimit()` is a logical worker-ID prefix,
 not CPU affinity; with a main-thread slot, a limit of two normally means one
 background spinner plus the caller. Limit zero uses the ordinary auto partitioner.
 In-flight resident commands finish even if eligibility is reduced.
-
-Each thread measures polling/clock cost and scales the selected budget by that
-cost. Chunks start at the requested grain and adapt from elapsed callback time;
-there is no CPU-model table or fixed microsecond chunk target. The local cost
-cache is keyed by pool generation and resident limit, including pool-address reuse.
-The probe grid and a default 5% tolerance are policy choices, not a guarantee of
-optimal performance for every workload. Calibration favors the smaller cohort
-within that band and, for equal cohorts, less frequent polling.
-
-The default startup probe budget is 50 ms, checked between synchronous probes.
-Every started probe is joined, so OS preemption can extend total wall-clock time.
-Unavailable cohorts are skipped instead of waiting five seconds or throwing a
-busy-pool error. With no completed trial, calibration selects ordinary auto.
-Loop launches never run this startup search. Recalibrate explicitly at a quiet
-control point if the machine's load or resource allocation changes significantly.
-
-The result records completed trials, selected settings, elapsed startup time and
-budget/cancellation status. Benchmark output additionally records these settings
-outside the timed loop. For reproducible diagnostic runs,
-`OOX_RAPID_AUTOCALIBRATE=0` keeps fixed settings;
-`OOX_RAPID_RESIDENT_LIMIT=N` selects a fixed cohort and disables startup search.
-These environment controls belong to the benchmark adapter, not the core API.
 
 Queued seeds keep the callback as an opaque pointer until the callback lease is
 acquired. Cancellation may end callback storage before a dequeued-but-not-started

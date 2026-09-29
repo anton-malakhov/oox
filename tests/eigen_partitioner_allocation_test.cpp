@@ -4,11 +4,14 @@
 #include <iostream>
 #include <new>
 #include "eigen_partitioner_test_support.h"
-#include <oox/eigen/rapid_mailbox.h>
+#include <oox/eigen/rapid_auto.h>
+#include "benchmarks/eigen/resident_test_support.h"
 
 thread_local int fail_after = -1;
 thread_local bool injected = false;
+std::atomic<size_t> allocation_attempts{0};
 void *operator new(std::size_t size) {
+  allocation_attempts.fetch_add(1, std::memory_order_relaxed);
   if (fail_after == 0) {
     fail_after = -1;
     injected = true;
@@ -105,36 +108,64 @@ void verify_reentrant_discard_after_allocation_failure() {
     std::_Exit(6);
 }
 
-void verify_mailbox_allocation_failures() {
+void verify_rapid_auto_allocation_failures() {
   using namespace oox::detail::eigen_pool;
   using namespace oox::detail::eigen_pool::rapid;
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
   RapidDomainState state(pool);
-  for (auto policy : {MailboxHandoff::Immediate, MailboxHandoff::LocalFirst}) {
-    unsigned hits = 0;
-    for (int ordinal = 0; ordinal < 16; ++ordinal) {
-      injected = false;
-      fail_after = ordinal;
-      bool caught = false;
-      try {
-        ParallelForMailbox({&state, {0, 1}}, 0, 4097, [](size_t) {}, policy, true);
-      } catch (const std::bad_alloc &) { caught = true; }
-      fail_after = -1;
-      if (caught != injected) std::_Exit(7);
-      hits += injected;
-      std::array<std::atomic<unsigned>, 257> visits{};
-      ParallelForMailbox({&state, {0, 4}}, 0, visits.size(),
-          [&](size_t i) { ++visits[i]; }, policy);
-      for (auto &v : visits) if (v != 1) std::_Exit(8);
+  unsigned hits = 0;
+  for (int ordinal = 0; ordinal < 64; ++ordinal) {
+    injected = false;
+    fail_after = ordinal % 32;
+    bool caught = false;
+    try {
+      ParallelForAuto({&state, {0, 4}}, 0, 65537, [](size_t) {},
+                         1, nullptr, nullptr);
+    } catch (const std::bad_alloc &) { caught = true; }
+    fail_after = -1;
+    if (caught != injected) {
+      std::cerr << "rapid auto allocation ordinal=" << ordinal << " mismatch\n";
+      std::_Exit(10);
     }
-    if (!hits) std::_Exit(9);
+    hits += injected;
+    std::array<std::atomic<unsigned>, 257> visits{};
+    ParallelForAuto({&state, {0, 4}}, 0, visits.size(), [&](size_t i) { ++visits[i]; });
+    for (auto &v : visits) if (v != 1) std::_Exit(11);
+  }
+  if (!hits) std::_Exit(12);
+}
+
+void verify_terminal_pairs_do_not_allocate() {
+  using namespace oox::detail::eigen_pool;
+  using namespace oox::detail::eigen_pool::rapid;
+  ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
+  RapidDomainState state(pool);
+  RapidStartGroup group{&state, {0, 4}};
+  for (unsigned test = 0; test < 32; ++test) {
+    eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(2));
+    std::array<std::atomic<unsigned>, 2> visits{};
+    size_t activated = 0;
+    const auto before = allocation_attempts.load(std::memory_order_relaxed);
+    injected = false;
+    fail_after = 0;
+    try {
+      ParallelForAuto(group, 0, 2, [&](size_t i) { ++visits[i]; }, 1, nullptr, &activated);
+    } catch (...) {
+      fail_after = -1;
+      std::cerr << "terminal pair allocated: case=" << test << '\n';
+      std::_Exit(13);
+    }
+    fail_after = -1;
+    if (injected || allocation_attempts.load(std::memory_order_relaxed) != before ||
+        activated != 1 || visits[0] != 1 || visits[1] != 1) std::_Exit(14);
   }
 }
 
 int main(int argc, char **argv) {
   eigen_partitioner_test::Select(argc, argv);
   verify_reentrant_discard_after_allocation_failure();
-  verify_mailbox_allocation_failures();
+  verify_rapid_auto_allocation_failures();
+  verify_terminal_pairs_do_not_allocate();
   verify_affinity_publication_failure();
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(8, true, true);

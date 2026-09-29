@@ -141,14 +141,18 @@ if (OOX_ENABLE_EIGEN)
           DISCOVERY_MODE PRE_TEST
           DISCOVERY_TIMEOUT 30)
 
-  add_executable(eigen_rapid_mailbox_test eigen_rapid_mailbox_test.cpp)
-  target_link_libraries(eigen_rapid_mailbox_test PRIVATE
-          ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
-  target_compile_definitions(eigen_rapid_mailbox_test PRIVATE
-          OOX_EIGEN_ENABLE_STATS=1)
-  gtest_discover_tests(eigen_rapid_mailbox_test
-          DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
-          PROPERTIES TIMEOUT 90)
+  add_executable(eigen_rapid_auto_test eigen_rapid_auto_test.cpp)
+  target_link_libraries(eigen_rapid_auto_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_rapid_auto_test PRIVATE OOX_EIGEN_ENABLE_STATS=1)
+  gtest_discover_tests(eigen_rapid_auto_test
+          DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 90)
+
+  foreach(kind IN ITEMS rapid_dispatch pool_batch)
+    add_executable(eigen_${kind}_test eigen_${kind}_test.cpp)
+    target_link_libraries(eigen_${kind}_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+    gtest_discover_tests(eigen_${kind}_test
+        DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+  endforeach()
 
   add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
   target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)

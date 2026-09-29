@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <oox/eigen/parallel_for.h>
+#include <oox/eigen/rapid_auto.h>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -80,10 +81,60 @@ template <class Policy> void Test(const char *name) {
   for (unsigned trace = 0; trace < 32; ++trace)
     RemoteCompletion(policy, name, trace % 2 != 0, trace);
 }
+
+void RapidCompletion(bool remote, bool registered, unsigned trace) {
+  internal::completion_notifications = 0;
+  internal::completion_waits = 0;
+  ThreadPool pool(2, false, registered, WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState domain(pool);
+  std::array<std::atomic<unsigned>, 2> visits{};
+  std::atomic<bool> started{false}, release{false};
+  auto body = [&](size_t i) {
+    ++visits[i];
+    if (!remote) return;
+    if (i == 1) {
+      started = true;
+      started.notify_one();
+      release.wait(false);
+    } else {
+      started.wait(false);
+    }
+  };
+  auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr);
+  using Launch = rapid::batch_detail::Launch<decltype(body), 2>;
+  auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 2}}, *region, &body);
+  launch->Prepare({0, 2, 1}, 1);
+  if (remote) {
+    // Join the raw test command explicitly; the production launcher instead
+    // joins its pool-managed command counter before releasing this reference.
+    std::thread helper([&] { launch->Run(1); });
+    std::thread controller([&] {
+      internal::completion_waits.wait(0);
+      release = true;
+      release.notify_one();
+    });
+    launch->Run(0);
+    pool.Wait([&] { return region->IsComplete(); });
+    helper.join();
+    controller.join();
+  } else {
+    launch->Run(1);
+    launch->Run(0);
+  }
+  region->CloseAndWait();
+  launch->Release();
+  region->TaskComplete();
+  for (auto &value : visits) Check(value == 1, "rapid", "serial oracle mismatch", trace);
+  Check(internal::completion_notifications == unsigned(remote), "rapid",
+        remote ? "missing remote notification" : "unnecessary caller notification", trace);
+}
 }
 
 int main() {
   Test<AutoPartitioner>("auto");
   Test<AffinityPartitioner>("affinity");
-  std::cout << "local completion and 64 remote/external waiter traces PASS\n";
+  RapidCompletion(false, true, 0);
+  for (unsigned trace = 0; trace < 32; ++trace)
+    RapidCompletion(true, trace % 2 != 0, trace);
+  std::cout << "local completion and 96 remote/external waiter traces PASS\n";
 }

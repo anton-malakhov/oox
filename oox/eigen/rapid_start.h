@@ -82,11 +82,11 @@ public:
     return remaining_.load(std::memory_order_acquire) == 0;
   }
 
-  void Rethrow() {
-    std::lock_guard<std::mutex> lock(exception_mutex_);
-    if (exception_) {
-      std::rethrow_exception(exception_);
-    }
+  // Both the caller body and all captured helpers must have returned. The
+  // completion acquire then makes exception_ immutable and visible here.
+  void RethrowAfterJoin() {
+    assert(IsComplete());
+    if (exception_) std::rethrow_exception(exception_);
   }
 
 private:
@@ -158,7 +158,7 @@ void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
   }
   region.RunCaller();
   pool.HelpResidentUntil(region);
-  region.Rethrow();
+  region.RethrowAfterJoin();
 }
 
 } // namespace oox::detail::eigen_pool::rapid

@@ -10,8 +10,8 @@
 #elif defined(EIGEN_MODE)
 #include "benchmarks/eigen/eigen_pool.h"
 #endif
-#ifdef RAPID_MAILBOX_MODE
-#include "eigen_mailbox_adapter.h"
+#ifdef RAPID_AUTO_MODE
+#include "eigen_rapid_auto_adapter.h"
 #endif
 
 namespace scheduler_eval {
@@ -48,12 +48,11 @@ void ReportSchedulerMetrics(benchmark::State &state,
   static_cast<void>(before);
   static_cast<void>(after);
 #endif
-#ifdef RAPID_MAILBOX_MODE
-  const auto &calibration = rapid_mailbox_eval::GetRuntime().Calibration();
+#ifdef RAPID_AUTO_MODE
+  const auto &calibration = rapid_auto_eval::GetRuntime().Calibration();
   state.counters["rapid_resident_limit"] = EigenPool().ResidentLimit();
   state.counters["rapid_background_residents"] = EigenPool().ResidentCapacity(
       {0, static_cast<unsigned>(EigenPool().NumThreads())});
-  state.counters["rapid_cost_multiplier"] = EigenPool().CalibrationMultiplier();
   state.counters["rapid_calibration_ns"] = calibration.elapsed_ns;
   state.counters["rapid_calibration_trials"] = calibration.trials.size();
   state.counters["rapid_calibration_budget_exhausted"] = calibration.budget_exhausted;

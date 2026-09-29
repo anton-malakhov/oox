@@ -8,8 +8,8 @@
 #include "oox/eigen/nonblocking_thread_pool.h"
 
 inline oox::detail::eigen_pool::ThreadPool& EigenPool() {
-#if EIGEN_MODE == EIGEN_RAPID_GROUP || EIGEN_MODE == EIGEN_RAPID_MAILBOX_EAGER || \
-    EIGEN_MODE == EIGEN_RAPID_MAILBOX_LOCAL
+#if EIGEN_MODE == EIGEN_RAPID_GROUP || EIGEN_MODE == EIGEN_RAPID_AUTO || \
+    EIGEN_MODE == EIGEN_AUTO_RESIDENT
   static auto pool = oox::detail::eigen_pool::ThreadPool(
       GetNumThreads(), true, true,
       oox::detail::eigen_pool::WorkerIdleMode::ResidentBusy);

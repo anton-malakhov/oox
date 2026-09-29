@@ -292,8 +292,13 @@ published foundations, limitations, and next measurements are in
 workload suite, including nested and worker-availability checks. `RAPID_START`
 retains upstream's historical TBB prototype. Compare with `EIGEN_AUTO` and
 `EIGEN_STATIC`; resident mode is opt-in and consumes idle CPU.
+`RAPID_AUTO` combines fast resident activation with the existing AutoPartitioner.
+`EIGEN_AUTO_RESIDENT` is the ordinary Auto control on the same idle policy.
+The Rapid+Auto adapter calibrates its resident limit at startup; set
+`OOX_RAPID_RESIDENT_LIMIT=N` to use a fixed cohort instead.
 
 Configure `OOX_SCHEDULER_EVAL_STATS=OFF` for timings without Eigen's diagnostic
 counter updates (default ON). The runner records this setting. For direct
 backend loops, use `bench_loops_EIGEN.EIGEN_AUTO_LOOP` and
-`bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`.
+`bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`, or
+`bench_loops_EIGEN.EIGEN_RAPID_AUTO_LOOP` for the adaptive implementation.

@@ -170,6 +170,17 @@ slot arrays. Those history allocations are separate from small task storage.
 
 ## Runtime boundary and later adaptation
 
+`rapid_auto.h` supplies batched initial activation.
+Its initial prefix uses AutoPartitionState splits and pinned join nodes in one
+shared allocation. Embedded initial continuations resume locally after division;
+real steals enter the ordinary Auto steal-check path. Later tasks use unmodified
+AutoPartitionState and ordinary publication. A tagged PinnedRoot completion
+retains prefix storage until both branches and the launch/queued executions end.
+
+The range buffer and demand logic are shared. In a resident-capable pool, a
+branch whose sibling has completed can donate its tail when a registered helper
+is waiting. This uses ordinary bounded publication, without a second task tree.
+
 The implementation uses Task, Schedule, ScheduleWithAffinity, CurrentThreadId,
 NumThreads, IsCancelled, Wait, and NotifyTaskCompletion. It does not include rapid_start.h, construct
 a Rapid group, publish Rapid activations, inherit Rapid worker domains, or

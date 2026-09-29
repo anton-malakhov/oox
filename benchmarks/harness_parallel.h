@@ -45,6 +45,7 @@
 #define FOLLY_FOR_EACH 40
 #define EIGEN_AUTO_LOOP 50
 #define EIGEN_RAPID_GROUP_LOOP 51
+#define EIGEN_RAPID_AUTO_LOOP 52
 
 #ifndef PARALLEL
 #define PARALLEL TBB_SIMPLE
@@ -59,7 +60,7 @@
 #elif PARALLEL == FOLLY_FOR_EACH
 #define __USE_FOLLY__ 1
 #elif PARALLEL >= EIGEN_AUTO_LOOP && \
-    PARALLEL <= EIGEN_RAPID_GROUP_LOOP
+    PARALLEL <= EIGEN_RAPID_AUTO_LOOP
 #define __USE_EIGEN__ 1
 #else
 #error Unrecognized PARALLEL mode
@@ -120,9 +121,12 @@
 #if PARALLEL == EIGEN_AUTO_LOOP
 #define EIGEN_MODE EIGEN_AUTO
 #include "eigen/parallel_for.h"
-#else
+#elif PARALLEL == EIGEN_RAPID_GROUP_LOOP
 #define EIGEN_MODE EIGEN_RAPID_GROUP
 #include "scheduler_eval/runtime/eigen_rapid_adapter.h"
+#else
+#define EIGEN_MODE EIGEN_RAPID_AUTO
+#include "scheduler_eval/runtime/eigen_rapid_auto_adapter.h"
 #endif
 #pragma pop_macro("TBB_STATIC")
 #pragma pop_macro("TBB_RAPID")
