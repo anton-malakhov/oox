@@ -982,11 +982,7 @@ private:
 #ifdef OOX_EIGEN_ENABLE_STATS
       const auto idle_begin = std::chrono::steady_clock::now();
 #endif
-      if (UsesResidentBusyWait()) {
-        worker_event_.Wait(token);
-      } else {
-        worker_event_.Wait(token);
-      }
+      worker_event_.Wait(token);
 #ifdef OOX_EIGEN_ENABLE_STATS
       const auto idle_end = std::chrono::steady_clock::now();
       auto &statistics = thread_data_[GetPerThread()->thread_id].statistics;
@@ -1294,6 +1290,9 @@ private:
   }
 
   void CancelOrdinaryQueues() {
+    // Best-effort drain: a contended local steal may fail before the deque is
+    // empty. Recipient-side affinity proxy references are also left for the
+    // final owner-side FlushQueues after workers join; Cancel is not a join.
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopBack(true)) {
         DiscardPublishedTask(task);

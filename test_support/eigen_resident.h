@@ -7,7 +7,8 @@
 
 namespace eigen_test_support {
 
-// Test/benchmark startup only: wait for an idle snapshot, without reserving it.
+// Shared test/benchmark startup support, not part of the installed runtime.
+// Wait for an idle snapshot, without reserving it.
 // The caller supplies the timeout; production launches need no preparation.
 inline void WaitForResidentWorkers(
     oox::detail::eigen_pool::rapid::RapidStartGroup group,

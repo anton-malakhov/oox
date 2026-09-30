@@ -13,6 +13,7 @@ inline thread_local std::vector<size_t> *direct_indices = nullptr;
   do { if (rapid_dispatch_observers::direct_indices) \
     rapid_dispatch_observers::direct_indices->push_back(index); } while (false)
 #include <oox/eigen/rapid_auto.h>
+#include "eigen_test_wait.h"
 #include <gtest/gtest.h>
 
 namespace {
@@ -212,10 +213,11 @@ TEST(EigenRapidDispatch, BorrowedLeaseKeepsClosingRegionAlive) {
     closer = std::thread([&] { region->CloseAndWait(); closed = true; });
     // Observe closure through public admission, not timing assumptions. The
     // original lease pins callback lifetime while CloseAndWait is blocked.
-    while (region->BeginWork()) {
+    eigen_test_support::WaitUntil([&] {
+      if (!region->BeginWork()) return true;
       region->EndWork();
-      std::this_thread::yield();
-    }
+      return false;
+    }, "callback admission closure");
     EXPECT_FALSE(closed.load());
     for (size_t direct = 0; direct < 2; ++direct)
       partitioner_detail::Process(*region, &body, {0, 17, 17},
@@ -301,8 +303,9 @@ TEST(EigenRapidDispatch, WaitingCallerCanReceiveWorkAfterPeerHasCompleted) {
           {0, size, 1}, state, &join, partitioner_detail::TaskContext<State>{});
     });
     // Keep this worker from taking its own donation before the caller can help.
-    while (!caller_ran.load(std::memory_order_acquire) && !release_command.load())
-      std::this_thread::yield();
+    eigen_test_support::WaitUntil([&] {
+      return caller_ran.load(std::memory_order_acquire) || release_command.load();
+    }, "waiting caller receives tail donation");
   };
   struct Command final : ResidentTask {
     explicit Command(decltype(execute) &f) : function(f) {}
@@ -321,7 +324,8 @@ TEST(EigenRapidDispatch, WaitingCallerCanReceiveWorkAfterPeerHasCompleted) {
   pool.PublishResident(command, remaining, worker, 0);
   pool.Wait([&] { return region->IsComplete(); });
   release_command = true;
-  while (remaining.load(std::memory_order_acquire)) std::this_thread::yield();
+  eigen_test_support::WaitUntil([&] { return remaining.load(std::memory_order_acquire) == 0; },
+                               "tail donation command completion");
   region->CloseAndWait();
   EXPECT_FALSE(timed_out.load());
   EXPECT_TRUE(caller_ran.load());

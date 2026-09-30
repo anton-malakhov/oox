@@ -5,7 +5,7 @@
 #include <new>
 #include "eigen_partitioner_test_support.h"
 #include <oox/eigen/rapid_auto.h>
-#include "benchmarks/eigen/resident_test_support.h"
+#include "test_support/eigen_resident.h"
 
 thread_local int fail_after = -1;
 thread_local bool injected = false;
@@ -161,7 +161,7 @@ void verify_terminal_pairs_do_not_allocate() {
   }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv) try {
   eigen_partitioner_test::Select(argc, argv);
   verify_reentrant_discard_after_allocation_failure();
   verify_rapid_auto_allocation_failures();
@@ -200,4 +200,8 @@ int main(int argc, char **argv) {
   if (hits == 0)
     return 3;
   std::cout << "allocation cases=32 injected=" << hits << " reuse=PASS\n";
+} catch (const std::exception &error) {
+  fail_after = -1;
+  std::cerr << "allocation test setup/execution failed: " << error.what() << '\n';
+  return 15;
 }

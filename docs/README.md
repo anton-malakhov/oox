@@ -328,6 +328,18 @@ exceptions to that layer, not raw to the pool.
   `eigen_pool_instantiation`, and `eigen_include_oox_first` /
   `eigen_include_upstream_first` (coexistence with upstream Eigen 3.4 in
   either include order);
+- **Eigen scheduler oracles** — `eigen_partitioner_{range,allocation,lifetime,completion}_test`
+  cover range results, allocation failures and completion/lifetime ordering;
+  `eigen_small_object_pool_test` covers bounded recycling and owner teardown.
+- **Rapid integration tests** — `eigen_rapid_{start,auto,dispatch,cancellation}_test`
+  cover resident publication, Auto split trees, callback admission and concurrent
+  cancellation before publication and during callbacks, including shared-domain
+  batches competing with ordinary fallback. `eigen_pool_batch_test`
+  checks bounded batch publication and reentrant cancellation. Test waits fail
+  the process with diagnostics rather than unwinding into blocking futures;
+  CTest timeouts also bound scheduler calls and destructors.
+  Shared resident startup helpers live in `test_support/`, outside the installed
+  runtime and independent of the benchmark source tree.
 - **Compile-policy tests** — `NonThrowConsumeCompile` and
   `NestedCMakePreservesListValues` (always built), plus
   `ExceptionPolicyCompile` when `OOX_EXCEPTIONS_ENABLED=ON`;
@@ -413,9 +425,11 @@ exceptions to that layer, not raw to the pool.
 - `docs/design-shared-var.md` — the thread-safe shared handle design
   (thick-handle architecture, atomic multi-state registration,
   waiter-as-graph-edge waits, deferred/forwarding semantics).
-- `oox/eigen/README.md` — provenance, OOX additions (guarded overflow
-  queue, C++20 atomic wait/notify parking), and per-file licenses of the
+- `oox/eigen/README.md` — provenance, OOX additions (bounded queues with
+  inline backpressure, C++20 atomic wait/notify parking), and per-file licenses of the
   vendored Eigen-derived scheduler.
+- `oox/eigen/PARTITIONERS.md` — range splitting, demand feedback, affinity,
+  allocation and callback/completion lifetime contracts.
 
 
 ## 10. References

@@ -74,8 +74,8 @@ First-touch tests allocate fresh anonymous mappings per repetition, so vector
 initialization or allocator reuse cannot pre-touch the input pages.
 
 The suite also builds `OOX_TASKS`, which expresses parallel ranges as recursive
-`oox::run` tasks joined through `oox::var`. It reads counters from OOX's actual
-pool. Its thread count is the library's build setting `OOX_EIGEN_THREADS`
+`oox::run` tasks joined through `oox::var`. With `OOX_SCHEDULER_EVAL_STATS=ON`,
+it reads counters from OOX's actual pool. Its thread count is the library's build setting `OOX_EIGEN_THREADS`
 (zero means detected hardware concurrency); configure that value to match the
 runner's `--threads` for cross-mode comparisons.
 Automatic OOX task grains target eight ranges per worker, capped at 1,024
@@ -302,3 +302,8 @@ counter updates (default ON). The runner records this setting. For direct
 backend loops, use `bench_loops_EIGEN.EIGEN_AUTO_LOOP` and
 `bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`, or
 `bench_loops_EIGEN.EIGEN_RAPID_AUTO_LOOP` for the adaptive implementation.
+
+Direct-loop CTest smoke cases use the `backend-loops` label and the registered
+size 64. An unmatched benchmark filter is a test failure, not an empty success.
+The scheduler-eval CI job with external backends disabled builds and runs all
+three Eigen loop modes once, with two threads.

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <oox/eigen/rapid_auto.h>
 #include <oox/eigen/rapid_auto_calibration.h>
-#include "benchmarks/eigen/resident_test_support.h"
+#include "test_support/eigen_resident.h"
+#include "eigen_test_wait.h"
 #include <gtest/gtest.h>
 #include <future>
 
@@ -245,7 +246,8 @@ TEST(EigenRapidAuto, CompletedCommandStaysReadyWithoutStealing) {
     pool.PublishResident(region, region.CompletionCounter(), worker, 1);
     region.RunCaller();
     // Isolate worker return: caller-side helping has its own steal attempts.
-    while (!region.IsComplete()) std::this_thread::yield();
+    eigen_test_support::WaitUntil([&] { return region.IsComplete(); },
+                                 "resident availability after completion");
     region.RethrowAfterJoin();
     EXPECT_EQ(pool.ResidentAvailableWorkers(group.domain), 1u);
   }
@@ -271,7 +273,7 @@ TEST(EigenRapidAuto, NestedAndConcurrentRootsMatchSerialOracle) {
   run();
   auto other = std::async(std::launch::async, run);
   run();
-  other.get();
+  eigen_test_support::GetReady(other, "nested concurrent Auto root");
   for (const auto &count : visits) EXPECT_EQ(count.load(), 3u);
 }
 
@@ -488,7 +490,7 @@ TEST(EigenRapidAuto, CalibrationRejectsTaskContext) {
     EXPECT_THROW(CalibrateAutoGroup({&domain, {0, 2}}), std::logic_error);
     done->set_value();
   }));
-  completed.get();
+  eigen_test_support::GetReady(completed, "calibration task-context rejection");
   EXPECT_EQ(pool.ResidentLimit(), 2u);
 }
 
@@ -597,7 +599,8 @@ TEST(EigenRapidAuto, TerminalPairsPreferReadyRecipientAndDoNotWaitForBusyOne) {
     if (i) helper = pool.CurrentThreadId();
   });
   pool.PublishResident(held, remaining, reserved, 0);
-  while (remaining.load(std::memory_order_acquire)) std::this_thread::yield();
+  eigen_test_support::WaitUntil([&] { return remaining.load(std::memory_order_acquire) == 0; },
+                               "reserved terminal-pair helper completion");
   EXPECT_EQ(visits.load(), 2u);
   EXPECT_EQ(helper, 2u);
 }

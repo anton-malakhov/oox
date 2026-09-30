@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 namespace resident_test_hook { void Acquired(unsigned); }
 #define OOX_EIGEN_TEST_RESIDENT_ACQUIRED(worker) resident_test_hook::Acquired(worker)
-#include "benchmarks/eigen/resident_test_support.h"
+#include "test_support/eigen_resident.h"
 #undef OOX_EIGEN_TEST_RESIDENT_ACQUIRED
 
 #include <oox/eigen/rapid_start.h>
 #include <oox/eigen/parallel_for.h>
+#include "eigen_test_wait.h"
 
 #include <gtest/gtest.h>
 
@@ -22,7 +23,7 @@ std::atomic<bool> armed{false}, acquired{false}, resume{false};
 void Acquired(unsigned) {
   if (!armed.exchange(false)) return;
   acquired.store(true);
-  while (!resume.load()) std::this_thread::yield();
+  eigen_test_support::WaitUntil([&] { return resume.load(); }, "resume acquired resident");
 }
 }
 
@@ -123,11 +124,7 @@ TEST(EigenRapidResident, InterleavedPublicationsMatchSerialOracle) {
     ParallelForResident(harness.group, 0, size, [&](size_t i) {
       actual[i].fetch_add(i % 13 + 3, std::memory_order_relaxed);
     });
-    const auto status = ordinary.wait_for(5s);
-    if (status != std::future_status::ready)
-      harness.pool.Cancel();
-    ordinary.get();
-    ASSERT_EQ(status, std::future_status::ready);
+    eigen_test_support::GetReady(ordinary, "interleaved ordinary loop");
     for (size_t i = 0; i < size; ++i)
       ASSERT_EQ(actual[i].load(), expected[i]) << i;
   }
@@ -203,7 +200,8 @@ TEST(EigenRapidResident, CapturedWorkerKeepsStolenTaskAvailableToRapidWait) {
     // Keep publication delayed until after the worker has already lost its bit.
     resident_test_hook::resume = true;
     pool.PublishResident(command, remaining, worker, 0);
-    while (remaining.load(std::memory_order_acquire)) std::this_thread::yield();
+    eigen_test_support::WaitUntil([&] { return remaining.load(std::memory_order_acquire) == 0; },
+                                 "captured resident command completion");
     EXPECT_EQ(command.helped, !command.cancelled);
     EXPECT_EQ(executed.load(), command.cancelled ? 0u : 1u);
     EXPECT_EQ(discarded.load(), command.cancelled ? 1u : 0u);
@@ -235,11 +233,7 @@ TEST(EigenRapidResident, OrdinaryPublicationReleasesIdleResidents) {
       visits[i].fetch_add(1, std::memory_order_relaxed);
     });
   });
-  const auto status = execution.wait_for(2s);
-  if (status != std::future_status::ready)
-    harness.pool.Cancel();
-  execution.get();
-  ASSERT_EQ(status, std::future_status::ready);
+  eigen_test_support::GetReady(execution, "ordinary publication to resident workers");
   for (size_t i = 0; i < visits.size(); ++i)
     EXPECT_EQ(visits[i].load(), 1u) << "index=" << i;
 }
@@ -330,11 +324,7 @@ TEST(EigenRapidResident, ConcurrentRangeRootsComposeWithDemandPartitioning) {
     }));
   }
   for (auto &root : roots) {
-    const auto status = root.wait_for(5s);
-    if (status != std::future_status::ready)
-      harness.pool.Cancel();
-    EXPECT_EQ(status, std::future_status::ready);
-    root.get();
+    eigen_test_support::GetReady(root, "concurrent resident range root");
   }
   for (size_t i = 0; i < visits.size(); ++i)
     EXPECT_EQ(visits[i].load(), 16u) << "index=" << i;

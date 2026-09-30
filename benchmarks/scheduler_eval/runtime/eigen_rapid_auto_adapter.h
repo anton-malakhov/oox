@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "benchmarks/eigen/resident_test_support.h"
+#include "test_support/eigen_resident.h"
 #include "benchmarks/eigen/eigen_pool.h"
 #include "benchmarks/eigen/thread_index.h"
 #include "benchmarks/eigen/util.h"

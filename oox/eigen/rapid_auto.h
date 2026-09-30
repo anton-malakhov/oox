@@ -28,6 +28,9 @@ bool TryTerminalPair(RapidStartGroup group, size_t begin, size_t end, F &functio
   ResidentRegion<decltype(body)> region(*group.state, body, 0, 2, 2, 1);
   unsigned worker = 0;
   if (!pool.ClaimResidentWorkers(group.domain, &worker, 1)) return false;
+#ifdef OOX_EIGEN_TEST_RAPID_CLAIMED
+  OOX_EIGEN_TEST_RAPID_CLAIMED(1);
+#endif
   pool.PublishResident(region, region.CompletionCounter(), worker, 1);
   region.RunCaller();
   pool.HelpResidentUntil(region);
@@ -94,6 +97,9 @@ public:
     std::construct_at(&seeds_[0].value,
         Seed{range, AutoPartitioner{}.MakeState(region_.pool), Join::Root(*this)});
     seed_count_ = 1;
+    // After h splits there are h+1 leaves and 2*h+1 FIFO entries, with
+    // h <= helpers < Participants. Each owner expands to at most four leaves
+    // (two queued), so the full tree has at most 4*Participants-1 join nodes.
     // Breadth-first prefix construction: O(participants), no per-node allocation.
     unsigned pending[2 * Participants - 1];
     size_t head = 0, tail = 1;
@@ -265,6 +271,9 @@ void Execute(RapidStartGroup group, size_t begin, size_t end, F &function,
   std::unique_ptr<Frame, decltype(release_launch)> owner(launch, release_launch);
   std::array<unsigned, Participants - 1> workers;
   const size_t helpers = pool.ClaimResidentWorkers(group.domain, workers.data(), capacity);
+#ifdef OOX_EIGEN_TEST_RAPID_CLAIMED
+  OOX_EIGEN_TEST_RAPID_CLAIMED(helpers);
+#endif
   launch->Prepare({begin, end, grain}, helpers, true);
   for (size_t i = 0; i < helpers; ++i)
     pool.PublishResident(*launch, launch->CompletionCounter(), workers[i], i + 1);

@@ -118,7 +118,7 @@ if (OOX_ENABLE_EIGEN)
           ${OOX_GTEST_LIB})
   gtest_discover_tests(eigen_pool_test
           DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_small_object_pool_test eigen_small_object_pool_test.cpp)
   target_link_libraries(eigen_small_object_pool_test PRIVATE
@@ -127,11 +127,12 @@ if (OOX_ENABLE_EIGEN)
           OOX_EIGEN_SMALL_OBJECT_POOL_TESTING=1)
   gtest_discover_tests(eigen_small_object_pool_test
           DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_pool_instantiation eigen_pool_instantiation.cpp)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
+  set_tests_properties(EigenPoolExplicitInstantiation PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_rapid_start_test eigen_rapid_start_test.cpp)
   target_link_libraries(eigen_rapid_start_test PRIVATE
@@ -139,7 +140,7 @@ if (OOX_ENABLE_EIGEN)
           ${OOX_GTEST_LIB})
   gtest_discover_tests(eigen_rapid_start_test
           DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_rapid_auto_test eigen_rapid_auto_test.cpp)
   target_link_libraries(eigen_rapid_auto_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
@@ -147,7 +148,7 @@ if (OOX_ENABLE_EIGEN)
   gtest_discover_tests(eigen_rapid_auto_test
           DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 90)
 
-  foreach(kind IN ITEMS rapid_dispatch pool_batch)
+  foreach(kind IN ITEMS rapid_dispatch rapid_cancellation pool_batch)
     add_executable(eigen_${kind}_test eigen_${kind}_test.cpp)
     target_link_libraries(eigen_${kind}_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
     gtest_discover_tests(eigen_${kind}_test
@@ -168,6 +169,7 @@ if (OOX_ENABLE_EIGEN)
   target_compile_definitions(eigen_partitioner_lifetime_test PRIVATE
           OOX_EIGEN_SMALL_OBJECT_POOL=0)
   add_test(NAME EigenPartitionerLifetimeOracle COMMAND eigen_partitioner_lifetime_test)
+  set_tests_properties(EigenPartitionerLifetimeOracle PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_partitioner_completion_test eigen_partitioner_completion_test.cpp)
   target_link_libraries(eigen_partitioner_completion_test PRIVATE ${PROJECT_NAME}::eigen)
