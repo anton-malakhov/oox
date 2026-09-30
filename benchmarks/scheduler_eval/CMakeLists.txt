@@ -2,6 +2,7 @@ set(OOX_SCHEDULER_EVAL_MODES SERIAL_ELISION)
 set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
 set(OOX_SCHEDULER_EVAL_TESTS)
 
+option(OOX_SCHEDULER_EVAL_STATS "Collect Eigen task and stealing counters" ON)
 option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
 add_library(oox_eval_papi STATIC metrics/papi_metrics.cpp)
 target_link_libraries(oox_eval_papi PUBLIC OOX)
@@ -26,7 +27,7 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    OOX_TASKS
+    OOX_TASKS RAPID_GROUP RAPID_AUTO EIGEN_AUTO_RESIDENT
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_AUTO EIGEN_SIMPLE EIGEN_STATIC EIGEN_AFFINITY
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
@@ -54,11 +55,25 @@ function(oox_configure_scheduler_eval_target target mode)
     target_link_libraries(${target} PRIVATE OOX)
   elseif(mode STREQUAL "OOX_TASKS")
     target_compile_definitions(${target} PRIVATE
-      OOX_TASK_MODE=1 OOX_EIGEN_ENABLE_STATS=1)
+      OOX_TASK_MODE=1 $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_AUTO" OR mode STREQUAL "EIGEN_AUTO_RESIDENT")
+    if(mode STREQUAL "RAPID_AUTO")
+      set(rapid_auto_mode EIGEN_RAPID_AUTO)
+    else()
+      set(rapid_auto_mode EIGEN_AUTO_RESIDENT)
+    endif()
+    target_compile_definitions(${target} PRIVATE RAPID_AUTO_MODE=1
+      EIGEN_MODE=${rapid_auto_mode}
+      $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE
-      EIGEN_MODE=${mode} OOX_EIGEN_ENABLE_STATS=1)
+      EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_GROUP")
+    target_compile_definitions(${target} PRIVATE
+      RAPID_GROUP_MODE=1 EIGEN_MODE=EIGEN_RAPID_GROUP $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
@@ -97,7 +112,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     "--benchmark_filter=(QuickHull|TrigramDedup|RadixSort64|TrigramSampleSort|SampleSortRecords|RadixPassWidth).*/1024(/|$)"
     --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
   list(APPEND OOX_SCHEDULER_EVAL_TESTS ${benchmark_target}_extended_smoke)
-  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS")
+  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS" OR mode STREQUAL "RAPID_GROUP" OR mode STREQUAL "RAPID_AUTO")
     add_test(NAME ${benchmark_target}_availability_smoke COMMAND ${benchmark_target}
       "--benchmark_filter=(ChangingWorkerAvailability/4096|OversubscribedLoops/4096/2|FirstTouch<.*>/16384)(/|$)"
       --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})

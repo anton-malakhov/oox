@@ -45,6 +45,9 @@ inline std::string GetParallelMode() {
 #define EIGEN_SIMPLE 19
 #define EIGEN_STATIC 20
 #define EIGEN_AFFINITY 21
+#define EIGEN_RAPID_GROUP 22
+#define EIGEN_RAPID_AUTO 25
+#define EIGEN_AUTO_RESIDENT 26
 
 #define TASKFLOW_GUIDED 1
 #define TASKFLOW_DYNAMIC 2

@@ -6,6 +6,10 @@
 #include "serial_adapter.h"
 #elif defined(OOX_TASK_MODE)
 #include "oox_task_adapter.h"
+#elif defined(RAPID_AUTO_MODE)
+#include "eigen_rapid_auto_adapter.h"
+#elif defined(RAPID_GROUP_MODE)
+#include "eigen_rapid_adapter.h"
 #elif defined(RAPID_START_MODE)
 #include "rapid_start_adapter.h"
 #else

@@ -1,6 +1,7 @@
 // Copyright (c) 2005-2021 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 #include <oox/eigen/parallel_for.h>
+#include <oox/eigen/rapid_auto.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -85,6 +86,72 @@ int main() {
     }
     ++cases;
   } while (std::next_permutation(order.begin(), order.end()));
+  for (bool discard : {false, true}) {
+    watched = nullptr;
+    regions_destroyed = 0;
+    bool called = false;
+    auto body = [&](size_t) { called = true; };
+    auto callback = std::make_unique<decltype(body)>(body);
+    rapid::RapidDomainState domain(pool);
+    using Launch = rapid::batch_detail::Launch<decltype(body)>;
+    using Work = Launch::Work;
+    using Join = Launch::Join;
+    auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
+    auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 1}},
+                                         *region, callback.get());
+    launch->Prepare({0, 2, 1}, 1);
+    watched = launch;
+    const auto seed = launch->GetSeed(0);
+    auto *held = NewSmallObject<Work>(*region, callback.get(), seed.range,
+                                     seed.state, 0, seed.parent);
+    Join::Release(held); // The owner half of this synthetic descendant finished.
+    region->CloseAndWait();
+    launch->Run(1); // The other initial owner declines callback admission.
+    callback.reset();
+    launch->Release(); // The launch returned, but a dequeued descendant remains.
+    region->TaskComplete();
+    if (regions_destroyed.load() != 0) return 4;
+    if (discard) held->Discard(); else (*held)();
+    if (called || regions_destroyed.load() != 1) return 5;
+  }
+  for (bool discard : {false, true}) {
+    watched = nullptr;
+    regions_destroyed = 0;
+    ThreadPool expanded_pool(2, false, false);
+    rapid::RapidDomainState domain(expanded_pool);
+    bool called = false;
+    auto body = [&](size_t) { called = true; };
+    auto callback = std::make_unique<decltype(body)>(body);
+    auto *function = callback.get();
+    using Launch = rapid::batch_detail::Launch<decltype(body)>;
+    auto *region = NewSmallObject<partitioner_detail::Region>(expanded_pool, nullptr, true);
+    auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 2}}, *region, function);
+    launch->Prepare({0, 128, 1}, 1, true);
+    watched = launch;
+    region->CloseAndWait();
+    callback.reset();
+    Launch::InitialTask *held = nullptr;
+    for (size_t i = 0; i < launch->SeedCount(); ++i) {
+      const auto value = launch->GetSeed(i);
+      if (value.queued) {
+        auto *task = new Launch::InitialTask(*launch, i);
+        if (!held) { held = task; continue; }
+        (*task)();
+        delete task;
+      } else {
+        partitioner_detail::Process<decltype(body), Launch::State, false>(*region,
+            function, value.range, value.state, value.parent,
+            partitioner_detail::TaskContext<Launch::State>{});
+      }
+    }
+    if (!held) return 6;
+    launch->Release();
+    region->TaskComplete();
+    if (regions_destroyed.load() != 0) return 7;
+    if (discard) held->Discard(); else (*held)();
+    delete held;
+    if (called || regions_destroyed.load() != 1) return 8;
+  }
   watched = nullptr;
   std::cout << "root/owner lifecycle orders=" << cases << " PASS\n";
 }

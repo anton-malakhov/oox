@@ -74,8 +74,8 @@ First-touch tests allocate fresh anonymous mappings per repetition, so vector
 initialization or allocator reuse cannot pre-touch the input pages.
 
 The suite also builds `OOX_TASKS`, which expresses parallel ranges as recursive
-`oox::run` tasks joined through `oox::var`. It reads counters from OOX's actual
-pool. Its thread count is the library's build setting `OOX_EIGEN_THREADS`
+`oox::run` tasks joined through `oox::var`. With `OOX_SCHEDULER_EVAL_STATS=ON`,
+it reads counters from OOX's actual pool. Its thread count is the library's build setting `OOX_EIGEN_THREADS`
 (zero means detected hardware concurrency); configure that value to match the
 runner's `--threads` for cross-mode comparisons.
 Automatic OOX task grains target eight ranges per worker, capped at 1,024
@@ -285,3 +285,25 @@ amortization, and an observed-versus-predicted SpMV plot to that result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).
+
+## Fast-group comparison
+
+`RAPID_GROUP` runs the Eigen pool's resident range groups on the existing
+workload suite, including nested and worker-availability checks. `RAPID_START`
+retains upstream's historical TBB prototype. Compare with `EIGEN_AUTO` and
+`EIGEN_STATIC`; resident mode is opt-in and consumes idle CPU.
+`RAPID_AUTO` combines fast resident activation with the existing AutoPartitioner.
+`EIGEN_AUTO_RESIDENT` is the ordinary Auto control on the same idle policy.
+The Rapid+Auto adapter calibrates its resident limit at startup; set
+`OOX_RAPID_RESIDENT_LIMIT=N` to use a fixed cohort instead.
+
+Configure `OOX_SCHEDULER_EVAL_STATS=OFF` for timings without Eigen's diagnostic
+counter updates (default ON). The runner records this setting. For direct
+backend loops, use `bench_loops_EIGEN.EIGEN_AUTO_LOOP` and
+`bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP`, or
+`bench_loops_EIGEN.EIGEN_RAPID_AUTO_LOOP` for the adaptive implementation.
+
+Direct-loop CTest smoke cases use the `backend-loops` label and the registered
+size 64. An unmatched benchmark filter is a test failure, not an empty success.
+The scheduler-eval CI job with external backends disabled builds and runs all
+three Eigen loop modes once, with two threads.

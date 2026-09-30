@@ -68,13 +68,16 @@ struct Metrics {
 
 class Region final : public SmallObjectAllocated<Region> {
 public:
-  explicit Region(ThreadPool &pool, Metrics *metrics)
-      : pool(pool), metrics(metrics) {}
+  explicit Region(ThreadPool &pool, Metrics *metrics,
+                  bool asynchronous_roots = false)
+      : pool(pool), metrics(metrics), asynchronous_roots_(asynchronous_roots) {}
   void AddTask() noexcept { remaining.fetch_add(1, std::memory_order_relaxed); }
   void TaskComplete(bool notify = true) noexcept {
     // The caller and the adaptive tree (or each non-adaptive task) retain us.
     // Copy the pool before releasing: completion may release the caller too.
     ThreadPool *saved_pool = &pool;
+    // Mailbox roots have no synchronous root owner whose wakeup can be elided.
+    notify = notify || asynchronous_roots_;
     const size_t previous = remaining.fetch_sub(1, std::memory_order_acq_rel);
     if (previous == 1)
       DeleteSmallObject(this);
@@ -123,6 +126,7 @@ public:
   Metrics *const metrics;
 
 private:
+  const bool asynchronous_roots_;
   std::atomic<size_t> remaining{1};
   static constexpr size_t closed = size_t{1} << (max_depth - 1);
   std::atomic<size_t> active{0};
@@ -135,12 +139,15 @@ private:
 // return. Running callbacks finish before CloseAndWait releases the caller.
 class WorkLease {
 public:
-  explicit WorkLease(Region &region) noexcept
-      : region_(region), acquired_(region.BeginWork()) {}
+  explicit WorkLease(Region &region, const WorkLease *parent = nullptr) noexcept
+      : region_(region), acquired_(parent ? parent->acquired_ && !region.IsCancelled()
+                                         : region.BeginWork()), owned_(!parent) {
+    assert(!parent || &parent->region_ == &region);
+  }
   WorkLease(const WorkLease &) = delete;
   WorkLease &operator=(const WorkLease &) = delete;
   ~WorkLease() {
-    if (acquired_)
+    if (acquired_ && owned_)
       region_.EndWork();
   }
   explicit operator bool() const noexcept { return acquired_; }
@@ -148,6 +155,7 @@ public:
 private:
   Region &region_;
   const bool acquired_;
+  const bool owned_;
 };
 
 struct LoopRange {
@@ -174,16 +182,42 @@ struct LoopRange {
 
 template <typename F, typename State> class Work;
 
+// A launch-owned prefix can pin its join nodes until the entire tree ends.
+// Its completion record also retains that storage after cancellation returns.
+struct PinnedRoot {
+  void (*complete)(PinnedRoot *, bool) noexcept;
+};
+
 // The two subtree references and the task-execution bit share one counter.
 // The embedded node can outlive execution, or finish before execution returns.
 template <typename Owner, bool Enabled = true> struct PeerJoin {
   explicit PeerJoin(PeerJoin *parent) noexcept : parent(parent) {}
   static constexpr uintptr_t root_bit = 1;
+  static constexpr uintptr_t pinned_bit = 2;
   static PeerJoin *Root(Region &region) noexcept {
-    static_assert(alignof(Region) > root_bit && alignof(PeerJoin) > root_bit);
+    static_assert(alignof(Region) > (root_bit | pinned_bit));
     // The final branch releases the tree's single Region reference.
     return reinterpret_cast<PeerJoin *>(
         reinterpret_cast<uintptr_t>(&region) | root_bit);
+  }
+  static PeerJoin *Root(PinnedRoot &root) noexcept {
+    static_assert(alignof(PinnedRoot) > (root_bit | pinned_bit));
+    static_assert(alignof(PeerJoin) > (root_bit | pinned_bit));
+    return reinterpret_cast<PeerJoin *>(
+        reinterpret_cast<uintptr_t>(&root) | root_bit | pinned_bit);
+  }
+  static bool IsPinnedRoot(PeerJoin *node) noexcept {
+    return (reinterpret_cast<uintptr_t>(node) & (root_bit | pinned_bit)) ==
+           (root_bit | pinned_bit);
+  }
+  static void CompleteRoot(PeerJoin *node, bool notify) noexcept {
+    const auto address = reinterpret_cast<uintptr_t>(node) & ~(root_bit | pinned_bit);
+    if (IsPinnedRoot(node)) {
+      auto *root = reinterpret_cast<PinnedRoot *>(address);
+      root->complete(root, notify);
+    } else {
+      reinterpret_cast<Region *>(address)->TaskComplete(notify);
+    }
   }
   static bool IsRoot(PeerJoin *node) noexcept {
     return reinterpret_cast<uintptr_t>(node) & root_bit;
@@ -197,8 +231,7 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
   static void Release(PeerJoin *node) noexcept {
     if (node && IsRoot(node)) {
       // The root Process returns this branch before its caller starts waiting.
-      reinterpret_cast<Region *>(reinterpret_cast<uintptr_t>(node) & ~root_bit)
-          ->TaskComplete(false);
+      CompleteRoot(node, false);
       return;
     }
     while (node) {
@@ -206,7 +239,8 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
       PeerJoin *parent = node->parent;
       std::thread::id caller;
       if constexpr (requires(const Owner &owner) { owner.PublishingThreadId(); }) {
-        if (IsRoot(parent))
+        // Pinned prefix nodes are Join objects, not Owner task allocations.
+        if (IsRoot(parent) && !IsPinnedRoot(parent))
           caller = static_cast<const Owner *>(node)->PublishingThreadId();
       }
       const unsigned previous =
@@ -218,9 +252,7 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
       if (IsRoot(parent)) {
         // The first task was published by the synchronous caller. That thread
         // cannot be parked while executing this completion; other threads notify.
-        auto *region = reinterpret_cast<Region *>(
-            reinterpret_cast<uintptr_t>(parent) & ~root_bit);
-        region->TaskComplete(caller == std::thread::id{} ||
+        CompleteRoot(parent, caller == std::thread::id{} ||
                              caller != std::this_thread::get_id());
         return;
       }
@@ -283,9 +315,9 @@ struct TaskContext : TaskOwner<State::adaptive>, TaskPlacement<State::uses_affin
   }
 };
 
-template <typename F, typename State>
+template <typename F, typename State, bool CheckSteal = true>
 void Process(Region &, F *, LoopRange, State, PeerJoin<Work<F, State>, State::adaptive> *,
-             TaskContext<State>) noexcept;
+             TaskContext<State>, const WorkLease * = nullptr) noexcept;
 
 template <typename F, typename State>
 class Work final : public Task, public PeerJoin<Work<F, State>, State::adaptive>,
@@ -357,14 +389,16 @@ void OfferWork(Region &region, F *function, LoopRange range,
 
 // All policies share publication, completion and callback lifetime. Adaptive
 // policies additionally use the current sibling's stolen flag and range pool.
-template <typename F, typename State>
+template <typename F, typename State, bool CheckSteal>
 void Process(Region &region, F *function, LoopRange range,
              State state, PeerJoin<Work<F, State>, State::adaptive> *parent,
-             TaskContext<State> context) noexcept {
+             TaskContext<State> context, const WorkLease *admission) noexcept {
   using Join = PeerJoin<Work<F, State>, State::adaptive>;
   // Release callback/metrics access before the branch can complete its tree.
   Branch<Work<F, State>, State::adaptive> branch{parent};
-  WorkLease work(region);
+  // Only synchronous direct continuations may borrow an enclosing lease.
+  // Queued tasks must independently check closure before touching callbacks.
+  WorkLease work(region, admission);
   if (!work)
     return;
   size_t chunks = 0;
@@ -373,7 +407,7 @@ void Process(Region &region, F *function, LoopRange range,
       if (context.hint != partitioning::no_affinity)
         state.NoteExecution(region.pool.CurrentThreadId(), context.hint);
     }
-    if constexpr (State::adaptive) {
+    if constexpr (State::adaptive && CheckSteal) {
       if (state.NeedsStealCheck()) {
         const bool stolen = std::this_thread::get_id() != context.owner;
         const bool peer_active =
@@ -409,7 +443,12 @@ void Process(Region &region, F *function, LoopRange range,
         partitioning::RangePool<LoopRange> ranges(range);
         while (!ranges.Empty() && !region.IsCancelled()) {
           ranges.Fill(state.max_depth);
-          if (state.CheckDemand(Join::PeerStolen(branch.Parent()))) {
+          bool demand = Join::PeerStolen(branch.Parent());
+          if (!demand && region.pool.UsesResidentBusyWait() && region.pool.HasWaitingHelper()) {
+            auto *parent = branch.Parent();
+            demand = parent && !Join::IsRoot(parent) && !parent->HasPeer();
+          }
+          if (state.CheckDemand(demand)) {
             if (ranges.Size() > 1) {
               OfferWork(region, function, ranges.Front(), state, branch,
                         ranges.FrontDepth(), partitioning::Split{});

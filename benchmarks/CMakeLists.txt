@@ -95,6 +95,7 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
+  list(APPEND EIGEN_LOOP_MODES EIGEN_AUTO_LOOP EIGEN_RAPID_GROUP_LOOP EIGEN_RAPID_AUTO_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
@@ -110,6 +111,8 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
         set(bench_ctest_filter "^BenchAccounts/10/100000$")
       elseif(bench STREQUAL "bench_shared_var_get_heavy")
         set(bench_ctest_filter "^BenchGetHeavy.*threads:2$")
+      elseif(bench STREQUAL "bench_loops")
+        set(bench_ctest_filter "/64(/|$)")
       endif()
       add_executable(${bench}_${mode}.${suffix} ${bench}.cpp)
       target_compile_definitions(${bench}_${mode}.${suffix} PRIVATE PARALLEL=${suffix} HAVE_${mode})
@@ -119,6 +122,13 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
                COMMAND ${bench}_${mode}.${suffix}
                        --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
                        --benchmark_filter=${bench_ctest_filter})
+      set_tests_properties(${bench}_${mode}.${suffix} PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Failed to match any benchmarks"
+        TIMEOUT 120)
+      if(bench STREQUAL "bench_loops")
+        set_tests_properties(${bench}_${mode}.${suffix} PROPERTIES
+          LABELS backend-loops ENVIRONMENT "BENCH_NUM_THREADS=2")
+      endif()
     endforeach()
   endforeach()
 endforeach()
