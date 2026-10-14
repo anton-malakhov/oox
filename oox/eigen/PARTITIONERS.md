@@ -168,23 +168,122 @@ remote returns, cache bounds, alignment, and shutdown races.
 AffinityHistory retains its shared-ownership implementation and variable-size
 slot arrays. Those history allocations are separate from small task storage.
 
+## Explicit-policy Rapid boundary
+
+`rapid_parallel_for.h` composes resident activation with Auto, Simple, Static
+and Affinity without changing their ordinary executors. `rapid_partitioning.h`
+owns the bounded seed frontier; it contains no scheduling or lifetime code.
+The existing `rapid_auto.h` remains the separate lazy-tail implementation.
+
+One policy state is created before capturing helpers. Splitting uses the
+policy's `GetSplit()` and split constructor, so children inherit the remaining
+budget and affinity slots. The largest divisible leaf is split first until
+there is a seed per captured participant or no further split is legal. Auto's
+mutating `IsDivisible()` is probed on a copy and committed only for the selected
+leaf. Static/Affinity use proportional splits: three workers over `[0,100)`
+produce `[0,33)`, `[33,67)`, `[67,100)`, not a power-of-two approximation.
+
+Each seed is a resident root, not an ordinary stolen task. Its initial execution
+does not report a synthetic theft. Ordinary descendants use the unchanged
+stolen-peer protocol; there are no cross-seed peer nodes for the resident prefix.
+Static/Affinity map available preferred workers before placing unmatched seeds.
+This is best-effort placement, not CPU pinning or a reservation of future workers.
+
+Preparation and publication after capture cannot allocate or throw. Even unused
+captured slots receive a command and acknowledge completion. Auto/Affinity
+pre-retain one Region reference per seed for its eventual ordinary tree;
+Simple/Static retain references only in their ordinary tasks. The prefix itself
+is joined by `ResidentCohort`, not by stack-allocated peer nodes.
+
+The caller joins captured commands, then waits for descendants and closes
+callback admission. The seed frontier (including root-owned Affinity history)
+outlives that close. Cancelled queued tasks may survive the call but cannot
+access callback, metrics or borrowed history after admission closes. The
+allocation-failure and lifetime tests cover failure before capture, failed
+publication, reuse, and execution/discard after borrowed state is destroyed.
+
 ## Runtime boundary and later adaptation
 
-`rapid_auto.h` supplies batched initial activation.
-Its initial prefix uses AutoPartitionState splits and pinned join nodes in one
-shared allocation. Embedded initial continuations resume locally after division;
-real steals enter the ordinary Auto steal-check path. Later tasks use unmodified
-AutoPartitionState and ordinary publication. A tagged PinnedRoot completion
-retains prefix storage until both branches and the launch/queued executions end.
+`rapid_auto.h` supplies batched initial activation. Each captured owner receives
+one contiguous range, with lengths differing by at most one. Auto's worker
+budget is distributed across those owners without speculative descendant tasks
+or private range trees. The launch descriptor is stack-owned and contains one
+root range/state, not an array of seeds or join nodes.
 
-The range buffer and demand logic are shared. In a resident-capable pool, a
-branch whose sibling has completed can donate its tail when a registered helper
-is waiting. This uses ordinary bounded publication, without a second task tree.
+Captured commands join separately from ordinary descendants. An initial owner
+has no completion-tree reference until its first successful child allocation;
+that constructor retains Region once and attaches the ordinary embedded join
+tree. Allocation failure cannot leave a reference behind. Descendants retain
+only heap-owned Region and never the launch frame or its borrowed admission.
+The publication gate also lives in Region, so late cancelled tasks do not
+borrow a flag from an expired stack frame.
 
-The implementation uses Task, Schedule, ScheduleWithAffinity, CurrentThreadId,
-NumThreads, IsCancelled, Wait, and NotifyTaskCompletion. It does not include rapid_start.h, construct
-a Rapid group, publish Rapid activations, inherit Rapid worker domains, or
-use a Rapid completion region. No OOX dependency or task API changes are required.
+The command join must precede any completion test on Region: Region can be
+caller-only while captured owners are still running and may create a child.
+After that join, no new initial tree can appear. A complete tree has already
+released all callback leases, permitting direct reclamation of the sole Region
+reference. Cancellation with outstanding trees still closes admission and
+waits for running callbacks before returning.
+
+A registered owner publishes a stack-lived remaining range in its worker slot.
+After checking ordinary queues, an idle helper can acquire half the unreserved
+tail directly. Only this successful theft allocates a task; no mailbox enqueue
+is needed. The owner reserves growing local batches, capped at one eighth of
+its original range (or the requested grain). This is a balancing trade-off,
+not the unmodified Auto range-buffer algorithm. Ordinary Auto retains its range
+buffer; on a resident pool, a waiting helper can also request donation after
+the current sibling subtree finishes.
+
+Tail theft keeps the owner's leading work in place even before it starts.
+This preserves progress when a receiver is delayed before executing its donation.
+
+The slot's lock bit protects the descriptor through theft and unpublication.
+Sequentially consistent reservation/tag operations prevent overlapping owner
+and thief ranges. Unpublication occurs before the descriptor destructor and
+restores any enclosing descriptor during nested execution. A publication gate
+and pending-command check prevent captured owners from stealing their launch's
+work before accepting their own initial command.
+
+Captured commands borrow a joined-owner admission: their command join, rather
+than an admission counter, protects their callbacks. Stolen tasks acquire
+counted admission independently. The caller helps while joining.
+An unregistered caller without an exclusive worker slot instead cooperatively
+publishes bounded ordinary tasks when a helper is available. Cancellation and
+callback lifetime continue to use the shared Region and peer-join machinery.
+
+The generic partitioner does not construct Rapid groups or depend on the public
+task API. The resident-capable executor additionally exposes range publication
+and demand checks; Rapid activation stays in `rapid_auto.h` and the explicit
+policy adapter `rapid_parallel_for.h`.
+
+For an ordered cohort within one bitmap word, the pool publishes a shared
+generation/membership descriptor. Readers validate generation around the mask;
+only selected members may read its task metadata. An occupied descriptor,
+single-helper cohort, or cross-word cohort uses ordinary per-worker commands.
+Neither path allocates a queue or an unbounded task frontier.
+
+On pools of at most eight workers, opted-in shared cohorts use sticky completion
+bits in the availability word. Each helper's existing release advertisement
+sets both readiness and completion. One acquire observing all selected done
+bits joins every helper's writes through the RMW release sequences.
+
+Done bits belong to the busy-held descriptor, not current worker readiness.
+Direct commands can reuse completed workers without clearing those bits.
+After joining, the caller clears done bits before releasing the descriptor.
+Manual epoch batches do not opt in by default and retain their finished-record
+contract.
+
+Direct and larger-pool cohorts retain pool-owned per-worker epochs. A later
+completion joins older commands on the same sequential worker. Single-helper
+and exhausted-epoch paths retain the counter join. Small pools reserve N bits
+for readiness, N for completion, and the remaining bits for the epoch clock;
+claims and withdrawal preserve the other fields. Epoch and generation
+exhaustion permanently selects direct/counter publication instead of wrapping.
+
+Completion records are isolated from active-range/deferred-task writes. On
+AArch64, resident polling uses `isb` rather than a bare `yield`; x86 retains
+`pause`. This is an instruction-level pause, not an operating-system sleep or
+an added timeout. Incoming commands retain priority over ordinary-work probes.
 
 The pool retains its task-publication and cancellation contracts. Affinity
 publication is integrated through ScheduleWithAffinity. Queue searches skip a
@@ -192,9 +291,9 @@ victim whose steal mutex is busy. Registered callers of Wait try helping before 
 as waiters. If no task is available, they retain the registration, recheck, and
 parking protocol.
 
-For later adaptation, carry parallel_for.h, partitioning.h,
-small_object_pool.h, the affinity-aware pool changes, and
-licenses/oneTBB-Apache-2.0.txt. The included pool supplies the existing Task type.
+For later adaptation, carry the complete `oox/eigen` header directory and its
+retained licenses: the executor's internal headers are dependencies, not
+standalone APIs. The included pool supplies the existing Task type.
 Preserve these contracts when adapting to another pool revision:
 
 - The caller owns the pool: an operation and its queued tasks hold it by raw

@@ -36,7 +36,9 @@ set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tas
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
 set(OOX_BACKENDS)
 
-find_package(benchmark REQUIRED)
+if(NOT TARGET benchmark::benchmark)
+  find_package(benchmark REQUIRED)
+endif()
 
 if(OOX_ALLOCATOR STREQUAL "system")
   message(STATUS "Building OOX benchmarks with system malloc task allocation")

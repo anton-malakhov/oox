@@ -5,6 +5,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include "oox/eigen/scheduler_trace.h"
 #if __has_include(<zmmintrin.h>)
 #include <zmmintrin.h>
 #define _clevict(a, b) _mm_clevict(a, b)
@@ -45,6 +46,7 @@ class distribution_function : public distribution_base {
         const int start = my_start + part*step + std::min(remainder, part);
         part++;
         const int end = my_start + part*step + std::min(remainder, part);
+        OOX_SCHED_SCOPE("range", ::oox::scheduler_trace::NextId(), start, end);
         #pragma forceinline
         my_func( start, end, part );
     }
@@ -66,6 +68,9 @@ struct work_ {
 struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb::detail::padded<mask2>, tbb::detail::padded<work_> {
     std::atomic<uintptr_t> n_tasks;
     tbb::task_group tg;
+#ifdef OOX_SCHEDULER_TRACE
+    std::uint64_t trace_ids[MAX_THREADS]{};
+#endif
 
     friend class TrapperTask;
 
@@ -77,16 +82,30 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
         std::atomic_thread_fence(std::memory_order_seq_cst);
         mask_t mask_snapshot = start_mask.load(std::memory_order_acquire);
         finish_mask.store(0, std::memory_order_relaxed);
+#ifdef OOX_SCHEDULER_TRACE
+        OOX_SCHED_WORKER(0);
+        for (size_t slot = 0; slot < MAX_THREADS; ++slot) {
+            if ((mask_snapshot | 1) & (mask_t(1) << slot)) {
+                trace_ids[slot] = ::oox::scheduler_trace::NextId();
+                OOX_SCHED_EVENT("activate_mask", trace_ids[slot], slot, mask_snapshot,
+                                ::oox::scheduler_trace::Current());
+            }
+        }
+#endif
         run_mask.store(mask_snapshot|1, std::memory_order_release);
         _clevict(&finish_mask, _MM_HINT_T0);
 
-        f->run(0, mask_snapshot);
+        {
+            OOX_SCHED_SCOPE("mask_task", trace_ids[0]);
+            f->run(0, mask_snapshot);
+        }
         tbb::detail::spin_wait_until_eq(finish_mask, mask_snapshot);
     }
 
     struct TrapperTask {
         void operator() () const {
             __TBB_ASSERT(slot,0);
+            OOX_SCHED_WORKER(slot);
             const mask_t bit = mask_t(1)<<slot;
             if(global.mode) {
                 global.start_mask.fetch_add(bit);
@@ -94,7 +113,10 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
                 mask_t r = global.run_mask.load(std::memory_order_acquire);
                 do {
                     if(r&bit) {
-                        global.func_ptr->run(slot, r);
+                        {
+                            OOX_SCHED_SCOPE("mask_task", global.trace_ids[slot]);
+                            global.func_ptr->run(slot, r);
+                        }
                         global.finish_mask.fetch_or(bit);
                         _clevict(&global.finish_mask, _MM_HINT_T1);
                     }
@@ -110,7 +132,10 @@ struct __attribute__((aligned(64))) RapidStart : tbb::detail::padded<mask1>, tbb
                     tbb::detail::spin_wait_while_eq(global.run_mask, 0U);
                     r = global.run_mask;
                     if(r&bit) {
-                        global.func_ptr->run(slot, r);
+                        {
+                            OOX_SCHED_SCOPE("mask_task", global.trace_ids[slot]);
+                            global.func_ptr->run(slot, r);
+                        }
                         global.finish_mask.fetch_or(bit);
                         _clevict(&global.finish_mask, _MM_HINT_T1);
                     }

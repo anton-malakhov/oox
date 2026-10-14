@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scheduler Viewer — учебная модель</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="native-model.js"></script>
+  <script defer src="model.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+<main>
+<nav><a href="trace.html">Реальные C++ трассы →</a> · <a href="compare.html">Модель ↔ запись</a> · <a href="lab.html">Редактор схем и оценок</a></nav>
+<div id="scheduler-step-player">
+  <h2>Разбиение и передача работы — по шагам</h2>
+  <p>У Rapid одинаковая идея быстрого старта, но разные продолжения. <strong>Lazy: вор делит доступный хвост.</strong> <strong>Native Auto: владелец публикует задачи, вор забирает их из очереди.</strong> Native означает политику нашего backend, не upstream Eigen.</p>
+  <button class="btn" id="sp-compare-native" type="button">Сравнить Lazy и Native Auto</button>
+  <div class="viz-row" id="sp-choices" aria-label="Планировщики для сравнения"></div>
+  <div class="viz-controls">
+    <label class="form-label">Потоки <select class="form-select" id="sp-workers"><option value="4" selected>4</option><option value="8">8</option></select></label>
+    <label class="form-label">Сценарий <select class="form-select" id="sp-scenario"><option value="single" selected>Одно задание</option><option value="stream">Поток из четырёх заданий</option></select></label>
+    <label class="form-label">Нагрузка <select class="form-select" id="sp-pattern"><option value="balanced">Равномерная</option><option value="tail" selected>Тяжёлый хвост</option><option value="cluster">Два дорогих кластера</option><option value="single">Одна тяжёлая итерация</option></select></label>
+    <label class="form-label">Воспроизведение <select class="form-select" id="sp-speed"><option value="1">1 кадр/с</option><option value="4" selected>4 кадра/с</option><option value="12">12 кадров/с</option></select></label>
+  </div>
+  <div class="viz-row">
+    <button class="btn" id="sp-restart" type="button">В начало</button>
+    <button class="btn" id="sp-back" type="button">← Назад</button>
+    <button class="btn btn-primary" id="sp-play" type="button">▶ Запустить</button>
+    <button class="btn" id="sp-next" type="button">Шаг →</button>
+    <button class="btn" id="sp-event" type="button">Следующая передача / разбиение</button>
+  </div>
+  <label class="form-label" for="sp-seek">Кадр <span id="sp-position" class="tabular-nums">0</span></label>
+  <input class="form-range" id="sp-seek" type="range" min="0" max="1" value="0" step="1">
+  <div class="viz-row" id="sp-legend"></div>
+  <div class="text-small" id="sp-description"></div>
+  <div class="text-small" id="sp-cost"></div>
+  <div class="text-small">Учебная модель, не трасса: кадр — следующее событие каждого варианта, НЕ общее время. Native повторяет переходы бюджета и приватного буфера локальных политик; порядок краж, допуск заданий и сигнал свободного helper упрощены. ОС, стоимость операций, отмена и runtime lifetime не моделируются.</div>
+  <div id="sp-panels"></div>
+  <div id="sp-announcement" class="sr-only" aria-live="polite"></div>
+</div>
+
+<noscript>Для проигрывателя необходимо включить JavaScript.</noscript>
+</main>
+</body>
+</html>

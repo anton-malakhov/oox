@@ -126,6 +126,26 @@ CMake includes only installed/enabled backends. Eigen contributes
 `EIGEN_SHARING_STEALING`, plus the oneTBB-derived `EIGEN_AUTO`,
 `EIGEN_SIMPLE`, `EIGEN_STATIC`, and `EIGEN_AFFINITY` range policies.
 See [the partitioner API and placement semantics](../../oox/eigen/PARTITIONERS.md).
+
+With `OOX_SCHEDULER_TRACE_TOOLS=ON`, opt-in paired probes additionally build
+`measure_scheduler_RAPID_NATIVE_{AUTO,SIMPLE,STATIC,AFFINITY}` and
+`measure_scheduler_NATIVE_{AUTO,SIMPLE,STATIC,AFFINITY}_RESIDENT`. They reuse the
+calibration suite (10 launch/balanced/tail/cluster/single-heavy cases), fixed
+grain 2 and identical resident-capable pools. Only initial Rapid activation
+differs within each pair. They are not part of the full `run.py` mode matrix.
+For example, after configuring a stats/PAPI/sanitizer-free Release build:
+
+```sh
+cmake --build build-eval --target measure_scheduler_RAPID_NATIVE_AUTO measure_scheduler_NATIVE_AUTO_RESIDENT -j
+BENCH_NUM_THREADS=8 OOX_RAPID_RESIDENT_LIMIT=8 ./build-eval/benchmarks/scheduler_eval/measure_scheduler_NATIVE_AUTO_RESIDENT --kernel arithmetic_v1 --min-ms 40
+BENCH_NUM_THREADS=8 OOX_RAPID_RESIDENT_LIMIT=8 ./build-eval/benchmarks/scheduler_eval/measure_scheduler_RAPID_NATIVE_AUTO --kernel arithmetic_v1 --min-ms 40
+```
+
+Use repeated fresh processes, alternating the pair order; a single invocation
+is only a smoke check. `RAPID_NATIVE_AUTO` means the explicit native Auto policy,
+not the optimized lazy `RAPID_AUTO`, and neither means upstream Eigen's original
+recursive loop. Do not combine measurements from different kernels.
+
 TBB contributes simple, automatic, static, and affinity partitioners, plus the historical bitmask `RAPID_START` prototype. OpenMP
 contributes static, dynamic-nonmonotonic, and guided-nonmonotonic schedules.
 
@@ -211,6 +231,110 @@ The tools deliberately separate two costs that are often mixed together:
   start, and duration. It visualizes externally observable execution; it does
   not invent internal mailbox/deque events that the public `ParallelFor` API
   cannot observe.
+
+### Internal scheduler timeline (opt-in)
+
+Enable `-DOOX_SCHEDULER_TRACE_TOOLS=ON` in a scheduler-eval build, then build
+`trace_scheduler_RAPID_AUTO`, `trace_scheduler_RAPID_START`,
+`trace_scheduler_EIGEN_AUTO`, and `trace_scheduler_EIGEN_STATIC`.
+The original binary-mask `RAPID_START` target requires TBB. Additional targets
+cover `RAPID_GROUP`, `EIGEN_AUTO_RESIDENT`, `EIGEN_SIMPLE`, and `EIGEN_AFFINITY`.
+`cmake --build build-scheduler-trace --target scheduler_trace_all` builds all
+available trace modes and the recorder test without building the benchmark suite.
+
+```sh
+python3 benchmarks/scheduler_eval/tracing/record.py --build build-scheduler-trace \
+  --threads 4 --tasks 256 --iterations 3 --work 200 --shape tail \
+  --modes RAPID_AUTO RAPID_START EIGEN_AUTO EIGEN_STATIC
+```
+
+Open the printed `comparison.html` directly in a browser; it is self-contained,
+offline, and does not upload data. The runner creates a fresh result directory
+with raw JSON, process logs, binary hashes, and the HTML. Existing output
+directories are never overwritten. `viewer.html` can also load multiple trace
+JSON files through its file chooser. `--callbacks` adds exact per-iteration
+execution intervals, at substantial extra recording cost.
+To package existing records with the current viewer, use
+`python3 benchmarks/scheduler_eval/tracing/view.py trace1.json trace2.json --output compare.html`.
+Mode checkboxes hide unwanted records and refit the shared scale, so a slow
+outlier does not compress the modes you are currently comparing.
+
+The timeline plots time on X and iteration indices on Y. A rectangle spans its
+executed interval `[a, b)` vertically and its execution time horizontally; color
+identifies a native thread (`T`, with its worker number `W` in the legend).
+All modes share a time scale relative to the selected launch. Click a rectangle
+or transfer for details; wheel zooms and dragging pans all modes together.
+Stable task IDs remain in details. Thread colors are identities within a
+recording, not a guarantee of matching CPU placement across modes.
+
+New recordings include `chunk` scopes for actual locally executed blocks,
+after any split/reservation has fixed their bounds. `range` still describes an
+initial executor range and can contain a subsequently donated tail, so it is
+not used as an execution rectangle when chunks or callbacks are available.
+Fixed `RAPID_START`/`RAPID_GROUP` ranges are directly executed and can be plotted
+as such. With callbacks enabled, individual executed iterations are shown.
+Older records without chunks or callbacks show faint initial assignments and
+are labeled accordingly. Instantaneous theft is a vertical marker covering
+the transferred indices; its arrowhead has the receiving thread's color.
+Queue and activation events resolve their iteration coordinates from the
+associated task/range, never from worker or slot numbers stored in event args.
+Use `view.py ... --output viewer.html --replace` to refresh a generated HTML
+with the current viewer while preserving its input trace files.
+
+Events distinguish activation, attempted queue placement, acquisition from an
+actual deque/mailbox/deferred slot, successful cross-worker theft, inline
+fallback, and parent/child splits. A queue delivery arrow connects an offer
+only to an observed acquisition; an offer alone does not prove enqueue success.
+Range theft is recorded on the thief with the observed victim worker and donor
+range ID. It is not reported as a donor-side operation. The original bitmask
+algorithm records mask activations and range execution, not invented steals.
+Its `mask_task` IDs identify commands/ranges, not heap-allocated task objects.
+Gaps mean no recorded execution, not proof of parking or OS descheduling.
+
+This is **not a performance measurement mode**. Recording adds timestamps,
+atomic operations, trace-only task fields, and can change allocation sizes and
+scheduling decisions. Normal builds compile out hooks and trace-only fields.
+The runner fixes the resident limit to the thread count and disables automatic
+calibration for reproducible policy selection; it does not pin CPU affinity.
+`balanced`, `hyperbolic`, and `tail` are synthetic spin workloads shared by all
+recorders; the hyperbolic shape is not the SpMV benchmark.
+`--grain` controls Eigen partitioners; the fixed-range `RAPID_START` and
+`RAPID_GROUP` adapters ignore it, as in their normal benchmark implementation.
+
+Buffers are bounded per native thread and allocated before recording. No file
+I/O or event-buffer growth occurs on the recorded path. Increase
+`--events-per-thread` if the viewer reports drops; incomplete traces never
+silently invent missing connections. A recorder supports one session per
+process. All translation units using the instrumented scheduler must agree on
+`OOX_SCHEDULER_TRACE` and link `tracing/recorder.cpp`; use the provided isolated
+targets rather than mixing traced and normal scheduler objects.
+
+`python3 benchmarks/scheduler_eval/tracing/audit.py trace1.json trace2.json`
+emits a machine-readable validation report. It checks scope nesting, every
+iteration in every launch against a simple integer coverage oracle, callback
+containment, and donation bounds/identity. Use `--callbacks` when recording to
+enable all checks; absent observations are reported as unverified. Exit codes
+are 0 (pass), 1 (failed check), and 2 (insufficient/unsupported evidence).
+
+Rapid traces also record setup/capture/publication/join phase boundaries and
+per-native-thread counters for range-slot locks, contention, rejected thefts,
+and owner wait spins. Counters cover the entire recording, not individual
+launches. They add recording overhead and establish observed work counts, not
+the magnitude of those costs in an uninstrumented run. Completion of an outer
+task envelope may trail the loop's return even though its callbacks and range
+tree have finished; the audit distinguishes this cleanup from late work.
+Stopping recording closes admission for new scopes and drains already accepted
+scopes before disabling events. The drain is bounded at 250 ms; timeout,
+pending/truncated scopes and rejected new scopes are explicit JSON metadata.
+The recorder never fabricates end events to make an incomplete trace pass.
+
+Tests (Python standard library; Node for the viewer model):
+
+```sh
+cmake --build build-scheduler-trace --target test_scheduler_trace_recorder
+python3 benchmarks/scheduler_eval/tracing/test_trace.py build-scheduler-trace
+node benchmarks/scheduler_eval/tracing/test_model.js
+```
 
 For the same reason, the full runner omits the blocking `barrier` scenario for
 `EIGEN_STEALING_GRAINSIZE`. Spin and multitask measurements remain valid for

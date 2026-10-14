@@ -63,8 +63,8 @@ inline std::uint64_t Probe(RapidStartGroup group,
 } // namespace auto_calibration_detail
 
 // Explicit, serialized startup operation, never called by loop launches.
-// It measures this Auto kernel, not the timed-chunk mailbox controller. The
-// soft budget is checked between joined probes; scheduling delays can extend it.
+// Probes use ParallelForAuto on this pool. The soft budget is checked between
+// joined probes; scheduling delays can extend it.
 inline AutoCalibrationResult CalibrateAutoGroup(RapidStartGroup group,
     AutoCalibrationOptions options = {}) {
   using namespace auto_calibration_detail;

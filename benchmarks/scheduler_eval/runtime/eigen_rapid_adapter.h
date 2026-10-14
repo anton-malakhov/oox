@@ -32,6 +32,7 @@ public:
     }
     rapid::ParallelForResidentRanges(group_, from, to,
         [&](std::size_t first, std::size_t last) {
+          OOX_SCHED_SCOPE("range", ::oox::scheduler_trace::NextId(), first, last);
           for (std::size_t i = first; i < last; ++i)
             func(i);
         });

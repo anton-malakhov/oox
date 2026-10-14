@@ -4,6 +4,8 @@
 
 #ifdef SERIAL
 #include "serial_adapter.h"
+#elif defined(OOX_RAPID_POLICY)
+#include "eigen_rapid_policy_adapter.h"
 #elif defined(OOX_TASK_MODE)
 #include "oox_task_adapter.h"
 #elif defined(RAPID_AUTO_MODE)

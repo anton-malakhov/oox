@@ -334,8 +334,7 @@ exceptions to that layer, not raw to the pool.
 - **Rapid integration tests** — `eigen_rapid_{start,auto,dispatch,cancellation}_test`
   cover resident publication, Auto split trees, callback admission and concurrent
   cancellation before publication and during callbacks, including shared-domain
-  batches competing with ordinary fallback. `eigen_pool_batch_test`
-  checks bounded batch publication and reentrant cancellation. Test waits fail
+  batches competing with ordinary fallback. Test waits fail
   the process with diagnostics rather than unwinding into blocking futures;
   CTest timeouts also bound scheduler calls and destructors.
   Shared resident startup helpers live in `test_support/`, outside the installed
