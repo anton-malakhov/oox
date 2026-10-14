@@ -97,18 +97,22 @@ int main() {
     using Work = Launch::Work;
     using Join = Launch::Join;
     auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
-    auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 1}},
-                                         *region, callback.get());
-    launch->Prepare({0, 2, 1}, 1);
-    watched = launch;
-    const auto seed = launch->GetSeed(0);
-    auto *held = NewSmallObject<Work>(*region, callback.get(), seed.range,
-                                     seed.state, 0, seed.parent);
-    Join::Release(held); // The owner half of this synthetic descendant finished.
-    region->CloseAndWait();
-    launch->Run(1); // The other initial owner declines callback admission.
+    watched = region;
+    Work *held = nullptr;
+    {
+      Launch launch(rapid::RapidStartGroup{&domain, {0, 1}}, *region, callback.get());
+      launch.Prepare({0, 2, 1}, 1);
+      const auto seed = launch.GetSeed(0);
+      if (!region->IsComplete() || seed.parent ||
+          seed.state.unpublished != &region->RapidPublication()) return 9;
+      held = NewSmallObject<Work>(*region, callback.get(), seed.range,
+                                 seed.state, 0, seed.parent);
+      if (region->IsComplete() || held->parent != Join::Root(*region)) return 10;
+      Join::Release(held); // The captured owner half finished.
+      region->CloseAndWait();
+      launch.Run(1); // The other owner declines callback admission.
+    } // The actual stack frame ends before the callback and delayed task.
     callback.reset();
-    launch->Release(); // The launch returned, but a dequeued descendant remains.
     region->TaskComplete();
     if (regions_destroyed.load() != 0) return 4;
     if (discard) held->Discard(); else (*held)();
@@ -117,41 +121,104 @@ int main() {
   for (bool discard : {false, true}) {
     watched = nullptr;
     regions_destroyed = 0;
-    ThreadPool expanded_pool(2, false, false);
-    rapid::RapidDomainState domain(expanded_pool);
+    ThreadPool donation_pool(2, false, false);
+    rapid::RapidDomainState domain(donation_pool);
     bool called = false;
     auto body = [&](size_t) { called = true; };
     auto callback = std::make_unique<decltype(body)>(body);
     auto *function = callback.get();
     using Launch = rapid::batch_detail::Launch<decltype(body)>;
-    auto *region = NewSmallObject<partitioner_detail::Region>(expanded_pool, nullptr, true);
-    auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 2}}, *region, function);
-    launch->Prepare({0, 128, 1}, 1, true);
-    watched = launch;
-    region->CloseAndWait();
-    callback.reset();
-    Launch::InitialTask *held = nullptr;
-    for (size_t i = 0; i < launch->SeedCount(); ++i) {
-      const auto value = launch->GetSeed(i);
-      if (value.queued) {
-        auto *task = new Launch::InitialTask(*launch, i);
-        if (!held) { held = task; continue; }
-        (*task)();
-        delete task;
-      } else {
-        partitioner_detail::Process<decltype(body), Launch::State, false>(*region,
-            function, value.range, value.state, value.parent,
-            partitioner_detail::TaskContext<Launch::State>{});
-      }
+    using Work = Launch::Work;
+    auto *region = NewSmallObject<partitioner_detail::Region>(donation_pool, nullptr, true);
+    watched = region;
+    Work *held = nullptr;
+    {
+      Launch launch(rapid::RapidStartGroup{&domain, {0, 2}}, *region, function);
+      launch.Prepare({0, 128, 1}, 1);
+      auto seed = launch.GetSeed(0);
+      if (!region->IsComplete() || seed.parent ||
+          seed.state.unpublished != &region->RapidPublication()) return 11;
+      partitioner_detail::LoopRange right(seed.range, partitioning::Split{});
+      if (!region->ReserveDonation()) return 6;
+      held = NewSmallObject<Work>(*region, function, right,
+          Launch::State(seed.state, partitioning::Split{}), 0, seed.parent, true);
+      if (region->IsComplete()) return 12;
+      Launch::Join::Release(held); // The donor has finished its half.
+      region->CloseAndWait();
+      launch.Run(1);
     }
-    if (!held) return 6;
-    launch->Release();
+    callback.reset();
     region->TaskComplete();
     if (regions_destroyed.load() != 0) return 7;
     if (discard) held->Discard(); else (*held)();
-    delete held;
     if (called || regions_destroyed.load() != 1) return 8;
+  }
+  for (bool discard : {false, true}) {
+    watched = nullptr;
+    regions_destroyed = 0;
+    bool called = false;
+    auto body = [&](size_t) { called = true; };
+    auto callback = std::make_unique<decltype(body)>(body);
+    rapid::RapidDomainState domain(pool);
+    using Launch = rapid::batch_detail::Launch<decltype(body)>;
+    using Work = Launch::Work;
+    using Join = Launch::Join;
+    auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
+    watched = region;
+    Work *last = nullptr;
+    {
+      Launch launch(rapid::RapidStartGroup{&domain, {0, 1}}, *region, callback.get());
+      launch.Prepare({0, 128, 1}, 0);
+      const auto seed = launch.GetSeed(0);
+      if (!region->IsComplete() || seed.parent) return 13;
+      auto *first = NewSmallObject<Work>(*region, callback.get(), seed.range,
+                                       seed.state, 0, seed.parent);
+      if (region->IsComplete() || first->parent != Join::Root(*region)) return 14;
+      last = NewSmallObject<Work>(*region, callback.get(), seed.range, seed.state, 0, first);
+      Join::Release(first); // The captured owner finishes after first promotion.
+      Join::Release(last); // The first task's local half has also finished.
+      first->FinishExecution();
+      region->CloseAndWait();
+      if (region->IsComplete()) return 15;
+    }
+    callback.reset();
+    region->TaskComplete(); // Exactly one Region reference protects the whole tree.
+    if (regions_destroyed.load() != 0) return 16;
+    if (discard) last->Discard(); else (*last)();
+    if (called || regions_destroyed.load() != 1) return 17;
+  }
+  for (bool discard : {false, true}) {
+    watched = nullptr;
+    regions_destroyed = 0;
+    bool called = false;
+    auto body = [&](size_t) { called = true; };
+    auto callback = std::make_unique<decltype(body)>(body);
+    using State = partitioning::AffinityPartitionState;
+    using Work = partitioner_detail::Work<decltype(body), State>;
+    using Join = partitioner_detail::PeerJoin<Work>;
+    auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
+    watched = region;
+    region->AddTask(); // One native Rapid seed's descendant-tree reference.
+    std::weak_ptr<partitioning::AffinityHistory> expired;
+    Work *held;
+    {
+      auto history = std::make_shared<partitioning::AffinityHistory>(2);
+      expired = history;
+      State root(std::move(history), 0);
+      State child(root, partitioning::ProportionalSplit{1, 1});
+      held = NewSmallObject<Work>(*region, callback.get(),
+          partitioner_detail::LoopRange{0, 128, 1}, child, 0, Join::Root(*region));
+      Join::Release(held); // Initial owner's local half has finished.
+      region->CloseAndWait();
+    }
+    callback.reset();
+    region->TaskComplete();
+    if (!expired.expired() || regions_destroyed.load() != 0) return 18;
+    // Must reject admission before NoteExecution touches the freed history.
+    if (discard) held->Discard(); else (*held)();
+    if (called || regions_destroyed.load() != 1) return 19;
   }
   watched = nullptr;
   std::cout << "root/owner lifecycle orders=" << cases << " PASS\n";
+  std::cout << "stack launch late completion cases=6 single Region reference=PASS\n";
 }

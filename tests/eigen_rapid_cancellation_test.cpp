@@ -55,6 +55,7 @@ TEST(EigenRapidCancellation, ConcurrentRootsMatchSerialOracleBeforeAndAfterPubli
     const unsigned callers = 2 + test % 3;
     const bool terminal = test % 2 == 0;
     const size_t grain = terminal ? (size + 1) / 2 : 1;
+    const size_t second_start = terminal ? size / 2 : (size + 1) / 2;
     // 0: full execution; 1: cancel with claims held; 2: cancel in callbacks.
     for (unsigned phase = 0; phase < 3; ++phase) {
       const std::string context = "seed=" + std::to_string(seed) + " case=" +
@@ -98,7 +99,7 @@ TEST(EigenRapidCancellation, ConcurrentRootsMatchSerialOracleBeforeAndAfterPubli
                 const size_t index = i - begin;
                 ++active_callbacks;
                 actual[root * size + index].fetch_add(unsigned(index % 23 + root + 1));
-                if (index == 0 || index == size / 2) {
+                if (index == 0 || index == second_start) {
                   ++arrivals;
                   eigen_test_support::WaitUntil([&] { return release_callbacks.load(); },
                                                 context.c_str());
@@ -129,7 +130,7 @@ TEST(EigenRapidCancellation, ConcurrentRootsMatchSerialOracleBeforeAndAfterPubli
         // before publication, only the two blocked entries for phase 2.
         for (size_t index = 0; index < size; ++index) {
           const bool executed = phase == 0 ||
-              (phase == 2 && (index == 0 || index == size / 2));
+              (phase == 2 && (index == 0 || index == second_start));
           const unsigned expected = executed ? unsigned(index % 23 + root + 1) : 0;
           ASSERT_EQ(actual[root * size + index].load(), expected)
               << "root=" << root << " index=" << index;
@@ -170,21 +171,16 @@ struct HeldWorkers {
 };
 
 std::vector<bool> SerialPrefixStarts(size_t size, size_t participants) {
-  // A plain FIFO of integer intervals, independent of Auto state/Launch.
-  std::vector<std::pair<size_t, size_t>> ranges{{0, size}};
-  std::vector<size_t> pending{0};
-  for (size_t head = 0; ranges.size() < participants && head < pending.size();) {
-    const size_t index = pending[head++];
-    const auto [first, last] = ranges[index];
-    if (last - first <= 1) continue;
-    const size_t middle = first + (last - first) / 2;
-    ranges[index].second = middle;
-    ranges.emplace_back(middle, last);
-    pending.push_back(index);
-    pending.push_back(ranges.size() - 1);
-  }
+  // Independent serial equal-slice model; accumulate boundaries without
+  // Launch's product/min formula.
+  std::vector<size_t> lengths(participants, size / participants);
+  for (size_t extra = 0; extra < size % participants; ++extra) ++lengths[extra];
   std::vector<bool> starts(size);
-  for (const auto &[first, last] : ranges) starts[first] = true;
+  size_t first = 0;
+  for (size_t length : lengths) {
+    starts[first] = true;
+    first += length;
+  }
   return starts;
 }
 } // namespace

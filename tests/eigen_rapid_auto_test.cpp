@@ -5,22 +5,22 @@
 #include "eigen_test_wait.h"
 #include <gtest/gtest.h>
 #include <future>
+#include <optional>
 
 namespace {
 using namespace oox::detail::eigen_pool;
 using namespace oox::detail::eigen_pool::rapid;
 using namespace std::chrono_literals;
 
-static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 2>) <
+static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 2>) ==
               sizeof(batch_detail::Launch<void (*)(size_t), 8>));
-static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 8>) <
+static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 8>) ==
               sizeof(batch_detail::Launch<void (*)(size_t), 16>));
-static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 16>) <
+static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 16>) ==
               sizeof(batch_detail::Launch<void (*)(size_t), 64>));
+static_assert(sizeof(batch_detail::Launch<void (*)(size_t), 64>) <= 256);
 
-TEST(EigenRapidAuto, FrontierInheritsOneRootBudget) {
-  ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
+TEST(EigenRapidAuto, AutoSplitsPreserveBinaryBudget) {
   using State = partitioning::AutoPartitionState;
   for (size_t workers : {2u, 3u, 4u, 8u, 16u, 31u, 64u}) {
     std::vector<State> states{State(workers)};
@@ -43,36 +43,7 @@ TEST(EigenRapidAuto, FrontierInheritsOneRootBudget) {
   }
 }
 
-TEST(EigenRapidAuto, PinnedPrefixJoinsMatchBooleanOracle) {
-  using Work = partitioner_detail::Work<void (*)(size_t), partitioning::AutoPartitionState>;
-  using Join = partitioner_detail::PeerJoin<Work>;
-  struct Root : partitioner_detail::PinnedRoot {
-    Root() : PinnedRoot{[](PinnedRoot *root, bool) noexcept {
-      ++static_cast<Root *>(root)->completions;
-    }} {}
-    unsigned completions = 0;
-  };
-  std::array<unsigned, 4> order{0, 1, 2, 3};
-  size_t test = 0;
-  do {
-    Root root;
-    Join parent(Join::Root(root)), left(&parent), right(&parent);
-    std::array<bool, 4> done{};
-    for (auto event : order) {
-      done[event] = true;
-      Join::Release(event < 2 ? &left : &right);
-      const bool left_done = done[0] && done[1], right_done = done[2] && done[3];
-      EXPECT_EQ(root.completions, unsigned(left_done && right_done)) << "case=" << test;
-      EXPECT_EQ(parent.references.load(), Join::executing + 2u - left_done - right_done);
-      EXPECT_EQ(left.references.load(), Join::executing + 2u - done[0] - done[1]);
-      EXPECT_EQ(right.references.load(), Join::executing + 2u - done[2] - done[3]);
-    }
-    ++test;
-  } while (std::next_permutation(order.begin(), order.end()));
-  EXPECT_EQ(test, 24u);
-}
-
-TEST(EigenRapidAuto, BatchFrontierMatchesSerialSplitOracle) {
+TEST(EigenRapidAuto, OwnerRangesMatchSerialEqualRangeOracle) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
   RapidDomainState domain(pool);
   size_t test = 0;
@@ -84,34 +55,43 @@ TEST(EigenRapidAuto, BatchFrontierMatchesSerialSplitOracle) {
         auto body = [&](size_t i) { ++visits[i]; };
         using Launch = batch_detail::Launch<decltype(body)>;
         auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
-        auto *launch = NewSmallObject<Launch>(RapidStartGroup{&domain, {0, 8}}, *region, &body);
+        std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
         launch->Prepare({0, size, grain}, helpers);
         struct Expected { size_t begin, end, budget; };
-        std::vector<Expected> expected{{0, size, 16}};
-        std::vector<size_t> pending{0};
-        size_t head = 0;
-        while (expected.size() < helpers + 1 && head < pending.size()) {
-          const size_t index = pending[head++];
-          const auto old = expected[index];
-          if (old.end - old.begin <= grain || old.budget <= 1) continue;
-          const size_t middle = old.begin + (old.end - old.begin) / 2;
-          expected[index] = {old.begin, middle, old.budget / 2};
-          expected.push_back({middle, old.end, old.budget / 2});
-          pending.push_back(index);
-          pending.push_back(expected.size() - 1);
+        const size_t owners = std::min(size, helpers + 1);
+        // Independent serial model: distribute extra units, then accumulate
+        // endpoints rather than reusing Launch's product/min boundary formula.
+        std::vector<size_t> lengths(owners, size / owners), budgets(owners, 16 / owners);
+        for (size_t extra = 0; extra < size % owners; ++extra) ++lengths[extra];
+        for (size_t extra = 0; extra < 16 % owners; ++extra) ++budgets[extra];
+        std::vector<Expected> expected;
+        size_t first = 0, budget = 0;
+        for (size_t owner = 0; owner < owners; ++owner) {
+          expected.push_back({first, first + lengths[owner], budgets[owner]});
+          first += lengths[owner];
+          budget += budgets[owner];
         }
+        EXPECT_EQ(first, size);
+        EXPECT_EQ(budget, 16u);
+        EXPECT_TRUE(region->IsComplete()); // Preparing stack owners adds no tree reference.
         EXPECT_EQ(launch->SeedCount(), expected.size());
+        size_t actual_budget = 0;
         for (size_t i = 0; i < expected.size(); ++i) {
           const auto &seed = launch->GetSeed(i);
           EXPECT_EQ(seed.range.begin, expected[i].begin);
           EXPECT_EQ(seed.range.end, expected[i].end);
+          EXPECT_EQ(seed.range.grain, grain);
           EXPECT_EQ(seed.state.divisor, expected[i].budget);
           EXPECT_EQ(seed.state.max_depth, 5u);
+          EXPECT_EQ(seed.state.unpublished, &region->RapidPublication());
+          EXPECT_EQ(seed.parent, nullptr);
+          actual_budget += seed.state.divisor;
           launch->Run(i);
         }
+        EXPECT_EQ(actual_budget, 16u);
         pool.Wait([&] { return region->IsComplete(); });
         region->CloseAndWait();
-        launch->Release();
+        launch.reset();
         region->TaskComplete();
         for (const auto &value : visits) EXPECT_EQ(value.load(), 1u);
       }
@@ -133,7 +113,7 @@ TEST(EigenRapidAuto, GrainSizedOwnersNeedNoOrdinaryTaskAllocations) {
   for (const auto &value : visits) EXPECT_EQ(value.load(), 1u);
 }
 
-TEST(EigenRapidAuto, ExpansionRespectsRemainingWorkerBudget) {
+TEST(EigenRapidAuto, InitialRangesBelongOnlyToCapturedOwners) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
   RapidDomainState domain(pool);
   for (size_t helpers : {1u, 7u}) {
@@ -141,17 +121,23 @@ TEST(EigenRapidAuto, ExpansionRespectsRemainingWorkerBudget) {
     auto body = [&](size_t i) { ++visits[i]; };
     using Launch = batch_detail::Launch<decltype(body)>;
     auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
-    auto *launch = NewSmallObject<Launch>(RapidStartGroup{&domain, {0, 8}}, *region, &body);
-    launch->Prepare({0, visits.size(), 1}, helpers, true);
-    EXPECT_EQ(launch->SeedCount(), helpers == 1 ? 2u : 32u);
+    std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
+    launch->Prepare({0, visits.size(), 1}, helpers);
+    EXPECT_TRUE(region->IsComplete());
+    EXPECT_EQ(launch->SeedCount(), helpers + 1);
+    size_t budget = 0;
     for (size_t i = 0; i < launch->SeedCount(); ++i) {
       const auto &seed = launch->GetSeed(i);
-      EXPECT_EQ(seed.state.divisor, helpers == 1 ? 8u : 0u);
+      EXPECT_EQ(seed.state.divisor, helpers == 1 ? 8u : 2u);
+      EXPECT_EQ(seed.parent, nullptr);
+      EXPECT_EQ(seed.state.unpublished, &region->RapidPublication());
+      budget += seed.state.divisor;
     }
+    EXPECT_EQ(budget, 16u);
     for (size_t i = 0; i <= helpers; ++i) launch->Run(i);
     pool.Wait([&] { return region->IsComplete(); });
     region->CloseAndWait();
-    launch->Release();
+    launch.reset();
     region->TaskComplete();
     for (const auto &value : visits) EXPECT_EQ(value.load(), 1u);
   }

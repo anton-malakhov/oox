@@ -148,7 +148,28 @@ if (OOX_ENABLE_EIGEN)
   gtest_discover_tests(eigen_rapid_auto_test
           DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 90)
 
-  foreach(kind IN ITEMS rapid_dispatch rapid_cancellation pool_batch)
+  add_executable(eigen_rapid_policy_test eigen_rapid_policy_test.cpp)
+  target_link_libraries(eigen_rapid_policy_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_rapid_policy_test
+      DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+
+  foreach(clock IN ITEMS normal tiny)
+    add_executable(eigen_rapid_epoch_${clock}_test eigen_rapid_epoch_test.cpp)
+    target_link_libraries(eigen_rapid_epoch_${clock}_test PRIVATE
+        ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+    target_compile_definitions(eigen_rapid_epoch_${clock}_test PRIVATE
+        OOX_EIGEN_THREAD_POOL_TESTING=1)
+    if(clock STREQUAL "tiny")
+      target_compile_definitions(eigen_rapid_epoch_${clock}_test PRIVATE
+          OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS=2
+          OOX_EIGEN_TEST_GLOBAL_RESIDENT_CLOCK_BITS=2
+          OOX_EIGEN_TEST_RESIDENT_BATCH_GENERATION_BITS=3)
+    endif()
+    gtest_discover_tests(eigen_rapid_epoch_${clock}_test TEST_PREFIX "${clock}."
+        DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+  endforeach()
+
+  foreach(kind IN ITEMS rapid_dispatch rapid_cancellation rapid_lazy)
     add_executable(eigen_${kind}_test eigen_${kind}_test.cpp)
     target_link_libraries(eigen_${kind}_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
     gtest_discover_tests(eigen_${kind}_test

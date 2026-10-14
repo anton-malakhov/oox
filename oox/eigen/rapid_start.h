@@ -56,10 +56,56 @@ class ScopedResidentState {
 public:
   explicit ScopedResidentState(RapidDomainState &state) noexcept
       : previous_(std::exchange(current_resident_state, &state)) {}
+  ScopedResidentState(const ScopedResidentState &) = delete;
+  ScopedResidentState &operator=(const ScopedResidentState &) = delete;
   ~ScopedResidentState() { current_resident_state = previous_; }
 
 private:
   RapidDomainState *previous_;
+};
+
+// Caller-owned join; worker completion records remain in the pool across reuse.
+class ResidentCohort {
+public:
+  ResidentCohort(ThreadPool &pool, const unsigned *workers, size_t count,
+                 std::atomic<size_t> &completion) noexcept
+      : pool_(pool), workers_(workers), count_(count), completion_(completion),
+        epoch_(count > 1 ? pool.NextResidentEpoch() : 0) {}
+  ResidentCohort(const ResidentCohort &) = delete;
+  ResidentCohort &operator=(const ResidentCohort &) = delete;
+  ~ResidentCohort() {
+    if (!finalized_) { assert(IsComplete()); pool_.ReleaseResidentEpochBatch(batch_); }
+  }
+  void Publish(ResidentTask &task) noexcept {
+    const bool packed_completion = epoch_ && pool_.SupportsPackedResidentCompletion();
+    const size_t batch = pool_.PublishResidentBatch(task, completion_, workers_, count_, 1,
+                                                   epoch_, packed_completion);
+    // Legacy batches are released by their final helper, not by this caller.
+    if (epoch_) batch_ = batch;
+    if (packed_completion) done_mask_ = pool_.ResidentBatchDoneMask(batch, workers_, count_);
+  }
+  bool IsComplete() const noexcept {
+    if (finalized_) return true;
+    if (done_mask_) return pool_.ResidentBatchDone(batch_, done_mask_);
+    return epoch_ ? pool_.ResidentEpochComplete(epoch_, workers_, count_)
+                  : completion_.load(std::memory_order_acquire) == 0;
+  }
+  void Finalize() noexcept {
+    assert(IsComplete());
+    if (epoch_) completion_.store(0, std::memory_order_relaxed);
+    pool_.ReleaseResidentEpochBatch(batch_);
+    batch_ = size_t(-1);
+    finalized_ = true;
+  }
+private:
+  ThreadPool &pool_;
+  const unsigned *workers_;
+  size_t count_;
+  std::atomic<size_t> &completion_;
+  uint64_t epoch_;
+  uint64_t done_mask_ = 0;
+  size_t batch_ = size_t(-1);
+  bool finalized_ = false;
 };
 
 template <typename F>
@@ -83,7 +129,7 @@ public:
   }
 
   // Both the caller body and all captured helpers must have returned. The
-  // completion acquire then makes exception_ immutable and visible here.
+  // captured-command join then makes exception_ immutable and visible here.
   void RethrowAfterJoin() {
     assert(IsComplete());
     if (exception_) std::rethrow_exception(exception_);
@@ -152,12 +198,11 @@ void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
   Function &callable = function;
   ResidentRegion<Function> region(*group.state, callable, begin, end,
                                   helpers + 1, helpers);
-  for (size_t helper = 0; helper < helpers; ++helper) {
-    pool.PublishResident(region, region.CompletionCounter(), workers[helper],
-                         helper + 1);
-  }
+  ResidentCohort cohort(pool, workers.data(), helpers, region.CompletionCounter());
+  cohort.Publish(region);
   region.RunCaller();
-  pool.HelpResidentUntil(region);
+  pool.HelpResidentUntil(cohort);
+  cohort.Finalize();
   region.RethrowAfterJoin();
 }
 

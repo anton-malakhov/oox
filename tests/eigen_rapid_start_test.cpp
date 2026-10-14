@@ -16,6 +16,7 @@ namespace resident_test_hook { void Acquired(unsigned); }
 #include <future>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace resident_test_hook {
@@ -34,7 +35,29 @@ using oox::detail::eigen_pool::ThreadPool;
 using oox::detail::eigen_pool::WorkerIdleMode;
 using oox::detail::eigen_pool::rapid::RapidDomainState;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
+using oox::detail::eigen_pool::rapid::ScopedResidentState;
+using oox::detail::eigen_pool::rapid::current_resident_state;
 using namespace std::chrono_literals;
+
+static_assert(!std::is_copy_constructible_v<ScopedResidentState>);
+static_assert(!std::is_copy_assignable_v<ScopedResidentState>);
+
+TEST(EigenRapidResident, ScopedStateRestoresNestedContextOnException) {
+  ThreadPool pool(1);
+  RapidDomainState outer(pool), inner(pool);
+  auto *const previous = current_resident_state;
+  {
+    ScopedResidentState outer_scope(outer);
+    EXPECT_EQ(current_resident_state, &outer);
+    EXPECT_THROW(([&] {
+      ScopedResidentState inner_scope(inner);
+      EXPECT_EQ(current_resident_state, &inner);
+      throw std::runtime_error("nested resident body");
+    }()), std::runtime_error);
+    EXPECT_EQ(current_resident_state, &outer);
+  }
+  EXPECT_EQ(current_resident_state, previous);
+}
 
 template <typename F>
 void ParallelForResident(RapidStartGroup group, size_t begin, size_t end, F body) {

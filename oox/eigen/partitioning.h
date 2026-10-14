@@ -110,6 +110,16 @@ struct AutoPartitionState : UnaffinitizedState {
   unsigned max_depth = 5;
 };
 
+// Rapid has already distributed the initial owners. Keep Auto's split state
+// and stolen-peer feedback, but materialize descendants only on idle demand.
+struct LazyAutoPartitionState : AutoPartitionState {
+  explicit constexpr LazyAutoPartitionState(std::size_t workers) noexcept
+      : AutoPartitionState(workers) {}
+  constexpr LazyAutoPartitionState(LazyAutoPartitionState &source, Split split) noexcept
+      : AutoPartitionState(source, split), unpublished(source.unpublished) {}
+  const std::atomic<bool> *unpublished = nullptr;
+};
+
 struct AffinityHistory {
   explicit AffinityHistory(std::size_t count)
       : workers(count), slots(new std::atomic<std::size_t>[count * 16]{}) {}
@@ -171,11 +181,12 @@ struct AffinityPartitionState : AutoPartitionState {
     if (!divisor)
       return no_affinity;
     const auto saved = slots[head].load(std::memory_order_relaxed);
-    return saved ? saved : head / factor;
+    return saved ? saved - 1 : head / factor;
   }
   void NoteExecution(std::size_t worker, std::size_t hint) noexcept {
     if (divisor && hint != no_affinity && worker != no_affinity && worker != hint)
-      slots[head].store(worker, std::memory_order_relaxed);
+      // Zero is the uninitialized marker; worker zero is a valid destination.
+      slots[head].store(worker + 1, std::memory_order_relaxed);
   }
 
   std::size_t head, slots_count;

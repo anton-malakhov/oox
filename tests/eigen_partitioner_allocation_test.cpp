@@ -5,6 +5,7 @@
 #include <new>
 #include "eigen_partitioner_test_support.h"
 #include <oox/eigen/rapid_auto.h>
+#include <oox/eigen/rapid_parallel_for.h>
 #include "test_support/eigen_resident.h"
 
 thread_local int fail_after = -1;
@@ -161,11 +162,103 @@ void verify_terminal_pairs_do_not_allocate() {
   }
 }
 
+template <typename Policy> void verify_rapid_policy_allocation_failures() {
+  using namespace oox::detail::eigen_pool;
+  ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(pool);
+  rapid::RapidStartGroup group{&state, {0, 4}};
+  unsigned hits = 0;
+  for (int ordinal = 0; ordinal < 32; ++ordinal) {
+    Policy policy; // Include the first Affinity-history allocation in injection.
+    eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(2));
+    injected = false;
+    fail_after = ordinal;
+    bool caught = false;
+    try {
+      rapid::ParallelFor(group, 0, 4097, [](size_t) {}, policy);
+    } catch (const std::bad_alloc &) { caught = true; }
+    fail_after = -1;
+    if (caught != injected) {
+      std::cerr << "rapid policy allocation ordinal=" << ordinal << " mismatch\n";
+      std::_Exit(18);
+    }
+    hits += injected;
+    // A failed preparation/publication must neither strand claimed workers nor
+    // leave a callback from the failed launch reachable by the next invocation.
+    eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(2));
+    std::array<std::atomic<unsigned>, 257> visits{};
+    rapid::ParallelFor(group, 0, visits.size(), [&](size_t i) { ++visits[i]; }, policy);
+    for (auto &v : visits) if (v != 1) std::_Exit(19);
+  }
+  if (!hits) std::_Exit(20);
+}
+
+void verify_failed_donation_releases_reservation() {
+  using namespace oox::detail::eigen_pool;
+  using State = partitioning::LazyAutoPartitionState;
+  ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
+  bool called = false, caught = false;
+  auto body = [&](size_t) { called = true; };
+  auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr);
+  using Work = partitioner_detail::Work<decltype(body), State>;
+  partitioner_detail::Branch<Work, true> branch(nullptr);
+  State state(2);
+  if (!region->ReserveDonation()) std::_Exit(15);
+  injected = false;
+  fail_after = 0;
+  try {
+    partitioner_detail::OfferWork(*region, &body, {0, 32, 1}, state, branch,
+                                 0, partitioning::Split{});
+  } catch (const std::bad_alloc &) { caught = true; }
+  fail_after = -1;
+  if (!caught || !injected || called || branch.Parent() || !region->IsComplete() ||
+      !region->ReserveDonation())
+    std::_Exit(16);
+  region->ReleaseDonation();
+  region->TaskComplete();
+}
+
+void verify_failed_first_theft_does_not_promote_root() {
+  using namespace oox::detail::eigen_pool;
+  using State = partitioning::LazyAutoPartitionState;
+  ThreadPool pool(1, false, false);
+  bool called = false, caught = false;
+  auto body = [&](size_t) { called = true; };
+  partitioner_detail::Metrics metrics;
+  auto *region = NewSmallObject<partitioner_detail::Region>(pool, &metrics);
+  using Work = partitioner_detail::Work<decltype(body), State>;
+  {
+    partitioner_detail::Branch<Work, true> branch(nullptr);
+    State state(1);
+    state.unpublished = &region->RapidPublication();
+    partitioner_detail::ActiveRange<decltype(body), State> active(
+        *region, &body, {0, 32, 1}, state, branch);
+    injected = false;
+    fail_after = 0;
+    auto *child = active.Steal();
+    fail_after = -1;
+    try { region->Rethrow(); } catch (const std::bad_alloc &) { caught = true; }
+    if (child || !caught || !injected || called || branch.Parent() ||
+        !region->IsComplete() || metrics.range_tasks != 0 || metrics.donated_ranges != 0) {
+      std::cerr << "seed=0 case=0 first theft allocation failure promoted root or retained work\n";
+      std::_Exit(17);
+    }
+  }
+  region->CloseAndWait();
+  region->TaskComplete();
+}
+
 int main(int argc, char **argv) try {
   eigen_partitioner_test::Select(argc, argv);
   verify_reentrant_discard_after_allocation_failure();
   verify_rapid_auto_allocation_failures();
+  verify_rapid_policy_allocation_failures<oox::detail::eigen_pool::AutoPartitioner>();
+  verify_rapid_policy_allocation_failures<oox::detail::eigen_pool::SimplePartitioner>();
+  verify_rapid_policy_allocation_failures<oox::detail::eigen_pool::StaticPartitioner>();
+  verify_rapid_policy_allocation_failures<oox::detail::eigen_pool::AffinityPartitioner>();
   verify_terminal_pairs_do_not_allocate();
+  verify_failed_donation_releases_reservation();
+  verify_failed_first_theft_does_not_promote_root();
   verify_affinity_publication_failure();
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(8, true, true);

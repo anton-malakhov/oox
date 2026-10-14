@@ -100,29 +100,36 @@ void RapidCompletion(bool remote, bool registered, unsigned trace) {
       started.wait(false);
     }
   };
-  auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr);
+  auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
   using Launch = rapid::batch_detail::Launch<decltype(body), 2>;
-  auto *launch = NewSmallObject<Launch>(rapid::RapidStartGroup{&domain, {0, 2}}, *region, &body);
-  launch->Prepare({0, 2, 1}, 1);
+  Launch launch(rapid::RapidStartGroup{&domain, {0, 2}}, *region, &body);
+  launch.Prepare({0, 2, 1}, 1);
   if (remote) {
-    // Join the raw test command explicitly; the production launcher instead
-    // joins its pool-managed command counter before releasing this reference.
-    std::thread helper([&] { launch->Run(1); });
+    // Captured commands are joined separately and do not retain Region.
+    // An actual escaping tree must wake its caller even when the final child
+    // finishes on its donating thread rather than on the synchronous caller.
+    using Work = Launch::Work;
+    auto *child = NewSmallObject<Work>(*region, &body,
+        partitioner_detail::LoopRange{1, 2, 1}, Launch::State(pool.NumThreads()), 0, nullptr);
+    std::thread helper([&] {
+      child->SetPublishingThreadId(std::this_thread::get_id());
+      (*child)();
+    });
     std::thread controller([&] {
       internal::completion_waits.wait(0);
       release = true;
       release.notify_one();
     });
-    launch->Run(0);
+    body(0);
+    Launch::Join::Release(child);
     pool.Wait([&] { return region->IsComplete(); });
     helper.join();
     controller.join();
   } else {
-    launch->Run(1);
-    launch->Run(0);
+    launch.Run(1);
+    launch.Run(0);
   }
   region->CloseAndWait();
-  launch->Release();
   region->TaskComplete();
   for (auto &value : visits) Check(value == 1, "rapid", "serial oracle mismatch", trace);
   Check(internal::completion_notifications == unsigned(remote), "rapid",
