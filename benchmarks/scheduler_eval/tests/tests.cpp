@@ -267,7 +267,7 @@ bool CheckGranularityEstimator() {
 }
 
 bool CheckSchedulerMetrics() {
-#ifdef EIGEN_MODE
+#if defined(EIGEN_MODE) && defined(OOX_EIGEN_ENABLE_STATS)
   const auto before = EigenPool().GetStatistics();
   std::atomic<bool> completed{false};
   EigenPoolWrapper scheduler;

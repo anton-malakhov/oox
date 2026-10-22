@@ -2,7 +2,15 @@ set(OOX_SCHEDULER_EVAL_MODES SERIAL_ELISION)
 set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
 set(OOX_SCHEDULER_EVAL_TESTS)
 
+option(OOX_SCHEDULER_EVAL_STATS "Collect Eigen task and stealing counters" ON)
 option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
+option(OOX_SCHEDULER_TRACE_TOOLS "Build opt-in scheduler timeline recorders" OFF)
+if(OOX_SCHEDULER_TRACE_TOOLS)
+  add_executable(test_scheduler_trace_recorder tracing/test_recorder.cpp tracing/recorder.cpp)
+  target_link_libraries(test_scheduler_trace_recorder PRIVATE OOX)
+  target_compile_definitions(test_scheduler_trace_recorder PRIVATE OOX_SCHEDULER_TRACE=1 OOX_TRACE_RECORDER_TESTING=1)
+  set(OOX_SCHEDULER_TRACE_TARGETS test_scheduler_trace_recorder)
+endif()
 add_library(oox_eval_papi STATIC metrics/papi_metrics.cpp)
 target_link_libraries(oox_eval_papi PUBLIC OOX)
 if(OOX_SCHEDULER_EVAL_PAPI)
@@ -26,7 +34,7 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    OOX_TASKS
+    OOX_TASKS RAPID_GROUP RAPID_AUTO EIGEN_AUTO_RESIDENT
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_AUTO EIGEN_SIMPLE EIGEN_STATIC EIGEN_AFFINITY
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
@@ -54,11 +62,25 @@ function(oox_configure_scheduler_eval_target target mode)
     target_link_libraries(${target} PRIVATE OOX)
   elseif(mode STREQUAL "OOX_TASKS")
     target_compile_definitions(${target} PRIVATE
-      OOX_TASK_MODE=1 OOX_EIGEN_ENABLE_STATS=1)
+      OOX_TASK_MODE=1 $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_AUTO" OR mode STREQUAL "EIGEN_AUTO_RESIDENT")
+    if(mode STREQUAL "RAPID_AUTO")
+      set(rapid_auto_mode EIGEN_RAPID_AUTO)
+    else()
+      set(rapid_auto_mode EIGEN_AUTO_RESIDENT)
+    endif()
+    target_compile_definitions(${target} PRIVATE RAPID_AUTO_MODE=1
+      EIGEN_MODE=${rapid_auto_mode}
+      $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE
-      EIGEN_MODE=${mode} OOX_EIGEN_ENABLE_STATS=1)
+      EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_GROUP")
+    target_compile_definitions(${target} PRIVATE
+      RAPID_GROUP_MODE=1 EIGEN_MODE=EIGEN_RAPID_GROUP $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
@@ -74,6 +96,16 @@ function(oox_configure_scheduler_eval_target target mode)
 endfunction()
 
 foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
+  if(OOX_SCHEDULER_TRACE_TOOLS AND mode MATCHES "^(SERIAL_ELISION|RAPID_AUTO|RAPID_START|TBB_AUTO)$")
+    add_executable(measure_scheduler_${mode} ${PROJECT_SOURCE_DIR}/tools/scheduler_viewer/measure_scheduler.cpp)
+    oox_configure_scheduler_eval_target(measure_scheduler_${mode} ${mode})
+  endif()
+  if(OOX_SCHEDULER_TRACE_TOOLS AND mode MATCHES "^(RAPID_AUTO|RAPID_GROUP|RAPID_START|EIGEN_AUTO_RESIDENT|EIGEN_AUTO|EIGEN_STATIC|EIGEN_SIMPLE|EIGEN_AFFINITY|EIGEN_STEALING|EIGEN_SHARING|TBB_AUTO)$")
+    add_executable(trace_scheduler_${mode} tracing/trace_scheduler.cpp tracing/recorder.cpp)
+    oox_configure_scheduler_eval_target(trace_scheduler_${mode} ${mode})
+    target_compile_definitions(trace_scheduler_${mode} PRIVATE OOX_SCHEDULER_TRACE=1)
+    list(APPEND OOX_SCHEDULER_TRACE_TARGETS trace_scheduler_${mode})
+  endif()
   set(benchmark_target bench_scheduler_eval_${mode})
   list(APPEND OOX_SCHEDULER_EVAL_TARGETS ${benchmark_target})
   add_executable(${benchmark_target} bench/bench_scheduler_eval.cpp)
@@ -97,7 +129,7 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
     "--benchmark_filter=(QuickHull|TrigramDedup|RadixSort64|TrigramSampleSort|SampleSortRecords|RadixPassWidth).*/1024(/|$)"
     --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
   list(APPEND OOX_SCHEDULER_EVAL_TESTS ${benchmark_target}_extended_smoke)
-  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS")
+  if(mode MATCHES "^EIGEN" OR mode STREQUAL "OOX_TASKS" OR mode STREQUAL "RAPID_GROUP" OR mode STREQUAL "RAPID_AUTO")
     add_test(NAME ${benchmark_target}_availability_smoke COMMAND ${benchmark_target}
       "--benchmark_filter=(ChangingWorkerAvailability/4096|OversubscribedLoops/4096/2|FirstTouch<.*>/16384)(/|$)"
       --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME})
@@ -154,13 +186,73 @@ foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
   endif()
 endforeach()
 
+# Keep the explicit-policy experiment opt-in: do not multiply the full-suite CI
+# matrix. Both sides reuse the calibration workload and the same resident pool.
+if(OOX_SCHEDULER_TRACE_TOOLS AND OOX_ENABLE_EIGEN)
+  foreach(policy IN ITEMS Auto Simple Static Affinity)
+    string(TOUPPER "${policy}" policy_name)
+    foreach(activate IN ITEMS 0 1)
+      if(activate)
+        set(probe_mode RAPID_NATIVE_${policy_name})
+      else()
+        set(probe_mode NATIVE_${policy_name}_RESIDENT)
+      endif()
+      add_executable(measure_scheduler_${probe_mode} ${PROJECT_SOURCE_DIR}/tools/scheduler_viewer/measure_scheduler.cpp)
+      set(policy_targets measure_scheduler_${probe_mode})
+      if(activate)
+        add_executable(trace_scheduler_${probe_mode} tracing/trace_scheduler.cpp tracing/recorder.cpp)
+        target_compile_definitions(trace_scheduler_${probe_mode} PRIVATE OOX_SCHEDULER_TRACE=1)
+        list(APPEND policy_targets trace_scheduler_${probe_mode})
+        list(APPEND OOX_SCHEDULER_TRACE_TARGETS trace_scheduler_${probe_mode})
+      endif()
+      foreach(policy_target IN LISTS policy_targets)
+        target_link_libraries(${policy_target} PRIVATE OOX OOX::eigen oox_eval_papi)
+        target_include_directories(${policy_target} PRIVATE
+          ${CMAKE_CURRENT_LIST_DIR}/runtime ${CMAKE_CURRENT_LIST_DIR}/metrics)
+        target_compile_definitions(${policy_target} PRIVATE
+          OOX_EVAL_UNPINNED=1 EIGEN_MODE=EIGEN_RAPID_AUTO
+          SCHEDULER_EVAL_MODE_NAME="${probe_mode}"
+          OOX_RAPID_POLICY=${policy}Partitioner OOX_RAPID_POLICY_ACTIVATE=${activate})
+      endforeach()
+    endforeach()
+  endforeach()
+endif()
+
 add_executable(test_eval_arguments tests/tests_arguments.cpp)
 oox_configure_scheduler_eval_target(test_eval_arguments SERIAL_ELISION)
 list(APPEND OOX_SCHEDULER_EVAL_TARGETS test_eval_arguments)
 add_custom_target(scheduler_eval_all DEPENDS ${OOX_SCHEDULER_EVAL_TARGETS})
+if(OOX_SCHEDULER_TRACE_TOOLS)
+  add_custom_target(scheduler_trace_all DEPENDS ${OOX_SCHEDULER_TRACE_TARGETS})
+endif()
 
-if(OOX_ENABLE_EIGEN OR TBB_FOUND)
+if(OOX_ENABLE_EIGEN OR TBB_FOUND OR OOX_SCHEDULER_TRACE_TOOLS)
   find_package(Python3 COMPONENTS Interpreter)
+endif()
+
+if(OOX_SCHEDULER_TRACE_TOOLS)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME scheduler_viewer_python COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+      -s ${PROJECT_SOURCE_DIR}/tools/scheduler_viewer -p "test_*.py")
+    set_tests_properties(scheduler_viewer_python PROPERTIES LABELS scheduler-viewer TIMEOUT 60)
+  endif()
+  if(OOX_ENABLE_EIGEN AND TBB_FOUND AND Python3_Interpreter_FOUND)
+    add_test(NAME scheduler_trace_protocol
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tracing/test_trace.py ${PROJECT_BINARY_DIR})
+    add_test(NAME scheduler_trace_audit
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tracing/test_audit.py)
+    set_tests_properties(scheduler_trace_protocol PROPERTIES TIMEOUT 180)
+  endif()
+  find_program(OOX_TRACE_NODE_EXECUTABLE node)
+  if(OOX_TRACE_NODE_EXECUTABLE)
+    foreach(check IN ITEMS model native_model trace_state trace_ui flowchart lab lab_ui)
+      add_test(NAME scheduler_viewer_${check} COMMAND ${OOX_TRACE_NODE_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tools/scheduler_viewer/test_${check}.cjs)
+      set_tests_properties(scheduler_viewer_${check} PROPERTIES LABELS scheduler-viewer TIMEOUT 60)
+    endforeach()
+    add_test(NAME scheduler_trace_viewer_model
+      COMMAND ${OOX_TRACE_NODE_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tracing/test_model.js)
+  endif()
 endif()
 
 if(OOX_ENABLE_EIGEN AND Python3_Interpreter_FOUND)

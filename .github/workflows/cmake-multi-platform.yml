@@ -91,7 +91,7 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     - name: Dependencies
-      run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev libtbb-dev libomp-19-dev
+      run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev libtbb-dev libomp-19-dev nodejs
     - name: Configure scheduler evaluations
       run: >
         cmake -S . -B build-scheduler-eval
@@ -99,6 +99,7 @@ jobs:
         -DOOX_BUILD_TESTS=OFF -DOOX_BUILD_BENCHMARKS=ON
         -DOOX_BUILD_TASKBENCH=OFF -DOOX_BUILD_SCHEDULER_EVALS=ON
         -DOOX_ENABLE_TBB=${{ matrix.external-backends }} -DOOX_ENABLE_TF=OFF
+        -DOOX_SCHEDULER_TRACE_TOOLS=ON
         -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=${{ matrix.external-backends }}
         -DOOX_EIGEN_THREADS=2
     - name: Build scheduler evaluations
@@ -116,6 +117,24 @@ jobs:
         cmake --build build-scheduler-eval --target
         bench_scheduler_eval_TBB_SIMPLE bench_scheduler_eval_RAPID_START
         bench_scheduler_eval_OMP_STATIC -j 8
+
+    - name: Build direct Eigen loop benchmarks
+      if: matrix.external-backends == 'OFF'
+      run: >
+        cmake --build build-scheduler-eval --target
+        bench_loops_EIGEN.EIGEN_AUTO_LOOP
+        bench_loops_EIGEN.EIGEN_RAPID_GROUP_LOOP
+        bench_loops_EIGEN.EIGEN_RAPID_AUTO_LOOP -j 8
+    - name: Run direct Eigen loop smoke tests
+      if: matrix.external-backends == 'OFF'
+      run: >
+        python3 benchmarks/scheduler_eval/tools/ctest_ci.py
+        --test-dir build-scheduler-eval --output-on-failure
+        -L backend-loops --no-tests=error --timeout 120
+
+    - name: Test standalone scheduler viewer
+      if: matrix.external-backends == 'OFF'
+      run: ctest --test-dir build-scheduler-eval -L scheduler-viewer --no-tests=error --output-on-failure --timeout 60
 
   build:
     runs-on: ${{ matrix.os }}

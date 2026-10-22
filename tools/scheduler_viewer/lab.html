@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Лаборатория блок-схем scheduler</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="lab.css">
+<script defer src="lab-engine.js"></script><script defer src="flowchart.js"></script><script defer src="lab-evidence.js"></script><script defer src="local-measurements.js"></script><script defer src="lab.js"></script></head>
+<body><main id="lab">
+<nav><a href="/">Учебные модели</a> · <a href="compare.html">Модель ↔ запись</a> · <a href="trace.html">Реальные трассы</a></nav>
+<header class="lab-hero"><span class="lab-eyebrow">SCHEDULER LAB · локальные эксперименты</span>
+<h1>Проверь идею до изменения C++</h1>
+<p>Сохрани базу, выключи один механизм и посмотри, куда уходит время.</p>
+<div class="lab-jump"><a href="#lab-experiment">01 · Эксперимент</a><a href="#lab-flowchart">Блок-схема</a><a href="#lab-hardware">02 · Измерения</a><a href="#lab-math">03 · Математика</a><a href="#lab-evidence">04 · Источники</a></div></header>
+<p class="lab-notice">Симуляция и C++-замеры разделены. Измеренное тело и микропробы уточняют входные данные, но не делают весь симулятор откалиброванной моделью CPU.</p>
+<div class="viz-controls lab-command" id="lab-experiment">
+  <label>Заготовка <select id="lab-preset" class="form-select"><option value="lazy">Rapid + lazy</option><option value="static">Битмасочный / static</option><option value="stealing">Рекурсивный stealing</option><option value="sharing">Sharing + stealing</option></select></label>
+  <label>Потоки <select id="lab-workers" class="form-select"><option>4</option><option selected>8</option><option>16</option></select></label>
+  <label>Seed <input id="lab-seed" class="lab-number" type="number" min="0" value="1"></label>
+  <button class="btn" id="lab-baseline">Зафиксировать как базу</button>
+  <button class="btn btn-primary" id="lab-run">Запустить A/B</button>
+</div>
+<div class="lab-quick"><span>Быстрый эксперимент</span><button class="btn" id="lab-ab-tail">Отключить кражу хвоста</button><button class="btn" id="lab-ab-queue">Отключить queue stealing</button><button class="btn" id="lab-ab-split">Переключить дробление</button><button class="btn" id="lab-profile">Применить измеренные входы</button></div>
+<p id="lab-profile-note" class="lab-caption"></p>
+<div id="lab-error" role="alert"></div><div id="lab-state" role="status"></div>
+<section id="lab-results" class="lab-surface" hidden><div class="lab-section-heading"><span class="lab-step">A/B</span><div><h3>Результат симуляции</h3><p>При заданной нагрузке и стоимостях, не измеренный speedup C++.</p></div></div><div id="lab-kpis" class="lab-kpis"></div><details><summary>Полный учёт времени и операций</summary><div id="lab-summary"></div></details>
+<p id="lab-sensitivity"></p>
+<div class="viz-row"><button class="btn" id="lab-play">▶ Проиграть</button><label>Время модели <input id="lab-time" type="range" min="0" max="1" value="0"></label><output id="lab-clock"></output></div>
+<div class="lab-pair"><div><h3>Зафиксированная база</h3><canvas id="lab-canvas-base" aria-label="Работа и обслуживание по потокам базовой схемы"></canvas></div><div><h3>Изменённая схема</h3><canvas id="lab-canvas-new" aria-label="Работа и обслуживание по потокам изменённой схемы"></canvas></div></div>
+<p>Цвет — полезная работа потока; серое — scheduler / ожидание ресурса; пусто — простой. Общий курсор показывает время МОДЕЛИ, не запись C++.</p><div id="lab-job-results"></div>
+</section>
+<section id="lab-flowchart" class="lab-surface"><div class="lab-section-heading"><span class="lab-step">01</span><div><h3>Механизмы планировщика</h3><p>Ромб — проверка условия, прямоугольник — действие, овал — начало/остановка. У стрелок подписаны исходы. Пунктир — обход выключенного блока.</p></div></div>
+<div class="lab-graph-scroll"><svg id="lab-graph" role="img" aria-label="Исполняемая блок-схема выбранного планировщика"></svg></div>
+<p class="lab-caption">Это цикл одного worker. Завершение всех заданий останавливает симуляцию. Схема показывает реальные переходы редактора, включая возвраты.</p>
+<details><summary>Изменить блоки и связи вручную</summary>
+<div class="viz-controls"><label>Начальный блок <select id="lab-entry" class="form-select"></select></label><label>Новый блок <select id="lab-operation" class="form-select"></select></label><button class="btn" id="lab-add-node">Добавить блок</button></div>
+<div class="lab-scroll"><table><thead><tr><th>Вкл.</th><th>ID</th><th>Действие</th><th>Да →</th><th>Нет →</th><th></th></tr></thead><tbody id="lab-nodes"></tbody></table></div>
+</details>
+</section>
+<section class="lab-surface"><div class="lab-section-heading"><span class="lab-step">02</span><div><h3>Нагрузка</h3><p>Размер, форма и порядок поступления — часть эксперимента, а не только настройки графика.</p></div></div>
+<div class="lab-scroll"><table><thead><tr><th>ID</th><th>Приход, нс</th><th>N</th><th>Паттерн</th><th>База итерации, нс</th><th>После задания</th><th></th></tr></thead><tbody id="lab-jobs"></tbody></table></div>
+<button class="btn" id="lab-add-job">Добавить задание</button>
+<p>Хвост: последние 25% ×16; кластеры ×6; одна дорогая итерация ×32. Random детерминирован seed. Зависимость ждёт завершения и join родителя; это граф заданий, не полная модель nested fork–join.</p>
+</section>
+<details class="lab-surface"><summary>Дополнительно: старт, зерно и стоимость блоков</summary>
+<div class="viz-controls"><label>Раздача <select id="lab-dispatch" class="form-select"><option value="rapid">Захват свободных (Rapid)</option><option value="mask">Весь пул, один запуск (static)</option><option value="mailbox">Адресная раздача (mailbox)</option><option value="tree">Одна корневая задача</option></select></label><label>Grain <input id="lab-grain" class="lab-number" type="number" min="1" value="2"></label><label>Рост порции <select id="lab-grain-policy" class="form-select"><option value="fixed">Фиксированная</option><option value="doubling">Удвоение с cap</option><option value="sqrt">Локальная √-эвристика</option><option value="heartbeat">Heartbeat-inspired (20h)</option><option value="guided">Local guided ceil(R/P)</option></select></label></div>
+<p>У каждого значения указан статус. Микропроба без конкуренции — лишь proxy для соответствующего блока. Неизмеренные части остаются допущениями. 49 нс и 75 мкс из старых экспериментов автоматически не подставляются.</p>
+<div id="lab-costs" class="lab-costs"></div>
+<label>Ёмкость очереди на поток <input id="lab-queue" class="lab-number" type="number" min="1" value="256"></label>
+<p>При заполнении очереди разбиение не публикуется, владелец продолжает свою работу; новые задания могут ожидать допуска. Это модель bounded backpressure, не дословный протокол C++.</p>
+</details>
+<section id="lab-hardware" class="lab-surface"><div class="lab-section-heading"><span class="lab-step">03</span><div><h3>Что измерено на этой машине</h3><p>Свежие процессы, тёплые вызовы, без трассировки. Прокси операций отдельно от end-to-end A/B.</p></div></div><div id="lab-measurement-status"></div><div id="lab-measurement-primitives"></div><div id="lab-real-ab"></div><div id="lab-model-check"></div></section>
+<section id="lab-math" class="lab-surface"><div class="lab-section-heading"><span class="lab-step">04</span><div><h3>Как считается время</h3><p>Формулы описывают эту модель; границы применимости важны не меньше коэффициентов.</p></div></div>
+<div class="lab-equations">
+<article><h4>Работа и паттерн</h4><code>wᵢ = u · f(i), W = Σᵢ wᵢ</code><p>u — время базовой итерации. Для хвоста f=16 у последних 25%, для кластеров f=6, для одной тяжёлой итерации f=32. Измеренный u оценивается по последовательному запуску того же тела.</p></article>
+<article><h4>Операции и конкуренция</h4><code>sₒ = max(tworker, tresource), eₒ = sₒ + cₒ</code><p>Запрос ждёт освобождения своей очереди или tail-слота. Полезная порция длится Σ wᵢ. Эта сериализация — упрощение, не модель MESI/NUMA.</p></article>
+<article><h4>Баланс processor-time</h4><code>P · T = W + H + I</code><p>H — обслуживание и ожидание занятого ресурса; I — оставшийся простой до общего завершения. Один микросекундный простой восьми потоков — 8 processor·мкс.</p></article>
+<article><h4>Нижняя граница</h4><code>T ≥ max(W/P, Srelease)</code><p>Srelease — самый ранний конец цепочки зависимостей при бесконечном числе работников и неделимых итерациях. Это граница полезной работы, не прогноз.</p></article>
+<article><h4>Проверяемый static-прогноз</h4><code>T̂static = Lempty + maxⱼ Σᵢ∈Aⱼ ŵᵢ</code><p>Lempty — измеренный пустой запуск; ŵᵢ — одноядерная оценка тела. Не учитывает перекрытие запуска, различия ядер и изменение стоимости под конкуренцией. Проверяем на нагрузках, не использованных для u.</p></article>
+<article><h4>Адаптивная порция</h4><code>τ = √(P · h · T̂owner / (1 + idle/P))</code><p>Локальная исследовательская эвристика. Вариант 20h — heartbeat-inspired, local-guided — ceil(R/P). Это не доказанные реализации всех алгоритмов из статей.</p></article>
+</div></section>
+<details class="lab-surface"><summary>Сохранить или перенести эксперимент</summary><div class="viz-row"><button class="btn" id="lab-export">Экспорт JSON</button><label>Импорт <input id="lab-import" type="file" accept=".json"></label></div></details>
+<details id="lab-evidence" class="lab-surface"><summary id="lab-evidence-title">Источники и применимость оценок</summary><div id="lab-sources"></div>
+<details><summary>Все выделенные формулы из наших двух исследовательских сводок</summary><div id="lab-formulas"></div></details>
+<details><summary>Все таблицы оценок и результатов из сводок</summary><div id="lab-tables"></div></details>
+<details><summary>Полный снимок исходных сводок (включая оценки в тексте)</summary><div id="lab-documents"></div></details>
+</details>
+</main></body></html>

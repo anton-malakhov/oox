@@ -36,7 +36,9 @@ set(OOX_ALLOCATOR "system" CACHE STRING "Task allocation backend for TBB OOX tas
 set_property(CACHE OOX_ALLOCATOR PROPERTY STRINGS tbb system jemalloc)
 set(OOX_BACKENDS)
 
-find_package(benchmark REQUIRED)
+if(NOT TARGET benchmark::benchmark)
+  find_package(benchmark REQUIRED)
+endif()
 
 if(OOX_ALLOCATOR STREQUAL "system")
   message(STATUS "Building OOX benchmarks with system malloc task allocation")
@@ -95,6 +97,7 @@ if(OOX_ENABLE_EIGEN)
   message(STATUS "Building with the bundled Eigen scheduler")
   list(APPEND OOX_BACKENDS EIGEN)
   list(APPEND EIGEN_LIBS ${PROJECT_NAME}::eigen)
+  list(APPEND EIGEN_LOOP_MODES EIGEN_AUTO_LOOP EIGEN_RAPID_GROUP_LOOP EIGEN_RAPID_AUTO_LOOP)
 endif()
 
 foreach(bench IN LISTS OOX_BENCHMARKS)
@@ -110,6 +113,8 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
         set(bench_ctest_filter "^BenchAccounts/10/100000$")
       elseif(bench STREQUAL "bench_shared_var_get_heavy")
         set(bench_ctest_filter "^BenchGetHeavy.*threads:2$")
+      elseif(bench STREQUAL "bench_loops")
+        set(bench_ctest_filter "/64(/|$)")
       endif()
       add_executable(${bench}_${mode}.${suffix} ${bench}.cpp)
       target_compile_definitions(${bench}_${mode}.${suffix} PRIVATE PARALLEL=${suffix} HAVE_${mode})
@@ -119,6 +124,13 @@ foreach(bench IN LISTS OOX_BENCHMARKS)
                COMMAND ${bench}_${mode}.${suffix}
                        --benchmark_min_time=${OOX_BENCHMARK_CTEST_MIN_TIME}
                        --benchmark_filter=${bench_ctest_filter})
+      set_tests_properties(${bench}_${mode}.${suffix} PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Failed to match any benchmarks"
+        TIMEOUT 120)
+      if(bench STREQUAL "bench_loops")
+        set_tests_properties(${bench}_${mode}.${suffix} PROPERTIES
+          LABELS backend-loops ENVIRONMENT "BENCH_NUM_THREADS=2")
+      endif()
     endforeach()
   endforeach()
 endforeach()
@@ -172,4 +184,11 @@ endif()
 
 if(OOX_BUILD_SCHEDULER_EVALS)
   add_subdirectory(scheduler_eval)
+  if(TBB_FOUND)
+    add_executable(test_eval_tbb_grain scheduler_eval/tests/test_tbb_grain.cpp)
+    target_link_libraries(test_eval_tbb_grain PRIVATE ${PROJECT_NAME} TBB::tbb)
+    add_test(NAME scheduler_eval_tbb_grain COMMAND test_eval_tbb_grain)
+    set_tests_properties(scheduler_eval_tbb_grain PROPERTIES LABELS scheduler-eval)
+    add_dependencies(scheduler_eval_all test_eval_tbb_grain)
+  endif()
 endif()
