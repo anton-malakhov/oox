@@ -39,8 +39,11 @@ bool CheckScan() {
   std::vector<std::uint64_t> values(1024, 1);
   scheduler_eval::ExclusiveScan(values);
   for (std::size_t i = 0; i < values.size(); ++i)
-    if (values[i] != i)
+    if (values[i] != i) {
+      std::cerr << "scan size=" << values.size() << " index=" << i
+                << " expected=" << i << " actual=" << values[i] << '\n';
       return false;
+    }
   return true;
 }
 
@@ -52,15 +55,26 @@ bool CheckSpmv() {
     std::vector<double> input(matrix.columns, 2.0), actual;
     scheduler_eval::Spmv(matrix, input, actual);
     const auto expected = scheduler_eval::SpmvSerial(matrix, input);
+    if (actual.size() != expected.size()) {
+      std::cerr << "spmv kind=" << static_cast<int>(kind)
+                << " rows=31 columns=47 seed=1 expected_size=" << expected.size()
+                << " actual_size=" << actual.size() << '\n';
+      return false;
+    }
     for (std::size_t i = 0; i < actual.size(); ++i)
-      if (!Close(actual[i], expected[i]))
+      if (!Close(actual[i], expected[i])) {
+        std::cerr << "spmv kind=" << static_cast<int>(kind)
+                  << " rows=31 columns=47 seed=1 row=" << i
+                  << " expected=" << expected[i] << " actual=" << actual[i] << '\n';
         return false;
+      }
   }
   return true;
 }
 
 #ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
 bool CheckBfs() {
+  std::cerr << "case bfs fixtures and generated graphs\n";
   const auto grid = scheduler_eval::MakeGraph(scheduler_eval::GraphKind::PaslSquareGrid, 8);
   if (grid.offsets != std::vector<std::size_t>{0, 2, 4, 6, 8} ||
       grid.edges != std::vector<std::uint32_t>{1, 2, 0, 3, 3, 0, 2, 1})
@@ -165,6 +179,7 @@ bool CheckBfs() {
         scheduler_eval::GraphKind::CubeGrid,
         scheduler_eval::GraphKind::SmallWorld}) {
     const auto graph = scheduler_eval::MakeGraph(kind, 1024);
+    std::cerr << "case bfs kind=" << static_cast<int>(kind) << " scale=1024\n";
     const auto expected = scheduler_eval::BfsSerial(graph);
     if (scheduler_eval::BfsFlat(graph) != expected ||
         scheduler_eval::BfsNested(graph, 8) != expected ||
@@ -198,6 +213,8 @@ bool CheckPrimaryWorkloads() {
     for (const auto size :
          std::array<std::size_t, 7>{0, 1, 2, 3, 17, 257, 4099}) {
       const auto points = scheduler_eval::MakePoints(kind, size, 29 + size);
+      std::cerr << "case hull kind=" << static_cast<int>(kind)
+                << " size=" << size << " seed=" << 29 + size << '\n';
       auto expected = scheduler_eval::ConvexHullSerial(points);
       scheduler_eval::ConvexHullMetrics metrics;
       auto actual = scheduler_eval::ConvexHullParallel(points, &metrics);
@@ -221,6 +238,8 @@ bool CheckPrimaryWorkloads() {
     for (const auto size :
          std::array<std::size_t, 7>{0, 1, 2, 7, 255, 2047, 4099}) {
       const auto keys = scheduler_eval::MakeKeys(kind, size, 41 + size);
+      std::cerr << "case keys kind=" << static_cast<int>(kind)
+                << " size=" << size << " seed=" << 41 + size << '\n';
       const auto pairs =
           scheduler_eval::MakeKeyValues(kind, size, 41 + size);
       scheduler_eval::DedupMetrics dedup_metrics;
@@ -294,6 +313,9 @@ bool CheckIntrusivePtrOrdering() {
 } // namespace
 
 int main() {
+  std::cerr.precision(17);
+  std::cerr << "mode=" << scheduler_eval::ModeName()
+            << " requested_threads=" << GetNumThreads() << '\n';
   scheduler_eval::Initialize();
   const std::vector<double> values(1003, 1.25);
   const bool bfs_ok =
