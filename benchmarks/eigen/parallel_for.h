@@ -136,7 +136,9 @@ inline void InitParallel(size_t threadsNum) {
 #endif
 #endif
 #ifdef TBB_MODE
+#ifndef OOX_EVAL_UNPINNED
   static PinningObserver pinner; // just init observer
+#endif
   static tbb::global_control threadLimit(
       tbb::global_control::max_allowed_parallelism, threadsNum);
 #endif

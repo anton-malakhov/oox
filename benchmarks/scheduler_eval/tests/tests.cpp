@@ -181,10 +181,26 @@ bool CheckBfs() {
     const auto graph = scheduler_eval::MakeGraph(kind, 1024);
     std::cerr << "case bfs kind=" << static_cast<int>(kind) << " scale=1024\n";
     const auto expected = scheduler_eval::BfsSerial(graph);
-    if (scheduler_eval::BfsFlat(graph) != expected ||
-        scheduler_eval::BfsNested(graph, 8) != expected ||
-        scheduler_eval::BfsAdaptive(graph, std::chrono::microseconds(20)) !=
-            expected)
+    const auto matches = [&](const char *variant, const std::vector<int> &actual) {
+      if (actual.size() != expected.size()) {
+        std::cerr << "bfs variant=" << variant << " kind=" << static_cast<int>(kind)
+                  << " scale=1024 expected_size=" << expected.size()
+                  << " actual_size=" << actual.size() << '\n';
+        return false;
+      }
+      for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (actual[i] != expected[i]) {
+          std::cerr << "bfs variant=" << variant << " kind=" << static_cast<int>(kind)
+                    << " scale=1024 vertex=" << i << " expected=" << expected[i]
+                    << " actual=" << actual[i] << '\n';
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!matches("flat", scheduler_eval::BfsFlat(graph)) ||
+        !matches("nested", scheduler_eval::BfsNested(graph, 8)) ||
+        !matches("adaptive", scheduler_eval::BfsAdaptive(graph, std::chrono::microseconds(20))))
       return false;
   }
   return true;
@@ -316,25 +332,48 @@ int main() {
   std::cerr.precision(17);
   std::cerr << "mode=" << scheduler_eval::ModeName()
             << " requested_threads=" << GetNumThreads() << '\n';
+  const char *filter = std::getenv("OOX_EVAL_CHECK");
+  const std::string_view selected = filter ? filter : "";
+  constexpr std::array<std::string_view, 10> checks{
+      "scan", "spmv", "bfs", "synthetic", "primary", "extended", "reduce",
+      "metrics", "intrusive", "granularity"};
+  if (filter && std::find(checks.begin(), checks.end(), selected) == checks.end()) {
+    std::cerr << "invalid OOX_EVAL_CHECK='" << selected << "'; expected one of:";
+    for (const auto check : checks) std::cerr << ' ' << check;
+    std::cerr << '\n';
+    return 2;
+  }
+#ifndef SCHEDULER_EVAL_HAS_NESTED_BFS
+  if (selected == "bfs") {
+    std::cerr << "OOX_EVAL_CHECK=bfs is unavailable for this mode\n";
+    return 2;
+  }
+#endif
+  const auto run = [&](const char *name, const char *label, auto &&check) {
+    if (filter && selected != name) return true;
+    std::cerr << "START mode=" << scheduler_eval::ModeName() << " check=" << name << '\n';
+    const bool passed = Report(label, check());
+    std::cerr << (passed ? "PASS" : "FAIL") << " mode=" << scheduler_eval::ModeName()
+              << " check=" << name << '\n';
+    return passed;
+  };
   scheduler_eval::Initialize();
   const std::vector<double> values(1003, 1.25);
-  const bool bfs_ok =
+  bool ok = true;
 #ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
-      CheckBfs();
-#else
-      true;
+  ok &= run("bfs", "bfs", CheckBfs);
 #endif
-  bool ok = Report("scan", CheckScan());
-  ok &= Report("spmv", CheckSpmv());
-  ok &= Report("bfs", bfs_ok);
-  ok &= Report("synthetic costs", CheckSyntheticCosts());
-  ok &= Report("primary workloads", CheckPrimaryWorkloads());
-  ok &= Report("extended workloads", scheduler_eval::CheckExtendedWorkloads());
-  ok &= Report("intrusive pointer ordering", CheckIntrusivePtrOrdering());
-  ok &= Report("granularity estimator", CheckGranularityEstimator());
-  ok &= Report("scheduler metrics", CheckSchedulerMetrics());
-  ok &= Report("blocked reduce",
-               Close(scheduler_eval::BlockedReduce(values, 37), 1253.75));
+  ok &= run("scan", "scan", CheckScan);
+  ok &= run("spmv", "spmv", CheckSpmv);
+  ok &= run("synthetic", "synthetic costs", CheckSyntheticCosts);
+  ok &= run("primary", "primary workloads", CheckPrimaryWorkloads);
+  ok &= run("extended", "extended workloads", scheduler_eval::CheckExtendedWorkloads);
+  ok &= run("intrusive", "intrusive pointer ordering", CheckIntrusivePtrOrdering);
+  ok &= run("granularity", "granularity estimator", CheckGranularityEstimator);
+  ok &= run("metrics", "scheduler metrics", CheckSchedulerMetrics);
+  ok &= run("reduce", "blocked reduce", [&] {
+    return Close(scheduler_eval::BlockedReduce(values, 37), 1253.75);
+  });
   if (!ok)
     std::cerr << "scheduler evaluation correctness test failed\n";
   return ok ? 0 : 1;
