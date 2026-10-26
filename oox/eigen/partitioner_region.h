@@ -9,12 +9,12 @@ namespace oox::detail::eigen_pool::partitioner_detail {
 inline constexpr unsigned max_depth = std::numeric_limits<size_t>::digits;
 
 struct Metrics {
-  std::atomic<size_t> owner_ranges{0};
-  std::atomic<size_t> range_tasks{0};
-  std::atomic<size_t> initial_tasks{0};
-  std::atomic<size_t> stolen_tasks{0};
-  std::atomic<size_t> donated_ranges{0};
-  std::atomic<size_t> private_chunks{0};
+  scheduler_sync::atomic<size_t> owner_ranges{0};
+  scheduler_sync::atomic<size_t> range_tasks{0};
+  scheduler_sync::atomic<size_t> initial_tasks{0};
+  scheduler_sync::atomic<size_t> stolen_tasks{0};
+  scheduler_sync::atomic<size_t> donated_ranges{0};
+  scheduler_sync::atomic<size_t> private_chunks{0};
 };
 
 class Region final : public SmallObjectAllocated<Region> {
@@ -38,7 +38,7 @@ public:
   bool IsComplete() const noexcept {
     return remaining.load(std::memory_order_acquire) == 1;
   }
-  std::atomic<bool> &RapidPublication() noexcept { return rapid_unpublished; }
+  scheduler_sync::atomic<bool> &RapidPublication() noexcept { return rapid_unpublished; }
   bool BeginWork() noexcept {
     if (IsCancelled())
       return false;
@@ -74,7 +74,7 @@ public:
     (void)pending;
   }
   void Fail(std::exception_ptr error) noexcept {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    std::lock_guard<scheduler_sync::mutex> lock(error_mutex);
     if (!exception)
       exception = std::move(error);
     cancelled.store(true, std::memory_order_release);
@@ -89,14 +89,14 @@ public:
 
 private:
   const bool asynchronous_roots_;
-  std::atomic<size_t> remaining{1};
+  scheduler_sync::atomic<size_t> remaining{1};
   static constexpr size_t closed = size_t{1} << (max_depth - 1);
-  std::atomic<size_t> active{0};
-  std::atomic<bool> cancelled{false};
-  std::atomic<bool> rapid_unpublished{false};
+  scheduler_sync::atomic<size_t> active{0};
+  scheduler_sync::atomic<bool> cancelled{false};
+  scheduler_sync::atomic<bool> rapid_unpublished{false};
   // One not-yet-started donation per region bounds stale/contended idle hints.
-  std::atomic<bool> donation_pending{false};
-  std::mutex error_mutex;
+  scheduler_sync::atomic<bool> donation_pending{false};
+  scheduler_sync::mutex error_mutex;
   std::exception_ptr exception;
 };
 

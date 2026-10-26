@@ -17,7 +17,7 @@ public:
               Branch<Node, true> &branch) noexcept
       : region_(region), function_(function), state_(state), branch_(branch),
         parent_(branch.Parent()), head_(range.begin), end_(range.end),
-        begin_(range.begin), grain_(range.grain), owner_(std::this_thread::get_id()) {
+        begin_(range.begin), grain_(range.grain), owner_(scheduler_sync::this_thread::get_id()) {
     state_.divisor = 0;
   }
   void Close() noexcept {
@@ -95,9 +95,9 @@ private:
   State state_;
   Branch<Node, true> &branch_;
   Join *parent_;
-  std::atomic<size_t> head_, end_;
+  scheduler_sync::atomic<size_t> head_, end_;
   const size_t begin_, grain_;
-  const std::thread::id owner_;
+  const scheduler_sync::thread::id owner_;
 #ifdef OOX_SCHEDULER_TRACE
   const uint64_t trace_parent_ = ::oox::scheduler_trace::Current();
 #endif

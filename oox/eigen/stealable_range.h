@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <thread>
 #include "scheduler_trace.h"
+#include "scheduler_sync.h"
 
 namespace oox::detail::eigen_pool {
 struct Task;
@@ -15,7 +16,7 @@ class StealableRange {
 public:
   virtual ~StealableRange() { assert(!slot_); }
   virtual Task *Steal() noexcept = 0;
-  void Publish(std::atomic<uintptr_t> &slot) noexcept {
+  void Publish(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
     assert(!slot_ && !(reinterpret_cast<uintptr_t>(this) & locked));
     slot_ = &slot;
     previous_ = Lock(slot);
@@ -43,7 +44,7 @@ public:
     }
     OOX_SCHED_COUNT(OwnerWaitSpins, spins);
   }
-  static Task *TrySteal(std::atomic<uintptr_t> &slot) noexcept {
+  static Task *TrySteal(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
     uintptr_t current = slot.load(std::memory_order_acquire);
     if (!current) return nullptr;
     if ((current & locked) || !slot.compare_exchange_strong(current, current | locked,
@@ -60,15 +61,9 @@ public:
 private:
   static constexpr uintptr_t locked = 1;
   static void Relax() noexcept {
-#if defined(__x86_64__)
-    asm volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-    asm volatile("yield" ::: "memory");
-#else
-    std::this_thread::yield();
-#endif
+    scheduler_sync::Relax();
   }
-  static uintptr_t Lock(std::atomic<uintptr_t> &slot) noexcept {
+  static uintptr_t Lock(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
     uintptr_t current = slot.load(std::memory_order_acquire);
     for (;;) {
       if (!(current & locked) && slot.compare_exchange_weak(current, current | locked,
@@ -77,7 +72,7 @@ private:
       current = slot.load(std::memory_order_acquire);
     }
   }
-  std::atomic<uintptr_t> *slot_ = nullptr;
+  scheduler_sync::atomic<uintptr_t> *slot_ = nullptr;
   uintptr_t previous_ = 0;
 };
 } // namespace oox::detail::eigen_pool

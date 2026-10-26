@@ -35,7 +35,7 @@ struct LoopRange {
 template <typename F, typename State> class Work;
 
 template <bool Enabled> struct TaskOwner {};
-template <> struct TaskOwner<true> { std::thread::id owner; };
+template <> struct TaskOwner<true> { scheduler_sync::thread::id owner; };
 template <bool Enabled> struct TaskPlacement {};
 template <> struct TaskPlacement<true> {
   size_t hint = partitioning::no_affinity;
@@ -51,7 +51,7 @@ struct TaskContext : TaskOwner<State::adaptive>, TaskPlacement<State::uses_affin
   explicit TaskContext(Ownerless) noexcept {}
   TaskContext() noexcept {
     if constexpr (State::adaptive)
-      this->owner = std::this_thread::get_id();
+      this->owner = scheduler_sync::this_thread::get_id();
   }
   void SetHint(const State &state) noexcept {
     if constexpr (State::uses_affinity)
@@ -83,10 +83,10 @@ public:
       region_.metrics->range_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   ~Work() override = default;
-  std::thread::id PublishingThreadId() const noexcept requires(State::adaptive) {
+  scheduler_sync::thread::id PublishingThreadId() const noexcept requires(State::adaptive) {
     return context_.owner;
   }
-  void SetPublishingThreadId(std::thread::id owner) noexcept requires(State::adaptive) {
+  void SetPublishingThreadId(scheduler_sync::thread::id owner) noexcept requires(State::adaptive) {
     context_.owner = owner;
   }
   void operator()() final {

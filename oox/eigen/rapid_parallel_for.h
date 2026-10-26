@@ -25,7 +25,7 @@ public:
       for (size_t i = 0; i < frontier_.Size(); ++i) region_.AddTask();
   }
   void SetAdmission(const partitioner_detail::WorkLease *admission) noexcept { admission_ = admission; }
-  std::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
+  scheduler_sync::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
   size_t SeedCount() const noexcept { return frontier_.Size(); }
 
   void Run(size_t slot) noexcept final {
@@ -52,7 +52,7 @@ private:
   F &function_;
   SeedFrontier<State, Capacity> frontier_;
   const partitioner_detail::WorkLease *admission_ = nullptr;
-  std::atomic<size_t> remaining_{0};
+  scheduler_sync::atomic<size_t> remaining_{0};
 };
 
 template <size_t Capacity, typename F, typename State>
@@ -115,7 +115,7 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end, F &&function,
     throw std::invalid_argument("Rapid partitioners require a resident-capable pool");
   if (pool.IsCancelled()) return;
   grain = std::max(grain, size_t{1});
-  if (current_resident_state || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
+  if (CurrentResidentState() || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
       end - begin <= grain || !pool.HasResidentAvailableWorker(group.domain)) {
     OOX_SCHED_EVENT("rapid_fallback", ::oox::scheduler_trace::Current());
     return pool.RunInlineWork([&] {

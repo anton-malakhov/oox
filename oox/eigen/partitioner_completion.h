@@ -38,7 +38,7 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
     while (node) {
       // Capture metadata before the RMW can allow FinishExecution to free us.
       PeerJoin *parent = node->parent;
-      std::thread::id caller;
+      scheduler_sync::thread::id caller;
       if constexpr (requires(const Owner &owner) { owner.PublishingThreadId(); }) {
         if (IsRoot(parent))
           caller = static_cast<const Owner *>(node)->PublishingThreadId();
@@ -52,8 +52,8 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
       if (IsRoot(parent)) {
         // The first task was published by the synchronous caller. That thread
         // cannot be parked while executing this completion; other threads notify.
-        CompleteRoot(parent, caller == std::thread::id{} ||
-                             caller != std::this_thread::get_id());
+        CompleteRoot(parent, caller == scheduler_sync::thread::id{} ||
+                             caller != scheduler_sync::this_thread::get_id());
         return;
       }
       node = parent;
@@ -67,8 +67,8 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
   static constexpr unsigned branch_mask = 3;
   static constexpr unsigned executing = 4;
   PeerJoin *const parent;
-  std::atomic<unsigned> references{executing | 2};
-  std::atomic<bool> stolen{false};
+  scheduler_sync::atomic<unsigned> references{executing | 2};
+  scheduler_sync::atomic<bool> stolen{false};
 };
 
 // Non-adaptive policies already join through Region's task count.

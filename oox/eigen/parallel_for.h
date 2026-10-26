@@ -31,7 +31,7 @@ public:
     const auto workers = pool.NumThreads();
     const auto current = pool.CurrentThreadId();
     const auto first = current == std::size_t(-1) ? 0 : current;
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<scheduler_sync::mutex> lock(mutex_);
     if (history_ && history_.use_count() != 1) {
       lock.unlock();
       return partitioning::AffinityPartitionState(
@@ -45,7 +45,7 @@ public:
   }
 
 private:
-  std::mutex mutex_;
+  scheduler_sync::mutex mutex_;
   ThreadPool *pool_ = nullptr;
   std::shared_ptr<partitioning::AffinityHistory> history_;
 };
@@ -108,7 +108,7 @@ void Process(Region &region, F *function, LoopRange range,
     }
     if constexpr (State::adaptive && CheckSteal) {
       if (state.NeedsStealCheck()) {
-        const bool stolen = std::this_thread::get_id() != context.owner;
+        const bool stolen = scheduler_sync::this_thread::get_id() != context.owner;
         const bool peer_active =
             stolen && parent && !Join::IsRoot(parent) && parent->HasPeer();
         if (state.CheckStolen(stolen, peer_active)) {

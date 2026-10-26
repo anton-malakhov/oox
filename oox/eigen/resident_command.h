@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include "scheduler_sync.h"
 
 namespace oox::detail::eigen_pool {
 
@@ -27,11 +28,11 @@ public:
 namespace internal {
 
 struct alignas(128) ResidentBroadcast {
-  std::atomic<uint64_t> generation{0};
-  alignas(128) std::atomic_flag busy = ATOMIC_FLAG_INIT;
-  std::atomic<uint64_t> mask{0};
+  scheduler_sync::atomic<uint64_t> generation{0};
+  alignas(128) scheduler_sync::atomic_flag busy{};
+  scheduler_sync::atomic<uint64_t> mask{0};
   ResidentTask *task = nullptr;
-  std::atomic<size_t> *completion = nullptr;
+  scheduler_sync::atomic<size_t> *completion = nullptr;
   uint64_t epoch = 0;
   bool packed_completion = false;
   size_t first_slot = 1;

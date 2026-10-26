@@ -52,13 +52,22 @@ struct RapidStartGroup {
 
 inline thread_local RapidDomainState *current_resident_state = nullptr;
 
+inline RapidDomainState *&CurrentResidentState() noexcept {
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+  struct Tag {};
+  return scheduler_sync::Local<RapidDomainState *, Tag>();
+#else
+  return current_resident_state;
+#endif
+}
+
 class ScopedResidentState {
 public:
   explicit ScopedResidentState(RapidDomainState &state) noexcept
-      : previous_(std::exchange(current_resident_state, &state)) {}
+      : previous_(std::exchange(CurrentResidentState(), &state)) {}
   ScopedResidentState(const ScopedResidentState &) = delete;
   ScopedResidentState &operator=(const ScopedResidentState &) = delete;
-  ~ScopedResidentState() { current_resident_state = previous_; }
+  ~ScopedResidentState() { CurrentResidentState() = previous_; }
 
 private:
   RapidDomainState *previous_;
@@ -68,7 +77,7 @@ private:
 class ResidentCohort {
 public:
   ResidentCohort(ThreadPool &pool, const unsigned *workers, size_t count,
-                 std::atomic<size_t> &completion) noexcept
+                 scheduler_sync::atomic<size_t> &completion) noexcept
       : pool_(pool), workers_(workers), count_(count), completion_(completion),
         epoch_(count > 1 ? pool.NextResidentEpoch() : 0) {}
   ResidentCohort(const ResidentCohort &) = delete;
@@ -101,7 +110,7 @@ private:
   ThreadPool &pool_;
   const unsigned *workers_;
   size_t count_;
-  std::atomic<size_t> &completion_;
+  scheduler_sync::atomic<size_t> &completion_;
   uint64_t epoch_;
   uint64_t done_mask_ = 0;
   size_t batch_ = size_t(-1);
@@ -122,7 +131,7 @@ public:
 
   void RunCaller() noexcept { RunSlot(0); }
 
-  std::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
+  scheduler_sync::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
 
   bool IsComplete() const noexcept {
     return remaining_.load(std::memory_order_acquire) == 0;
@@ -149,7 +158,7 @@ private:
           !cancelled_.load(std::memory_order_acquire))
         std::invoke(function_, first, last);
     } catch (...) {
-      std::lock_guard<std::mutex> lock(exception_mutex_);
+      std::lock_guard<scheduler_sync::mutex> lock(exception_mutex_);
       if (!exception_) {
         exception_ = std::current_exception();
         cancelled_.store(true, std::memory_order_release);
@@ -162,9 +171,9 @@ private:
   size_t begin_;
   size_t end_;
   size_t slots_;
-  std::atomic<size_t> remaining_;
-  std::atomic<bool> cancelled_{false};
-  std::mutex exception_mutex_;
+  scheduler_sync::atomic<size_t> remaining_;
+  scheduler_sync::atomic<bool> cancelled_{false};
+  scheduler_sync::mutex exception_mutex_;
   std::exception_ptr exception_;
 };
 
@@ -181,7 +190,7 @@ void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
   if (!pool.UsesResidentBusyWait()) {
     throw std::invalid_argument("resident Rapid requires a resident-busy pool");
   }
-  if (current_resident_state == group.state || group.domain.Size() == 1) {
+  if (CurrentResidentState() == group.state || group.domain.Size() == 1) {
     if (!pool.IsCancelled())
       std::invoke(function, begin, end);
     return;

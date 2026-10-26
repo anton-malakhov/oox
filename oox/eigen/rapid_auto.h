@@ -84,7 +84,7 @@ public:
               typename partitioner_detail::TaskContext<State>::Ownerless{}}, admission_);
     });
   }
-  std::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
+  scheduler_sync::atomic<size_t> &CompletionCounter() noexcept { return remaining_; }
   size_t SeedCount() const noexcept { return seed_count_; }
   Seed GetSeed(size_t index) const noexcept {
     assert(index < seed_count_);
@@ -108,7 +108,7 @@ private:
   Range root_range_{0, 0, 1};
   State root_state_{0};
   size_t seed_count_ = 0;
-  std::atomic<size_t> remaining_{0};
+  scheduler_sync::atomic<size_t> remaining_{0};
 };
 
 template <size_t Participants, typename F>
@@ -175,10 +175,10 @@ void ParallelForAuto(RapidStartGroup group, size_t begin, size_t end,
     throw std::invalid_argument("Rapid auto requires a resident-capable pool");
   if (pool.IsCancelled()) return;
   grain = std::max(grain, size_t{1});
-  if (current_resident_state || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
+  if (CurrentResidentState() || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
       end - begin <= grain || !pool.HasResidentAvailableWorker(group.domain)) {
     OOX_SCHED_EVENT("rapid_fallback", ::oox::scheduler_trace::Current(),
-        (current_resident_state ? 1u : 0u) | (pool.IsExecutingTask() ? 2u : 0u) |
+        (CurrentResidentState() ? 1u : 0u) | (pool.IsExecutingTask() ? 2u : 0u) |
         (pool.NumThreads() == 1 ? 4u : 0u) | (end - begin <= grain ? 8u : 0u),
         pool.ResidentAvailableWorkers(group.domain));
     // Ordinary Auto executes its root directly on this caller. Preserve the
