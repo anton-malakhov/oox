@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Модель и реальная запись</title><link rel="stylesheet" href="style.css"><script defer src="compare.js"></script>
+<style>.comparison{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.comparison iframe{width:100%;height:1200px;border:1px solid var(--border)}@media(max-width:850px){.comparison{grid-template-columns:1fr}}</style>
+</head><body><main>
+<nav><a href="/">Учебный режим</a> · <a href="trace.html">Все реальные трассы</a> · <a href="lab.html">Редактор схем и оценок</a></nav>
+<h2>Модель ↔ реальная C++ запись</h2>
+<label class="form-label">Реализация <select id="implementation" class="form-select"></select></label>
+<p id="provenance"></p>
+<p>Слева — условные события, справа — измеренные микросекунды с накладными расходами трассировки, не benchmark. Управление независимое: одинаковый шаг не означает одинаковое время. Бледное — завершено, насыщенное — активный блок. Справа очереди/остатки не дорисованы; стрелки показывают выбранную историю подтверждённых передач.</p>
+<div class="comparison"><section><h3>Учебная модель</h3><iframe id="model-frame" title="Учебная модель выбранного планировщика"></iframe></section><section><h3>Измеренная запись</h3><iframe id="trace-frame" title="Реальная трасса выбранного планировщика"></iframe></section></div>
+<script id="trace-data" type="application/json">[]</script>
+</main></body></html>

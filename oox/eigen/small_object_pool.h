@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include "scheduler_sync.h"
 
 #include <atomic>
 #include <cstddef>
@@ -16,8 +17,8 @@ namespace oox::detail::eigen_pool {
 namespace internal {
 
 #ifdef OOX_EIGEN_SMALL_OBJECT_POOL_TESTING
-inline std::atomic<size_t> small_object_blocks{0};
-inline std::atomic<size_t> small_object_owners{0};
+inline scheduler_sync::atomic<size_t> small_object_blocks{0};
+inline scheduler_sync::atomic<size_t> small_object_owners{0};
 #endif
 
 // A block retains its owner independently of the object's lifetime. Closing
@@ -136,19 +137,28 @@ class SmallObjectPool {
     static constexpr size_t cache_limit = 256;
     Block *private_list = nullptr;
     size_t private_count = 0;
-    alignas(64) std::atomic<Block *> remote_list{nullptr};
-    std::atomic<size_t> remote_count{0};
-    std::atomic<size_t> references{1};
+    alignas(64) scheduler_sync::atomic<Block *> remote_list{nullptr};
+    scheduler_sync::atomic<size_t> remote_count{0};
+    scheduler_sync::atomic<size_t> references{1};
   };
 
   struct LocalOwner {
     ~LocalOwner() {
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+      // Twist resets its TLS slot before invoking this destructor. Do not
+      // re-enter Local() here: that would construct a second owner.
+      exiting = true;
+#else
       exiting_ = true;
       local_state_ = nullptr;
+#endif
       if (state)
         state->Close();
     }
     State *state = nullptr;
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+    bool exiting = false;
+#endif
   };
 
 public:
@@ -156,6 +166,16 @@ public:
   static constexpr size_t alignment = alignof(std::max_align_t);
 
   static void *Allocate() {
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+    // One virtual-thread TLS object models allocation and owner closure.
+    // Native ordering with unrelated, later TLS destructors is tested natively.
+    auto &owner = scheduler_sync::Local<LocalOwner, SmallObjectPool>();
+    if (owner.exiting)
+      return (new Block(nullptr))->storage;
+    if (!owner.state)
+      owner.state = new State;
+    return owner.state->Allocate()->storage;
+#else
     // A later thread-local destructor may allocate after our owner has closed.
     // Such objects use standalone blocks and can be freed by any thread.
     if (exiting_)
@@ -166,6 +186,7 @@ public:
       local_state_ = owner.state;
     }
     return local_state_->Allocate()->storage;
+#endif
   }
 
   static void Release(void *memory) noexcept {
@@ -174,7 +195,12 @@ public:
     State *owner = block->owner;
     if (!owner)
       delete block;
-    else if (owner == local_state_)
+    else if (owner ==
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+             scheduler_sync::Local<LocalOwner, SmallObjectPool>().state)
+#else
+             local_state_)
+#endif
       owner->ReturnLocal(block);
     else
       owner->ReturnRemote(block);

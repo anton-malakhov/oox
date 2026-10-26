@@ -70,7 +70,6 @@ void ParallelFor(size_t from, size_t to, Func &&func, size_t grainSize = 1) {
 #else
   static_assert(false, "Wrong TBB_MODE mode");
 #endif
-  // TODO: grain size?
 #if TBB_MODE == TBB_RAPID
 #if 0
   RapidGroup.parallel_ranges(from, to, [&](auto from, auto to, auto part) {
@@ -81,7 +80,7 @@ void ParallelFor(size_t from, size_t to, Func &&func, size_t grainSize = 1) {
 #endif
 #else
   tbb::parallel_for(
-      tbb::blocked_range(from, to),
+      tbb::blocked_range(from, to, std::max(size_t{1}, grainSize)),
       [&](const tbb::blocked_range<size_t> &range) {
         for (size_t i = range.begin(); i != range.end(); ++i) {
           func(i);
@@ -137,7 +136,9 @@ inline void InitParallel(size_t threadsNum) {
 #endif
 #endif
 #ifdef TBB_MODE
+#ifndef OOX_EVAL_UNPINNED
   static PinningObserver pinner; // just init observer
+#endif
   static tbb::global_control threadLimit(
       tbb::global_control::max_allowed_parallelism, threadsNum);
 #endif

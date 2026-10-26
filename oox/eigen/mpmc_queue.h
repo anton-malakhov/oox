@@ -35,6 +35,7 @@ SOFTWARE.
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include "scheduler_sync.h"
 
 #ifndef __cpp_aligned_new
 #ifdef _WIN32
@@ -116,7 +117,7 @@ template <typename T> struct Slot {
   T &&move() noexcept { return reinterpret_cast<T &&>(storage); }
 
   // Align to avoid false sharing between adjacent slots
-  alignas(hardwareInterferenceSize) std::atomic<size_t> turn = {0};
+  alignas(hardwareInterferenceSize) scheduler_sync::atomic<size_t> turn = {0};
   typename std::aligned_storage<sizeof(T), alignof(T)>::type storage;
 };
 
@@ -291,8 +292,8 @@ private:
   [[no_unique_address]] Allocator allocator_;
 
   // Align to avoid false sharing between head_ and tail_
-  alignas(hardwareInterferenceSize) std::atomic<size_t> head_;
-  alignas(hardwareInterferenceSize) std::atomic<size_t> tail_;
+  alignas(hardwareInterferenceSize) scheduler_sync::atomic<size_t> head_;
+  alignas(hardwareInterferenceSize) scheduler_sync::atomic<size_t> tail_;
 };
 } // namespace mpmc
 

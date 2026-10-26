@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scheduler trace laboratory</title>
+<style>
+:root { color-scheme: light dark; --bg: light-dark(#fafaf8,#171a20); --fg: light-dark(#192b38,#dce6ee); --muted: light-dark(#56616d,#a2aebc); --line: light-dark(#d8dfe4,#343d47); --panel: light-dark(#fff,#20252e); }
+* { box-sizing:border-box } body { margin:0; padding:24px; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg) }
+header { max-width:1500px; margin:auto } h1 { margin:0; font-size:24px; font-weight:600 } p { color:var(--muted); margin:6px 0 14px }
+.toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin:16px 0 }
+button,select,input { font:inherit; color:inherit } button,select { border:1px solid var(--line); padding:6px 12px; background:var(--panel); border-radius:6px } button { cursor:pointer } input[type=file] { max-width:350px }
+label { display:inline-flex; align-items:center; gap:6px } #panels { max-width:1500px; margin:auto } .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin:18px 0; padding:14px; overflow:hidden }
+.heading { display:flex; align-items:baseline; flex-wrap:wrap; gap:12px } h2 { font-size:17px; margin:0 } .stats { color:var(--muted); font-variant-numeric:tabular-nums } canvas { display:block; width:100%; touch-action:none; cursor:crosshair }
+.thread-legend { display:flex; flex-wrap:wrap; gap:12px; margin:8px 0; font-size:12px } .thread-legend span { display:inline-flex; align-items:center; gap:5px } .thread-legend i { width:11px; height:11px; display:inline-block; border-radius:2px }
+#detail { position:sticky; bottom:8px; white-space:pre-wrap; border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:12px; max-height:230px; overflow:auto; max-width:1500px; margin:auto; font:12px/1.5 ui-monospace,monospace }
+#status { color:var(--muted); white-space:pre-wrap } .warning { color:light-dark(#a34310,#ffb678) } .legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--muted) } .empty { padding:60px 24px; text-align:center; border:1px dashed var(--line); border-radius:10px } a { color:inherit }
+</style></head>
+<body>
+<header><h1>Scheduler trace laboratory</h1>
+<p>X — время · Y — диапазон итераций · цвет — поток</p>
+<div class="toolbar"><input id="files" type="file" accept=".json" multiple aria-label="Открыть записи запусков"><button id="clear">Очистить</button><label>Запуск <select id="wave"><option value="0">0</option><option value="all">Все</option></select></label><button id="fit">Весь интервал</button><button id="in">＋</button><button id="out">−</button></div>
+<div class="toolbar" id="modes" aria-label="Видимые режимы"></div>
+<div class="toolbar"><label><input type="checkbox" id="activation" checked>Активация</label><label><input type="checkbox" id="queues" checked>Очереди</label><label><input type="checkbox" id="steals" checked>Кражи</label><label><input type="checkbox" id="splits">Дробление</label><label><input type="checkbox" id="callbacks" checked>Callbacks</label></div>
+<details><summary>Управление и обозначения</summary>
+<div class="legend"><span>Сплошная → активация / очередь</span><span>Пунктирная отметка → успешная кража</span><span>Точечная → родитель / ребёнок</span></div>
+<p>Колесо — масштаб у курсора, перетаскивание — время; клик по задаче или стрелке — детали. Общая шкала времени для всех режимов, ноль — начало выбранного запуска. Пустое место не доказывает сон потока.</p>
+<p>Прямоугольник занимает свой диапазон [a, b) по вертикали и время выполнения по горизонтали. Цвет соответствует реальному потоку T; W — номер worker. При включённых callbacks видны отдельные итерации, иначе — выполняемые блоки. Цвета идентифицируют потоки внутри записи. При краже отметка охватывает переданный диапазон, её наконечник окрашен в цвет получателя. Hyperbolic — синтетическая форма нагрузки, не SpMV.</p></details>
+<p class="warning">Трассировка меняет тайминги и порядок работы. Это отладка, не benchmark.</p>
+<div id="status" role="status"></div></header>
+<main id="panels"><div class="empty">Откройте несколько trace JSON для сравнения режимов.</div></main>
+<pre id="detail" aria-live="polite">Выберите задачу или стрелку на временной шкале.</pre>
+<script id="trace-data" type="application/json">[]</script>
+<script src="model.js"></script>
+<script src="viewer.js"></script>
+</body></html>
