@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <utility>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 #ifdef TBB_MODE
 #include "tbb_pinner.h"
@@ -141,6 +143,14 @@ inline void InitParallel(size_t threadsNum) {
 #endif
   static tbb::global_control threadLimit(
       tbb::global_control::max_allowed_parallelism, threadsNum);
+  // Every warmup iteration blocks until all requested participants enter.
+  // A global control is only a ceiling; it cannot enlarge the active arena.
+  const size_t capacity = std::min(
+      static_cast<size_t>(tbb::this_task_arena::max_concurrency()),
+      tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism));
+  if (threadsNum > capacity)
+    throw std::invalid_argument("TBB warmup requested " + std::to_string(threadsNum) +
+        " participants, but the active arena/control limit is " + std::to_string(capacity));
 #endif
 #ifdef OMP_MODE
   static InitOnce ompInit{[threadsNum]() { omp_set_num_threads(threadsNum); }};

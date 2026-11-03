@@ -7,7 +7,9 @@ exec > >(tee /out/logs/session.log) 2>&1
 export BENCH_NUM_THREADS=${BENCH_NUM_THREADS:-8}
 unset PARLAY_NUM_THREADS OMP_NUM_THREADS
 { date -Is; uname -a; lscpu; "${CXX:-c++}" --version; cmake --version;
-  dpkg-query -W libtbb-dev;
+  dpkg-query -W build-essential clang cmake ninja-build git;
+  printf '#include <oneapi/tbb/version.h>\n' | "${CXX:-c++}" -dM -E -x c++ - |
+    grep -E '^#define (TBB_VERSION_(MAJOR|MINOR|PATCH)|TBB_INTERFACE_VERSION) ';
   printf 'BENCH_NUM_THREADS=%s\nSANITIZE=%s\nBUILD_JOBS=%s\nREPEATS=%s\nTEST_TIMEOUT=%s\n' \
     "$BENCH_NUM_THREADS" "${SANITIZE:-none}" "${BUILD_JOBS:-4}" "${REPEATS:-20}" "${TEST_TIMEOUT:-180}";
   printf 'ordinary: calibration/default limit; final: calibration=0 resident_limit=%s\n' "$BENCH_NUM_THREADS";

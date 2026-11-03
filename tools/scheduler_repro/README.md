@@ -9,7 +9,9 @@ and exits nonzero if any series fails. Every repeat's verbose CTest output is sa
 Prerequisites: Docker with a running Linux engine and at least eight CPUs available
 to its VM. An eight-thread request is not a CPU allocation. The TBB startup barrier
 may stall if the runtime cannot supply all participants. Do not restrict the
-container to fewer CPUs for the baseline run.
+container to fewer CPUs for the baseline run. Requests above the active TBB
+arena/control capacity are rejected before entering the blocking warmup; the
+harness never silently lowers the requested participant count.
 
 From the repository root (Bash):
 
@@ -31,7 +33,11 @@ an ARM host uses emulation: successful tests do not rule out native-x86 failures
 and elapsed times are not benchmark results. Keep source files unchanged during
 the run. Prefer a dedicated checkout for a reproducible snapshot.
 
-The Ubuntu base is pinned by digest. Apt package versions are recorded in the
+The Ubuntu base is pinned by digest. The image builds oneTBB 2022.3.0 at
+`f1862f38f83568d96e814e469ab61f88336cc595`, matching the repository submodule and
+minimum supported TBB version. This release handles ASan fake-stack addresses in
+its stack inspection; the upgrade is not evidence that reported scheduler races
+are fixed. Apt package versions are recorded in the
 image/environment logs rather than claimed to be immutable across future builds.
 Retain the built image (or its registry digest) to reproduce exact dependencies.
 

@@ -64,7 +64,7 @@ find_package(Threads REQUIRED)
 
 if (OOX_ENABLE_TBB)
   if (NOT OOX_LOCAL_TBB)
-    find_package(TBB 2021 QUIET)  # not REQUIRED
+    find_package(TBB 2022.3 QUIET)  # not REQUIRED
   endif ()
   if (NOT TBB_FOUND)
     execute_process(COMMAND git submodule update --init --depth=1 thirdparty/oneTBB/

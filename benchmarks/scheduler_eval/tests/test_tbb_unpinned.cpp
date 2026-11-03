@@ -5,7 +5,12 @@
 // Under LeakSanitizer this also checks that an unpinned startup does not
 // register an unused pinning observer whose proxy survives process shutdown.
 int main() {
-  InitParallel(static_cast<size_t>(GetNumThreads()));
+  try {
+    InitParallel(static_cast<size_t>(GetNumThreads()));
+  } catch (const std::invalid_argument &error) {
+    std::cerr << "scheduler initialization failed: " << error.what() << '\n';
+    return 2;
+  }
   std::array<int, 64> values{};
   ParallelFor(0, values.size(), [&](size_t i) { values[i] = int(i + 1); });
   for (size_t i = 0; i < values.size(); ++i) {

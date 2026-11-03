@@ -357,7 +357,12 @@ int main() {
               << " check=" << name << '\n';
     return passed;
   };
-  scheduler_eval::Initialize();
+  try {
+    scheduler_eval::Initialize();
+  } catch (const std::invalid_argument &error) {
+    std::cerr << "scheduler initialization failed: " << error.what() << '\n';
+    return 2;
+  }
   const std::vector<double> values(1003, 1.25);
   bool ok = true;
 #ifdef SCHEDULER_EVAL_HAS_NESTED_BFS
