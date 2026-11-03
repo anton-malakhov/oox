@@ -18,6 +18,7 @@ modes=(SERIAL_ELISION TBB_SIMPLE TBB_AUTO EIGEN_AUTO EIGEN_AUTO_RESIDENT EIGEN_S
 targets=("${modes[@]/#/test_scheduler_eval_}")
 targets+=(test_eval_dedup_spurious)
 targets+=(test_eval_unpinned_TBB_SIMPLE test_eval_unpinned_TBB_AUTO)
+targets+=(test_eval_tbb_capacity_TBB_SIMPLE test_eval_tbb_capacity_TBB_AUTO)
 options=()
 if [[ -d /deps/googletest ]]; then options+=(-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/deps/googletest); fi
 if [[ -d /deps/benchmark ]]; then options+=(-DFETCHCONTENT_SOURCE_DIR_BENCHMARK=/deps/benchmark); fi
@@ -42,7 +43,11 @@ run_test() {
 }
 unset OOX_RAPID_AUTOCALIBRATE OOX_RAPID_RESIDENT_LIMIT
 run_test dedup_spurious '^scheduler_eval_dedup_spurious$'
-run_test unpinned_tbb '^test_eval_unpinned_TBB_(SIMPLE|AUTO)$'
+for mode in TBB_SIMPLE TBB_AUTO; do
+  run_test "capacity_${mode}" "^test_eval_tbb_capacity_${mode}$"
+  run_test "retry_${mode}" "^test_eval_tbb_retry_${mode}$"
+  run_test "unpinned_${mode}" "^test_eval_unpinned_${mode}$"
+done
 for mode in "${modes[@]}"; do run_test "$mode" "^test_scheduler_eval_${mode}$"; done
 export OOX_RAPID_AUTOCALIBRATE=0 OOX_RAPID_RESIDENT_LIMIT=$BENCH_NUM_THREADS
 run_test RAPID_AUTO_fixed "^test_scheduler_eval_RAPID_AUTO$"
