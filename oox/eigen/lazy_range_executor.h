@@ -67,9 +67,9 @@ public:
     }
   }
   void Run(size_t &chunks) {
-    struct RunningCallback {
-      bool &running;
-      ~RunningCallback() { running = false; }
+    struct RunningBatch {
+      Batch *&active;
+      ~RunningBatch() { active = nullptr; }
     };
     size_t cursor = begin_, quantum = grain_;
     // Grow local batches without constructing a private split tree. A thief
@@ -86,20 +86,15 @@ public:
       const size_t stop = std::min(next, end_.load(std::memory_order_acquire));
       // A terminal-tail thief may have taken all work before this reservation.
       if (stop <= cursor) break;
-      batch_trimmed_ = false;
       {
+        Batch batch{cursor, stop};
+        active_batch_ = &batch;
+        RunningBatch running{active_batch_};
         OOX_SCHED_SCOPE("chunk", ::oox::scheduler_trace::NextId(), cursor, stop);
-        while (cursor < stop) {
-          next_callback_ = cursor + 1;
-          {
-            callback_running_ = true;
-            RunningCallback callback{callback_running_};
-            std::invoke(*function_, cursor);
-          }
-          ++cursor;
-          // Nested entry returned the rest of this reservation to thieves.
-          // Never execute against the old stop; reserve again from live end_.
-          if (batch_trimmed_) break;
+        // Keep the cursor local; nested entry only needs the next boundary.
+        for (; cursor < batch.end; ++cursor) {
+          batch.next = cursor + 1;
+          std::invoke(*function_, cursor);
         }
       }
       ++chunks;
@@ -109,12 +104,19 @@ public:
   }
 
 private:
+  struct Batch {
+    size_t next, end;
+    bool released = false;
+  };
   bool OnNestedEntry() noexcept final {
-    if (!callback_running_ || batch_trimmed_) return false;
+    if (!active_batch_ || active_batch_->released) return false;
     // Called by the owner under the slot tag. end_ stays monotonic; released
     // callbacks below it are unstarted, and the running callback stays private.
-    head_.store(next_callback_, std::memory_order_seq_cst);
-    batch_trimmed_ = true;
+    const size_t next = active_batch_->next;
+    head_.store(next, std::memory_order_seq_cst);
+    // Finish the running callback, then reserve again from the live tail.
+    active_batch_->end = next;
+    active_batch_->released = true;
     nested_seen_ = true;
     return true;
   }
@@ -127,8 +129,7 @@ private:
   scheduler_sync::atomic<size_t> head_, end_;
   const size_t begin_, grain_;
   const scheduler_sync::thread::id owner_;
-  size_t next_callback_ = 0;
-  bool callback_running_ = false, batch_trimmed_ = false;
+  Batch *active_batch_ = nullptr;
   // Monotonic: read and written only while the slot tag is held.
   bool nested_seen_ = false;
 #ifdef OOX_SCHEDULER_TRACE
