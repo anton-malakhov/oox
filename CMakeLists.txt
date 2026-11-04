@@ -71,6 +71,11 @@ if (OOX_ENABLE_TBB)
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     option(TBB_TEST OFF)
     add_subdirectory(thirdparty/oneTBB onetbb)
+    if (TARGET tbb AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15 AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+      # oneTBB 2022.3 lacks the GCC 15 workaround for notify_one_relaxed (upstream PR #2029).
+      target_compile_options(tbb PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>)
+    endif ()
     set(TBB_FOUND ON)
   endif ()
 endif ()
