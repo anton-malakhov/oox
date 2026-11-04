@@ -448,6 +448,16 @@ public:
          HasResidentBatch(pt->thread_id));
   }
 
+  void PrepareNestedRange() noexcept {
+    auto *pt = GetPerThread();
+    if (!IsRegistered(pt) || !pt->owns_queue || !UsesResidentBusyWait()) return;
+    if (!StealableRange::PrepareNested(thread_data_[pt->thread_id].stealable_range)) return;
+    // Notify only after the slot is unlocked, using the existing demand hints.
+    if (HasWaitingHelper()) WakeOneWorker();
+    if (HasResidentAvailableWorker({0, static_cast<unsigned>(num_threads_)}))
+      HintResidentOrdinaryWork();
+  }
+
   bool PublishStealableRange(StealableRange &range) noexcept {
     auto *pt = GetPerThread();
     if (!IsRegistered(pt) || !pt->owns_queue || !UsesResidentBusyWait()) return false;

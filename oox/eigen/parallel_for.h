@@ -164,6 +164,9 @@ void ParallelFor(ThreadPool &pool, size_t begin, size_t end,
                  partitioner_detail::Metrics *metrics = nullptr) {
   if (begin >= end || pool.IsCancelled())
     return;
+  // Release an active owner's pending batch even when this inner operation
+  // takes the one-thread/grain fast path and never publishes its own range.
+  pool.PrepareNestedRange();
   grain = std::max<size_t>(grain, 1);
   if (pool.NumThreads() == 1 || end - begin <= grain) {
     OOX_SCHED_WORKER(pool.CurrentThreadId());

@@ -10,8 +10,9 @@
 namespace oox::detail::eigen_pool {
 struct Task;
 
-// A tagged worker slot pins this stack object during a theft. Unpublication
-// acquires the same tag, so a stale pointer is never dereferenced by a thief.
+// A tagged worker slot pins the owner's LIFO chain of stack ranges during a
+// theft. Publication and unpublication acquire the same tag, so every ancestor
+// stays alive until the thief has finished traversing the chain.
 class StealableRange {
 public:
   virtual ~StealableRange() { assert(!slot_); }
@@ -20,6 +21,8 @@ public:
     assert(!slot_ && !(reinterpret_cast<uintptr_t>(this) & locked));
     slot_ = &slot;
     previous_ = Lock(slot);
+    if (previous_)
+      reinterpret_cast<StealableRange *>(previous_)->OnNestedEntry();
     slot.store(reinterpret_cast<uintptr_t>(this), std::memory_order_release);
   }
   bool IsPublished() const noexcept { return slot_ != nullptr; }
@@ -44,6 +47,16 @@ public:
     }
     OOX_SCHED_COUNT(OwnerWaitSpins, spins);
   }
+  // Called only by the slot's physical owner. The hook releases pending work
+  // before an inner operation that may execute without publishing a range.
+  static bool PrepareNested(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
+    if (!slot.load(std::memory_order_acquire)) return false;
+    const uintptr_t current = Lock(slot);
+    const bool released = current &&
+        reinterpret_cast<StealableRange *>(current)->OnNestedEntry();
+    slot.store(current, std::memory_order_release);
+    return released;
+  }
   static Task *TrySteal(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
     uintptr_t current = slot.load(std::memory_order_acquire);
     if (!current) return nullptr;
@@ -53,10 +66,23 @@ public:
       return nullptr;
     }
     OOX_SCHED_COUNT(RangeLockAcquired);
-    Task *task = reinterpret_cast<StealableRange *>(current)->Steal();
+    Task *task = nullptr;
+    auto *range = reinterpret_cast<StealableRange *>(current);
+    do {
+      task = range->Steal();
+      if (task) break;
+      // Keep the slot pinned through both the link read and the ancestor's
+      // Steal(). Prefer the deepest range, then try unreserved ancestor tails.
+      range = reinterpret_cast<StealableRange *>(range->previous_);
+    } while (range);
     slot.store(current, std::memory_order_release);
     return task;
   }
+
+protected:
+  // Invoked by the owner while the same slot tag pins this range and its
+  // ancestors. The hook must not invoke callbacks or acquire the tag again.
+  virtual bool OnNestedEntry() noexcept { return false; }
 
 private:
   static constexpr uintptr_t locked = 1;

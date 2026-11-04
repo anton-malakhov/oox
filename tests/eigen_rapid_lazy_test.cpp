@@ -101,7 +101,7 @@ TEST(EigenRapidLazy, PublishedOwnerRetainsLeadingHalfBeforeRun) {
   }
 }
 
-TEST(EigenRapidLazy, NestedPublicationRestoresOuterRange) {
+TEST(EigenRapidLazy, NestedPublicationFallsBackAndRestoresOuterRange) {
   std::atomic<uintptr_t> slot{0};
   struct Range final : StealableRange {
     Task *Steal() noexcept final { ++visits; return nullptr; }
@@ -114,8 +114,33 @@ TEST(EigenRapidLazy, NestedPublicationRestoresOuterRange) {
   inner.Unpublish();
   StealableRange::TrySteal(slot);
   outer.Unpublish();
-  EXPECT_EQ(outer.visits, 2u);
+  // A rejected inner range exposes its ancestor while it remains published.
+  EXPECT_EQ(outer.visits, 3u);
   EXPECT_EQ(inner.visits, 1u);
+  EXPECT_EQ(slot.load(), 0u);
+}
+
+TEST(EigenRapidLazy, SuccessfulInnerTheftDoesNotVisitTheAncestor) {
+  std::atomic<uintptr_t> slot{0};
+  struct Result final : Task {
+    void operator()() final {}
+    void Discard() noexcept final {}
+  } result;
+  struct Range final : StealableRange {
+    Task *Steal() noexcept final { ++visits; return task; }
+    Task *task = nullptr;
+    unsigned visits = 0;
+  } outer, inner;
+  outer.Publish(slot);
+  inner.task = &result;
+  inner.Publish(slot);
+  EXPECT_EQ(StealableRange::TrySteal(slot), &result);
+  EXPECT_EQ(inner.visits, 1u);
+  EXPECT_EQ(outer.visits, 0u);
+  inner.Unpublish();
+  EXPECT_EQ(StealableRange::TrySteal(slot), nullptr);
+  EXPECT_EQ(outer.visits, 1u);
+  outer.Unpublish();
   EXPECT_EQ(slot.load(), 0u);
 }
 

@@ -7,6 +7,15 @@
 namespace oox::detail::eigen_pool::rapid {
 namespace batch_detail {
 
+#if defined(OOX_RAPID_EXPERIMENT_NESTED_LAZY) && OOX_RAPID_EXPERIMENT_NESTED_LAZY
+// Research-only opt-in. Ordinary Auto remains the default fallback policy.
+struct NestedLazyPartitioner {
+  auto MakeState(ThreadPool &pool) const {
+    return partitioning::LazyAutoPartitionState(pool.NumThreads());
+  }
+};
+#endif
+
 // Both halves are indivisible under the requested grain. There can be no
 // descendant tasks borrowing this descriptor, so joining the one captured
 // helper suffices even on cancellation; no heap completion tree is needed.
@@ -175,7 +184,9 @@ void ParallelForAuto(RapidStartGroup group, size_t begin, size_t end,
     throw std::invalid_argument("Rapid auto requires a resident-capable pool");
   if (pool.IsCancelled()) return;
   grain = std::max(grain, size_t{1});
-  if (CurrentResidentState() || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
+  // Snapshot before RunInlineWork establishes this entry's own ancestry.
+  const bool nested = CurrentResidentState() || pool.IsExecutingTask();
+  if (nested || pool.NumThreads() == 1 ||
       end - begin <= grain || !pool.HasResidentAvailableWorker(group.domain)) {
     OOX_SCHED_EVENT("rapid_fallback", ::oox::scheduler_trace::Current(),
         (CurrentResidentState() ? 1u : 0u) | (pool.IsExecutingTask() ? 2u : 0u) |
@@ -184,6 +195,14 @@ void ParallelForAuto(RapidStartGroup group, size_t begin, size_t end,
     // Ordinary Auto executes its root directly on this caller. Preserve the
     // Rapid entry's ancestry even if helpers become available mid-callback.
     return pool.RunInlineWork([&] {
+#if defined(OOX_RAPID_EXPERIMENT_NESTED_LAZY) && OOX_RAPID_EXPERIMENT_NESTED_LAZY
+      if (nested) {
+        oox::detail::eigen_pool::ParallelFor(
+            pool, begin, end, std::forward<F>(function),
+            batch_detail::NestedLazyPartitioner{}, grain, metrics);
+        return;
+      }
+#endif
       oox::detail::eigen_pool::ParallelFor(
           pool, begin, end, std::forward<F>(function), grain, metrics);
     });

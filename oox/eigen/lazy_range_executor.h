@@ -6,8 +6,8 @@
 
 namespace oox::detail::eigen_pool::partitioner_detail {
 
-// Only an idle thief allocates a descendant. The owner reserves a contiguous
-// batch before executing it; theft may shrink only its not-yet-reserved tail.
+// Only an idle thief allocates a descendant. Theft takes the unreserved tail,
+// including pending batch callbacks explicitly released by a nested owner.
 template <typename F, typename State>
 class ActiveRange final : public StealableRange {
   using Node = Work<F, State>;
@@ -33,7 +33,7 @@ public:
       OOX_SCHED_COUNT(RangeRejectedEmpty);
       return nullptr;
     }
-    if (last - first <= grain_) {
+    if (last - first <= grain_ && !nested_seen_) {
       OOX_SCHED_COUNT(RangeRejectedGrain);
       return nullptr;
     }
@@ -46,7 +46,9 @@ public:
       OOX_SCHED_COUNT(RangeRejectedCommand);
       return nullptr;
     }
-    const size_t middle = first + (last - first) / 2;
+    // A nested owner retains its running callback, so its final indivisible
+    // pending tail can move as one whole task without retaining another half.
+    const size_t middle = last - first <= grain_ ? first : first + (last - first) / 2;
     try {
       state_.CheckDemand(true);
       auto *child = NewSmallObject<Node>(region_, function_, LoopRange{middle, last, grain_},
@@ -65,6 +67,10 @@ public:
     }
   }
   void Run(size_t &chunks) {
+    struct RunningCallback {
+      bool &running;
+      ~RunningCallback() { running = false; }
+    };
     size_t cursor = begin_, quantum = grain_;
     // Grow local batches without constructing a private split tree. A thief
     // can access the unreserved remainder even while a callback is running.
@@ -78,11 +84,24 @@ public:
       head_.store(next, std::memory_order_seq_cst);
       WaitForStealer();
       const size_t stop = std::min(next, end_.load(std::memory_order_acquire));
+      // A terminal-tail thief may have taken all work before this reservation.
+      if (stop <= cursor) break;
+      batch_trimmed_ = false;
       {
         OOX_SCHED_SCOPE("chunk", ::oox::scheduler_trace::NextId(), cursor, stop);
-        for (size_t i = cursor; i < stop; ++i) std::invoke(*function_, i);
+        while (cursor < stop) {
+          next_callback_ = cursor + 1;
+          {
+            callback_running_ = true;
+            RunningCallback callback{callback_running_};
+            std::invoke(*function_, cursor);
+          }
+          ++cursor;
+          // Nested entry returned the rest of this reservation to thieves.
+          // Never execute against the old stop; reserve again from live end_.
+          if (batch_trimmed_) break;
+        }
       }
-      cursor = stop;
       ++chunks;
       quantum = std::min(quantum, limit);
       quantum += std::min(quantum, limit - quantum);
@@ -90,6 +109,16 @@ public:
   }
 
 private:
+  bool OnNestedEntry() noexcept final {
+    if (!callback_running_ || batch_trimmed_) return false;
+    // Called by the owner under the slot tag. end_ stays monotonic; released
+    // callbacks below it are unstarted, and the running callback stays private.
+    head_.store(next_callback_, std::memory_order_seq_cst);
+    batch_trimmed_ = true;
+    nested_seen_ = true;
+    return true;
+  }
+
   Region &region_;
   F *function_;
   State state_;
@@ -98,6 +127,10 @@ private:
   scheduler_sync::atomic<size_t> head_, end_;
   const size_t begin_, grain_;
   const scheduler_sync::thread::id owner_;
+  size_t next_callback_ = 0;
+  bool callback_running_ = false, batch_trimmed_ = false;
+  // Monotonic: read and written only while the slot tag is held.
+  bool nested_seen_ = false;
 #ifdef OOX_SCHEDULER_TRACE
   const uint64_t trace_parent_ = ::oox::scheduler_trace::Current();
 #endif
