@@ -50,6 +50,21 @@ available helpers and invokes `callback(first, last)` once per participant,
 partitioning by the captured count rather than the nominal pool size.
 A warm launch uses a stack descriptor and no ordinary task allocation.
 
+`WorkerIdleMode::ResidentAuto` bounds resident polling by the CPU allowance
+observed when the pool is constructed. On Linux it reads the creator's allowed CPUs and chooses one
+logical CPU per physical core from sysfs. Background workers bind themselves
+when entering resident polling and restore their previous affinity on leaving
+resident service at the next idle transition. The creator keeps its affinity.
+Threads spawned by user callbacks on a pinned worker inherit that worker's mask.
+Missing topology or rejected affinity calls allow execution with the OS placement.
+Other platforms use the hardware concurrency estimate. CPU bandwidth quotas
+require separate accounting. `NumThreads()` still reports the requested pool size. Workers above
+the resident limit use ordinary task execution and parking. When the pool exceeds
+the CPU allowance, those workers park immediately after unsuccessful searches.
+`SetResidentLimit` and Rapid Auto calibration both respect `MaxResidentLimit()`
+in this mode.
+The scheduler benchmark runtime selects this automatic policy for resident pools.
+
 Launches do not wait for busy workers to become available. Tests and benchmarks
 may explicitly call `eigen_test_support::WaitForResidentWorkers` from
 `test_support/eigen_resident.h`, with a caller-supplied startup timeout.

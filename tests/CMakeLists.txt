@@ -176,6 +176,11 @@ if (OOX_ENABLE_EIGEN)
         DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
   endforeach()
 
+  add_executable(eigen_resident_limit_test eigen_resident_limit_test.cpp)
+  target_link_libraries(eigen_resident_limit_test PRIVATE ${PROJECT_NAME}::eigen)
+  add_test(NAME EigenResidentAutomaticLimit COMMAND eigen_resident_limit_test)
+  set_tests_properties(EigenResidentAutomaticLimit PROPERTIES TIMEOUT 60)
+
   add_executable(eigen_nested_ancestor_test eigen_nested_ancestor_test.cpp)
   target_link_libraries(eigen_nested_ancestor_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
   target_compile_definitions(eigen_nested_ancestor_test PRIVATE OOX_RAPID_EXPERIMENT_NESTED_LAZY=1)

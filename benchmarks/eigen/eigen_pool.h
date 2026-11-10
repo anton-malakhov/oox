@@ -12,7 +12,7 @@ inline oox::detail::eigen_pool::ThreadPool& EigenPool() {
     EIGEN_MODE == EIGEN_AUTO_RESIDENT
   static auto pool = oox::detail::eigen_pool::ThreadPool(
       GetNumThreads(), true, true,
-      oox::detail::eigen_pool::WorkerIdleMode::ResidentBusy);
+      oox::detail::eigen_pool::WorkerIdleMode::ResidentAuto);
 #else
   static auto pool =
       oox::detail::eigen_pool::ThreadPool(GetNumThreads(), true, true);

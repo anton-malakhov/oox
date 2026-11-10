@@ -87,7 +87,7 @@ inline AutoCalibrationResult CalibrateAutoGroup(RapidStartGroup group,
   const auto expired = [&] { return Clock::now() - started >= options.probe_budget; };
   pool.SetResidentLimit(0);
   if (pool.NumThreads() > 1 && options.probe_budget.count() > 0 && !pool.IsCancelled()) {
-    const size_t maximum = std::min(pool.NumThreads(), size_t{64});
+    const size_t maximum = std::min(pool.MaxResidentLimit(), size_t{64});
     std::vector<size_t> limits;
     // Intermediate sizes matter on heterogeneous/loaded CPUs; powers of two
     // alone can miss a useful cohort between half and all of the workers.

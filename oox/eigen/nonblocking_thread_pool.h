@@ -23,6 +23,7 @@
 #include "stealable_range.h"
 #include "scheduler_trace.h"
 #include "resident_command.h"
+#include "available_parallelism.h"
 
 #include <atomic>
 #include <bit>
@@ -46,7 +47,8 @@ namespace oox::detail::eigen_pool {
 
 // ResidentBusy is an explicit pool-lifetime policy. Idle workers advertise a
 // bit and poll a command slot instead of entering the OS parking protocol.
-enum class WorkerIdleMode { Park, ResidentBusy };
+// ResidentAuto bounds persistent polling by the CPU allowance at construction.
+enum class WorkerIdleMode { Park, ResidentBusy, ResidentAuto };
 
 constexpr uint64_t ResidentClaimMask(uint64_t candidates, unsigned first_bit,
                                      size_t capacity) noexcept {
@@ -200,7 +202,7 @@ public:
         all_coprimes_(num_threads_),
         pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
         resident_available_words_(
-            idle_mode_ == WorkerIdleMode::ResidentBusy
+            idle_mode_ != WorkerIdleMode::Park
                 ? (static_cast<size_t>(num_threads_) + 63) / 64
                 : 0),
         resident_available_(resident_available_words_ == 0
@@ -213,7 +215,11 @@ public:
                                       resident_available_words_)),
         done_(false),
         cancelled_(false),
-        resident_limit_(idle_mode == WorkerIdleMode::ResidentBusy ? num_threads_ : 0),
+        resident_placement_(idle_mode == WorkerIdleMode::ResidentAuto
+            ? DiscoverResidentPlacement(num_threads_)
+            : ResidentPlacement{idle_mode == WorkerIdleMode::Park ? 0 : size_t(num_threads_), {}}),
+        resident_limit_max_(resident_placement_.limit),
+        resident_limit_(resident_limit_max_),
         first_background_worker_(use_main_thread && num_threads_ > 1 ? 1 : 0) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
@@ -245,7 +251,10 @@ public:
           PerThread *pt = GetPerThread();
           const PerThread previous = *pt;
           RegisterThread(pt, i, true);
-          WorkerLoop();
+          auto &bindings = resident_placement_.bindings;
+          auto *binding = size_t(i) < bindings.size() ? &bindings[i] : nullptr;
+          WorkerLoop(false, false, binding);
+          if (binding) binding->Restore();
           *pt = previous;
         }));
       }
@@ -416,8 +425,11 @@ public:
   }
 
   bool UsesResidentBusyWait() const noexcept {
-    return idle_mode_ == WorkerIdleMode::ResidentBusy;
+    return idle_mode_ == WorkerIdleMode::ResidentBusy ||
+           idle_mode_ == WorkerIdleMode::ResidentAuto;
   }
+
+  size_t MaxResidentLimit() const noexcept { return resident_limit_max_; }
 
   size_t ResidentLimit() const noexcept {
     return resident_limit_.load(std::memory_order_acquire);
@@ -428,7 +440,7 @@ public:
   void SetResidentLimit(size_t limit) {
     if (!UsesResidentBusyWait() && limit != 0)
       throw std::invalid_argument("resident limit requires a resident-capable pool");
-    resident_limit_.store(std::min(limit, NumThreads()), std::memory_order_release);
+    resident_limit_.store(std::min(limit, MaxResidentLimit()), std::memory_order_release);
     WakeAllWorkers();
   }
 
@@ -495,7 +507,7 @@ public:
     domain.limit = static_cast<unsigned>(std::min<size_t>(domain.limit, ResidentLimit()));
     if (domain.start >= domain.limit)
       return 0;
-    if (idle_mode_ != WorkerIdleMode::ResidentBusy || capacity == 0) {
+    if (!UsesResidentBusyWait() || capacity == 0) {
       return 0;
     }
     // The word index is worker / 64 and the bit is worker % 64. Rotating both
@@ -1123,6 +1135,8 @@ private:
   // Keep the polled generation off the frequently written claim cursor's
   // cache line without shifting existing scheduler fields.
   alignas(128) scheduler_sync::atomic<uint64_t> resident_publication_epoch_{0};
+  ResidentPlacement resident_placement_;
+  const size_t resident_limit_max_;
   alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t> resident_limit_;
   const size_t first_background_worker_;
 
@@ -1131,7 +1145,9 @@ private:
   }
 
   // Main worker thread loop. Returns true if processed some tasks
-  bool WorkerLoop(bool external = false, bool once = false) {
+  bool WorkerLoop(bool external = false, bool once = false,
+                  ResidentPlacement::Binding *binding = nullptr) {
+    bool binding_requested = false;
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
     bool processed_anything = false;
@@ -1140,6 +1156,10 @@ private:
         return processed_anything;
       }
 
+      if (binding_requested && !IsResidentWorker(static_cast<size_t>(pt->thread_id))) {
+        binding->Restore();
+        binding_requested = false;
+      }
       if (TryExecuteOne()) {
         processed_anything = true;
         if (once) {
@@ -1151,7 +1171,13 @@ private:
         return processed_anything;
       }
 
-      if (IsResidentWorker(static_cast<size_t>(pt->thread_id))) {
+      const bool resident = IsResidentWorker(static_cast<size_t>(pt->thread_id));
+      if (binding && binding_requested != resident) {
+        if (resident) binding->Apply();
+        else binding->Restore();
+        binding_requested = resident;
+      }
+      if (resident) {
         if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
           processed_anything = true;
         }
@@ -1159,7 +1185,10 @@ private:
       }
 
       bool found_work = false;
-      if (allow_spinning_) {
+      // Extra workers in an oversubscribed automatic pool should park after
+      // the failed search, leaving CPU time to its resident participants.
+      if (allow_spinning_ && (idle_mode_ != WorkerIdleMode::ResidentAuto ||
+                              MaxResidentLimit() == NumThreads())) {
         for (int i = 0; i < kSpinCount; ++i) {
           if (cancelled_.load(std::memory_order_acquire)) {
             return processed_anything;
