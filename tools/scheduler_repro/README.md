@@ -1,5 +1,36 @@
 # Scheduler correctness reproduction in Linux
 
+For a native build, correctness checks and performance measurements from a fresh
+GitHub checkout, use [`../scheduler_benchmark.py`](../scheduler_benchmark.py).
+It requires Python 3.8+ and can install Debian/Ubuntu build dependencies. From
+an existing checkout:
+
+```sh
+python3 tools/scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
+```
+
+Without a checkout, download the same standalone script and run it:
+
+```sh
+curl -fL https://raw.githubusercontent.com/anton-malakhov/oox/kkalpha-pr37-on-pr35/tools/scheduler_benchmark.py -o scheduler_benchmark.py
+python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
+```
+
+The default campaign runs the 27 focused launch, nested, matrix, SpMV and
+variable-cost cases, where supported by each mode, with five fresh-process
+repetitions in seeded shuffled order. It includes a separate nested-Lazy build.
+Use `--full` for all registered workloads, `--threads 8 16 32` for other worker
+counts, `--cpu-set 0-7` for Linux CPU placement, and `--resident auto` to measure
+automatic group calibration instead of the default fixed resident limit.
+`--mode RAPID_AUTO EIGEN_AUTO TBB_AUTO` narrows the mode matrix. `--ref` accepts a
+branch, tag or commit. Each invocation creates a new output directory and prints
+the archive path. `metadata.json` records completion, source and binary identities,
+CPU affinity, configuration and passed correctness commands. Failure exits nonzero
+and preserves the available logs in an archive. CPU counts are requested workers;
+check affinity, cgroup limits and the TBB capacity diagnostics for actual resources.
+Pass only `--filter '^Launch/64/' --repetitions 1 --min-time 0.01s` for a smoke run.
+The raw JSON and `summary.json` retain the timings and selected Rapid group limits.
+
 This runner builds the shared scheduler-eval correctness workloads, not performance
 benchmarks. It tests serial elision, TBB Simple/Auto, Eigen Auto/resident/stealing,
 Rapid Group and Rapid Auto. It also tests Rapid Auto with a fixed resident limit.
