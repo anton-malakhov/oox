@@ -166,7 +166,8 @@ def execute(args, directory, metadata):
                    "-DOOX_ENABLE_TF=OFF", "-DOOX_ENABLE_FOLLY=OFF",
                    "-DOOX_ENABLE_OMP=OFF", "-DOOX_SCHEDULER_EVAL_STATS=OFF"]
         if variant == "nested-lazy":
-            options.append("-DCMAKE_CXX_FLAGS=-DOOX_RAPID_EXPERIMENT_NESTED_LAZY=1")
+            flags = os.environ.get("CXXFLAGS", "")
+            options.append(f"-DCMAKE_CXX_FLAGS={flags} -DOOX_RAPID_EXPERIMENT_NESTED_LAZY=1")
         run(["cmake", "-S", source, "-B", build, "-G", "Ninja",
              "-DCMAKE_BUILD_TYPE=Release"] + options, logs / (variant + "-configure.log"))
         targets = [prefix + mode for mode in modes

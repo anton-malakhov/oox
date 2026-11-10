@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -51,6 +52,28 @@ class BenchmarkRunnerTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             runner.run([sys.executable, "-c", "import time; time.sleep(30)"],
                        self.root / "timeout.log", timeout=0.1)
+
+    def test_nested_build_preserves_environment_compiler_flags(self):
+        configurations = []
+
+        def run(command, *args, **kwargs):
+            if command[:2] == ["cmake", "-S"]:
+                configurations.append(command)
+                if len(configurations) == 2:
+                    raise InterruptedError("stop before compilation")
+
+        with patch.object(sys, "argv", ["runner", "--mode", "RAPID_AUTO"]):
+            args = runner.arguments()
+        with patch.dict(os.environ, {"CXXFLAGS": "-fPIC -O2"}), \
+                patch.object(runner, "run", run), \
+                patch.object(runner, "capture", return_value="test"), \
+                patch.object(runner.shutil, "which", return_value="tool"), \
+                patch.object(runner.shutil, "copy2"), \
+                self.assertRaises(InterruptedError):
+            runner.execute(args, self.root, {})
+        self.assertEqual(len(configurations), 2)
+        self.assertIn("-DCMAKE_CXX_FLAGS=-fPIC -O2 -DOOX_RAPID_EXPERIMENT_NESTED_LAZY=1",
+                      configurations[1])
 
     def test_archives_success_and_failure_without_build_tree(self):
         def execute(args, directory, metadata):
