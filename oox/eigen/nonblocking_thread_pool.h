@@ -22,6 +22,7 @@
 #include "small_object_pool.h"
 #include "scheduler_trace.h"
 #include "resident_command.h"
+#include "resident_cohort.h"
 #include "resident_queue_scan.h"
 #include "resident_worker_mask.h"
 #include "resident_worker_set.h"
@@ -400,28 +401,13 @@ public:
         workers, count, first_slot, epoch, packed_completion && SupportsPackedResidentCompletion());
   }
 
-  // Allocate after all claims and before any command publication. Successive
-  // claims of any one worker therefore have strictly increasing epochs.
   uint64_t NextResidentEpoch() noexcept {
-    if (SupportsPackedResidentCompletion())
-      return resident_workers_.Word(0).PackedEpoch(num_threads_, std::memory_order_acquire).value_or(0);
-    uint64_t observed = resident_dispatch_epoch_.load(std::memory_order_relaxed);
-    const uint64_t maximum = internal::resident_global_clock_max;
-    while (observed < maximum) {
-      if (resident_dispatch_epoch_.compare_exchange_weak(observed, observed + 1,
-                                                        std::memory_order_relaxed))
-        return observed + 1 == maximum ? 0 : observed + 1;
-    }
-    // Keep every completed ID monotonic; zero permanently selects counters.
-    return 0;
+    return internal::AllocateResidentEpoch(num_threads_, resident_workers_, resident_dispatch_epoch_);
   }
 
   bool ResidentEpochComplete(uint64_t epoch, const unsigned *workers,
                               size_t count) const noexcept {
-    for (size_t i = 0; i < count; ++i)
-      if (thread_data_[workers[i]].resident_finished.load(std::memory_order_acquire) < epoch)
-        return false;
-    return true;
+    return internal::CohortEpochComplete(thread_data_, epoch, workers, count);
   }
 
   bool SupportsPackedResidentCompletion() const noexcept {
@@ -429,11 +415,7 @@ public:
   }
   uint64_t ResidentBatchDoneMask(size_t word, const unsigned *workers,
                                 size_t count) const noexcept {
-    if (word == size_t(-1) || !SupportsPackedResidentCompletion()) return 0;
-    uint64_t mask = 0;
-    for (size_t i = 0; i < count; ++i)
-      mask |= uint64_t{1} << workers[i];
-    return internal::ResidentMaskWord::DoneBits(mask, num_threads_);
+    return internal::CohortDoneMask(word, workers, count, num_threads_);
   }
   bool ResidentBatchDone(size_t word, uint64_t mask) const noexcept {
     return resident_workers_.Word(word).Completed(mask);
@@ -441,7 +423,7 @@ public:
 
   // The selected finished-epoch or packed-done acquire must precede release.
   void ReleaseResidentEpochBatch(size_t word) noexcept {
-    if (word == size_t(-1)) return;
+    if (word == internal::no_resident_batch) return;
     resident_broadcasts_[word].ReleaseAfterJoin(word, resident_workers_.Word(word), num_threads_);
   }
 
