@@ -21,6 +21,8 @@
 
 namespace oox::detail::eigen_pool {
 
+// Choose up to capacity ready bits, starting at first_bit and wrapping around.
+// With bits {1, 3, 7} ready, starting at 6 selects {7, 1} for a request of two.
 constexpr uint64_t ResidentClaimMask(uint64_t candidates, unsigned first_bit,
                                      size_t capacity) noexcept {
   if (static_cast<size_t>(std::popcount(candidates)) <= capacity)
@@ -28,6 +30,7 @@ constexpr uint64_t ResidentClaimMask(uint64_t candidates, unsigned first_bit,
   uint64_t remaining = std::rotr(candidates, static_cast<int>(first_bit));
   uint64_t selected = 0;
   for (size_t count = 0; count < capacity; ++count) {
+    // Copy the lowest set bit, then clear it so the next iteration sees the next candidate.
     selected |= remaining & (~remaining + 1);
     remaining &= remaining - 1;
   }
@@ -36,6 +39,7 @@ constexpr uint64_t ResidentClaimMask(uint64_t candidates, unsigned first_bit,
 
 namespace internal {
 
+// Tests can shorten the epoch to reach saturation in a few claims.
 #if defined(OOX_EIGEN_THREAD_POOL_TESTING) && defined(OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS)
 static_assert(OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS > 0 && OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS <= 56);
 inline constexpr unsigned resident_packed_clock_bits = OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS;
@@ -45,14 +49,20 @@ inline constexpr unsigned resident_packed_clock_bits = 0;
 inline constexpr uint64_t resident_packed_clock_max = 0;
 #endif
 
-// Small pools keep a claim clock above their worker bits. Registration and
-// withdrawal must preserve those upper bits, including during reconfiguration.
-// For <=8 workers: [clock | N sticky shared-cohort done bits | N ready bits].
-// Larger pools use ordinary readiness words and separate epoch records.
+// Worker i advertises readiness in word i / 64, bit i % 64. Larger pools use
+// these words for readiness alone. When the whole pool has N <= 8 workers,
+// word 0 also has room to track completion:
+//   Bits [0, N)    Ready: the worker is offering to accept a Rapid command.
+//   Bits [N, 2N)   Done: the worker completed its part of a shared packed broadcast.
+//   Bits [2N, 64)  Epoch: incremented once per successful claim until saturation.
+// A helper can be claimed again before the previous caller joins. Its done
+// bit stays set so that caller can still observe completion.
 class ResidentMaskWord {
 public:
   static constexpr bool SupportsPackedCompletion(unsigned workers) noexcept { return workers <= 8; }
 
+  // Map the global worker range [begin, end) onto this word. For [62, 66),
+  // word 0 contributes bits 62 and 63, and word 1 contributes bits 0 and 1.
   static uint64_t DomainMask(size_t word, unsigned begin, unsigned end) noexcept {
     const size_t word_begin = word * 64;
     const size_t first = std::max(word_begin, static_cast<size_t>(begin));
@@ -72,7 +82,8 @@ public:
     return bits_.load(std::memory_order_acquire) & allowed;
   }
 
-  // On CAS failure, select again from the updated word. A worker might have withdrawn.
+  // The publisher reserves all selected helpers in this word with one CAS.
+  // On failure, select again: a helper may have withdrawn or another publisher may have claimed it.
   uint64_t ClaimResidentWord(uint64_t allowed, unsigned first_bit, size_t capacity,
                              unsigned workers) noexcept {
     uint64_t observed = bits_.load(std::memory_order_acquire);
@@ -86,30 +97,37 @@ public:
     return 0;
   }
 
+  // The worker tries to take back its offer. In WaitResident, false means a
+  // publisher already claimed it, even if the command has yet to arrive.
   bool WithdrawResident(unsigned worker) noexcept {
     const uint64_t bit = WorkerBit(worker);
     return (bits_.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
   }
 
+  // On entry to WaitResident, set the ready bit. When finishing a packed
+  // broadcast, the helper publishes both readiness and completion in one update.
   void Advertise(unsigned worker, unsigned workers, bool packed_done = false) noexcept {
     const uint64_t bit = WorkerBit(worker);
     const uint64_t done = packed_done ? DoneBits(bit, workers) : 0;
     bits_.fetch_or(bit | done, std::memory_order_release);
   }
 
-  // Only a small pool has a packed clock. Saturation switches subsequent joins to counters.
+  // Read the small pool's claim epoch. At saturation, new cohorts use completion
+  // counters so an outstanding join can never see a wrapped epoch.
   std::optional<uint64_t> PackedEpoch(unsigned workers, std::memory_order order) const noexcept {
     const uint64_t version = bits_.load(order) >> (2 * workers);
     if (version == ClockMax(workers)) return std::nullopt;
     return version;
   }
 
+  // Translate the cohort's worker IDs into the corresponding done-bit positions.
   static uint64_t DoneBits(uint64_t members, unsigned workers) noexcept {
     return members << workers;
   }
 
   bool Completed(uint64_t done) const noexcept { return Available(done) == done; }
 
+  // The joining caller clears only its broadcast's done bits when releasing the descriptor.
   void ClearDone(uint64_t members, unsigned workers) noexcept {
     bits_.fetch_and(~DoneBits(members, workers), std::memory_order_relaxed);
   }
