@@ -4,6 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#if defined(__linux__) && !(defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST)
+#include <pthread.h>
+#include "eigen_test_wait.h"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <ctime>
@@ -111,6 +116,54 @@ TEST(EigenPool, ResidentBindingRespectsNarrowerWorkerAffinity) {
   if (setup_error) GTEST_SKIP() << "Cannot set test affinity, errno=" << setup_error;
   ASSERT_EQ(read_error, 0);
   EXPECT_EQ(observed, restricted);
+}
+
+TEST(EigenPool, ResidentWorkerRestoresAffinityWhenLimitFallsAndOnExit) {
+  using namespace oox::detail::eigen_pool;
+  using affinity_detail::CpuMask;
+  const auto original = affinity_detail::ReadAllowedMask();
+  const auto placement = DiscoverResidentPlacement(1);
+  if (placement.bindings.empty() || placement.bindings.front().target == original)
+    GTEST_SKIP() << "Need a worker whose allowed mask can be narrowed";
+  const auto &target = placement.bindings.front().target;
+  if (!std::async(std::launch::async, [&] { return affinity_detail::SetThreadMask(target); }).get())
+    GTEST_SKIP() << "Cannot set worker affinity";
+
+  // Observe the same physical thread before it enters and after it leaves the pool loop.
+  struct Observer : StlThreadEnvironment {
+    std::promise<pthread_t> &started;
+    CpuMask &on_exit;
+    EnvThread *CreateThread(std::function<void()> loop) {
+      return new EnvThread([this, loop = std::move(loop)] {
+        started.set_value(pthread_self());
+        loop();
+        on_exit = affinity_detail::ReadAllowedMask();
+      });
+    }
+  };
+  std::promise<pthread_t> started;
+  auto worker = started.get_future();
+  CpuMask on_exit;
+  {
+    ThreadPoolTempl<Observer> pool(1, true, false, WorkerIdleMode::ResidentAuto,
+                                   Observer{{}, started, on_exit});
+    const auto physical = worker.get();
+    CpuMask observed(original.size());
+    auto wait_mask = [&](const CpuMask &expected, const char *operation) {
+      eigen_test_support::WaitUntil([&] {
+        return pthread_getaffinity_np(physical, observed.size() * sizeof(unsigned long),
+                   reinterpret_cast<cpu_set_t *>(observed.data())) == 0 && observed == expected;
+      }, operation);
+    };
+    wait_mask(target, "first resident binding");
+    EXPECT_EQ(affinity_detail::ReadAllowedMask(), original);
+    pool.SetResidentLimit(0);
+    wait_mask(original, "restore worker affinity after limit falls");
+    pool.SetResidentLimit(1);
+    wait_mask(target, "reapply worker affinity after limit rises");
+    pool.Cancel();
+  }
+  EXPECT_EQ(on_exit, original);
 }
 #endif
 

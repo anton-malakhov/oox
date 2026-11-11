@@ -189,10 +189,7 @@ public:
           PerThread *pt = GetPerThread();
           const PerThread previous = *pt;
           RegisterThread(pt, i, true);
-          auto &bindings = resident_placement_.bindings;
-          auto *binding = size_t(i) < bindings.size() ? &bindings[i] : nullptr;
-          WorkerLoop(false, false, binding);
-          if (binding) binding->Restore();
+          WorkerLoop(false, false, ResidentWorkerBinding(resident_placement_, i));
           *pt = previous;
         }));
       }
@@ -930,8 +927,7 @@ private:
 
   // Main worker thread loop. Returns true if processed some tasks
   bool WorkerLoop(bool external = false, bool once = false,
-                  ResidentPlacement::Binding *binding = nullptr) {
-    bool binding_requested = false;
+                  ResidentWorkerBinding binding = {}) {
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
     bool processed_anything = false;
@@ -940,10 +936,8 @@ private:
         return processed_anything;
       }
 
-      if (binding_requested && !IsResidentWorker(static_cast<size_t>(pt->thread_id))) {
-        binding->Restore();
-        binding_requested = false;
-      }
+      // Recheck an existing CPU binding before probing ordinary queues.
+      if (binding.Requested()) binding.SetResident(IsResidentWorker(pt->thread_id));
       if (TryExecuteOne()) {
         processed_anything = true;
         if (once) {
@@ -956,11 +950,7 @@ private:
       }
 
       const bool resident = IsResidentWorker(static_cast<size_t>(pt->thread_id));
-      if (binding && binding_requested != resident) {
-        if (resident) binding->Apply();
-        else binding->Restore();
-        binding_requested = resident;
-      }
+      binding.SetResident(resident);
       if (resident) {
         if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
           processed_anything = true;

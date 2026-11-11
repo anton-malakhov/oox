@@ -83,6 +83,34 @@ struct ResidentPlacement {
   std::vector<Binding> bindings;
 };
 
+// Scoped to one physical worker. External and nested callers use the empty binding.
+class ResidentWorkerBinding {
+public:
+  ResidentWorkerBinding() = default;
+  ResidentWorkerBinding(ResidentPlacement &placement, size_t worker) noexcept
+      : target_(worker < placement.bindings.size() ? &placement.bindings[worker] : nullptr) {}
+  ResidentWorkerBinding(const ResidentWorkerBinding &) = delete;
+  ResidentWorkerBinding &operator=(const ResidentWorkerBinding &) = delete;
+
+  ~ResidentWorkerBinding() {
+    if (target_) target_->Restore();
+  }
+
+  bool Requested() const noexcept { return requested_; }
+
+  void SetResident(bool resident) noexcept {
+    if (!target_ || requested_ == resident) return;
+    if (resident) target_->Apply();
+    else target_->Restore();
+    // Keep the request even if Linux declined the bind. Retry on the next transition.
+    requested_ = resident;
+  }
+
+private:
+  ResidentPlacement::Binding *target_ = nullptr;
+  bool requested_ = false;
+};
+
 inline ResidentPlacement DiscoverResidentPlacement(size_t workers) {
 #if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
   return {workers, {}};
