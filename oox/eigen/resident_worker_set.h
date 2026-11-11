@@ -18,10 +18,6 @@ struct DomainId {
     return {start, static_cast<unsigned>(std::min<size_t>(limit, workers))};
   }
 
-  bool IsEmpty() const noexcept { return start == limit; }
-  bool IsValidFor(size_t workers) const noexcept {
-    return start < limit && limit <= workers;
-  }
   size_t Size() const noexcept {
     return limit >= start ? limit - start : 0;
   }

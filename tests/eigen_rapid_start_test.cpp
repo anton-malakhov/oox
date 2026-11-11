@@ -506,19 +506,18 @@ TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
 }
 
 TEST(EigenRapidResident, EmptyGroupsAndInvalidDomains) {
-  bool called = false;
+  const auto unexpected = [](size_t, size_t) { ADD_FAILURE() << "unexpected range callback"; };
   eigen_test_support::WaitForResidentWorkers({}, std::chrono::seconds(5));
-  ParallelForResidentRanges({}, 0, 8, [&](size_t, size_t) { called = true; });
-  EXPECT_FALSE(called);
+  ParallelForResidentRanges({}, 0, 8, unexpected);
   RapidHarness harness(2, true, WorkerIdleMode::ResidentBusy);
-  EXPECT_THROW(harness.group.Subgroup({0, 3}), std::invalid_argument);
+  ParallelForResidentRanges({&harness.pool, {1, 1}}, 0, 8, unexpected);
+  const RapidStartGroup reversed{&harness.pool, {1, 0}};
+  EXPECT_THROW(ParallelForResidentRanges(reversed, 0, 8, unexpected), std::invalid_argument);
   const RapidStartGroup invalid{&harness.pool, {1, 3}};
-  EXPECT_THROW(ParallelForResidentRanges(invalid, 0, 8,
-      [](size_t, size_t) {}), std::invalid_argument);
+  EXPECT_THROW(ParallelForResidentRanges(invalid, 0, 8, unexpected), std::invalid_argument);
   RapidHarness parked(2);
   EXPECT_THROW(eigen_test_support::WaitForResidentWorkers(parked.group, std::chrono::seconds(5)), std::invalid_argument);
-  EXPECT_THROW(ParallelForResidentRanges(parked.group, 0, 8,
-      [](size_t, size_t) {}), std::invalid_argument);
+  EXPECT_THROW(ParallelForResidentRanges(parked.group, 0, 8, unexpected), std::invalid_argument);
 }
 
 TEST(EigenRapidResident, LaunchDoesNotRequireAllWorkersReady) {
