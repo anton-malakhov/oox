@@ -960,7 +960,7 @@ TEST(SharedVar, GetWhileFastWriters) {
     registrations.store(kRegistrations, std::memory_order_relaxed);
     writer.join();
     (void)value.get(); // the chain drains; read the final value
-    (void)sink;
+    [[maybe_unused]] const auto final_read = sink;
 }
 
 int main(int argc, char** argv) {

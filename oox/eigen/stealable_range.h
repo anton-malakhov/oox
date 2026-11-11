@@ -26,9 +26,8 @@ public:
   }
   bool IsPublished() const noexcept { return slot_ != nullptr; }
   void Unpublish() noexcept {
-    const auto current = Lock(*slot_);
+    [[maybe_unused]] const auto current = Lock(*slot_);
     assert(current == reinterpret_cast<uintptr_t>(this));
-    (void)current;
     slot_->store(reinterpret_cast<uintptr_t>(previous_), std::memory_order_release);
     slot_ = nullptr;
   }
