@@ -87,6 +87,33 @@ TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(-1), std::invalid_argument);
 }
 
+#if defined(__linux__) && !(defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST)
+TEST(EigenPool, ResidentBindingRespectsNarrowerWorkerAffinity) {
+  auto placement = oox::detail::eigen_pool::DiscoverResidentPlacement(2);
+  if (placement.bindings.size() < 2) GTEST_SKIP() << "Need two allowed physical cores";
+  auto &binding = placement.bindings[1];
+  const auto &restricted = placement.bindings[0].target;
+  ASSERT_NE(binding.target, restricted);
+
+  std::vector<unsigned long> observed(restricted.size());
+  int read_error = 0;
+  const auto setup_error = std::async(std::launch::async, [&] {
+    const size_t bytes = restricted.size() * sizeof(unsigned long);
+    // Establish that Linux accepts the target, then give the worker a different mask.
+    if (sched_setaffinity(0, bytes, reinterpret_cast<const cpu_set_t *>(binding.target.data())) ||
+        sched_setaffinity(0, bytes, reinterpret_cast<const cpu_set_t *>(restricted.data())))
+      return errno;
+    binding.Apply();
+    if (sched_getaffinity(0, bytes, reinterpret_cast<cpu_set_t *>(observed.data()))) read_error = errno;
+    return 0;
+  }).get();
+
+  if (setup_error) GTEST_SKIP() << "Cannot set test affinity, errno=" << setup_error;
+  ASSERT_EQ(read_error, 0);
+  EXPECT_EQ(observed, restricted);
+}
+#endif
+
 TEST(EigenPool, OneBackgroundWorkerRunsExternalSubmission) {
   ThreadPool pool(1, false, false);
   std::promise<void> completed;
