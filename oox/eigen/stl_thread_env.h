@@ -13,6 +13,7 @@
 #include <functional>
 #include <thread>
 #include <utility>
+#include "scheduler_sync.h"
 
 namespace oox::detail::eigen_pool {
 
@@ -27,7 +28,7 @@ struct StlThreadEnvironment {
     void OnCancel() {}
 
   private:
-    std::thread thr_;
+    scheduler_sync::thread thr_;
   };
 
   EnvThread *CreateThread(std::function<void()> f) {

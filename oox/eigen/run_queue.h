@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <mutex>
 #include <utility>
+#include "scheduler_sync.h"
 
 namespace oox::detail::eigen_pool {
 
@@ -87,7 +88,7 @@ public:
   // PushBack adds w at the end of the queue.
   // If queue is full returns w, otherwise returns default-constructed Work.
   bool PushBack(Work w) {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<scheduler_sync::mutex> lock(mutex_);
     unsigned back = back_.load(std::memory_order_relaxed);
     Elem *e = &array_[(back - 1) & kMask];
     uint8_t s = e->state.load(std::memory_order_relaxed);
@@ -105,7 +106,7 @@ public:
   Work PopBack() {
     if (Empty())
       return Work();
-    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    std::unique_lock<scheduler_sync::mutex> lock(mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return Work();
     unsigned back = back_.load(std::memory_order_relaxed);
     Elem *e = &array_[back & kMask];
@@ -131,7 +132,7 @@ private:
   static const unsigned kMask = kSize - 1;
   static const unsigned kMask2 = (kSize << 1) - 1;
   struct Elem {
-    std::atomic<uint8_t> state;
+    scheduler_sync::atomic<uint8_t> state;
     Work w;
   };
   enum {
@@ -139,7 +140,7 @@ private:
     kBusy,
     kReady,
   };
-  std::mutex mutex_;
+  scheduler_sync::mutex mutex_;
   // Low log(kSize) + 1 bits in front_ and back_ contain rolling index of
   // front/back, respectively. The remaining bits contain modification counters
   // that are incremented on Push operations. This allows us to (1) distinguish
@@ -147,8 +148,8 @@ private:
   // position, these conditions would be indistinguishable); (2) obtain
   // consistent snapshot of front_/back_ for Size operation using the
   // modification counters.
-  std::atomic<unsigned> front_;
-  std::atomic<unsigned> back_;
+  scheduler_sync::atomic<unsigned> front_;
+  scheduler_sync::atomic<unsigned> back_;
   Elem array_[kSize];
 
   // SizeOrNotEmpty returns current queue size; if NeedSizeEstimate is false,
@@ -164,7 +165,7 @@ private:
       unsigned front1 = front_.load(std::memory_order_relaxed);
       if (front != front1) {
         front = front1;
-        std::atomic_thread_fence(std::memory_order_acquire);
+        scheduler_sync::atomic_thread_fence(std::memory_order_acquire);
         continue;
       }
       if (NeedSizeEstimate) {
