@@ -5,6 +5,7 @@ namespace resident_test_hook { void Acquired(unsigned); }
 #undef OOX_EIGEN_TEST_RESIDENT_ACQUIRED
 
 #include <oox/eigen/rapid_start.h>
+#include <oox/eigen/resident_queue_scan.h>
 #include <oox/eigen/parallel_for.h>
 #include "eigen_test_wait.h"
 
@@ -164,6 +165,68 @@ TEST(EigenRapidResident, ClaimWorkersAcrossWordBoundaries) {
   ResidentWorkerSet disabled(0, 0);
   EXPECT_EQ(disabled.Count({0, size}), 0u);
   EXPECT_EQ(disabled.Claim({0, size}, ids, 1), 0u);
+}
+
+TEST(EigenRapidResident, QueueScanCompletesRoundsAcrossPublications) {
+  using oox::detail::eigen_pool::Task;
+  using oox::detail::eigen_pool::internal::ResidentQueueScan;
+  struct Queue {
+    struct { bool Empty() const { return true; } } affinity_mailbox;
+    struct { std::atomic<size_t> successful_steals{0}; } statistics;
+    unsigned id;
+    std::vector<unsigned> *visits;
+    Task *local = nullptr;
+    bool pending = false;
+    Task *PopFront() { return local; }
+    bool MayHaveStealableWork() const {
+      visits->push_back(id);
+      return pending;
+    }
+    Task *PopBack(bool) { return nullptr; }
+  };
+  constexpr unsigned size = 5;
+  constexpr unsigned coprimes[] = {1, 2, 3, 4};
+  const std::vector<unsigned> expected{2, 0, 3, 1, 4};
+  std::vector<unsigned> visits;
+  std::vector<Queue> queues(size);
+  for (unsigned id = 0; id < size; ++id) {
+    queues[id].id = id;
+    queues[id].visits = &visits;
+  }
+  ResidentQueueScan scan(10);
+  auto prepare = [&](uint64_t epoch) {
+    return scan.Prepare(0, epoch, size, coprimes, [] { return uint32_t{1} << 31; });
+  };
+  auto probe = [&](uint64_t epoch) {
+    EXPECT_TRUE(prepare(epoch));
+    return scan.TryTake(0, queues);
+  };
+  auto round = [&](uint64_t epoch) {
+    visits.clear();
+    for (unsigned i = 0; i < size; ++i) EXPECT_EQ(probe(epoch), nullptr);
+    EXPECT_EQ(visits, expected);
+    EXPECT_TRUE(scan.RoundFinished());
+  };
+
+  struct LocalTask final : Task { void operator()() override {} } local;
+  queues[0].local = &local;
+  EXPECT_EQ(probe(10), &local);
+  EXPECT_TRUE(visits.empty());
+  queues[0].local = nullptr;
+  EXPECT_EQ(probe(10), nullptr);
+  // A publication after the first victim must not restart this round early.
+  for (unsigned i = 1; i < size; ++i) EXPECT_EQ(probe(11), nullptr);
+  EXPECT_EQ(visits, expected);
+
+  queues[1].pending = true;  // Another worker takes the task before PopBack.
+  round(11);
+  EXPECT_TRUE(scan.RetryRequested());
+  queues[1].pending = false;
+  round(11);
+  EXPECT_FALSE(prepare(11));
+  scan.AfterCommand();
+  round(11);
+  EXPECT_FALSE(prepare(11));
 }
 
 TEST(EigenRapidResident, InterleavedPublicationsMatchSerialOracle) {

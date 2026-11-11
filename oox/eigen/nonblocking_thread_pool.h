@@ -22,6 +22,7 @@
 #include "small_object_pool.h"
 #include "scheduler_trace.h"
 #include "resident_command.h"
+#include "resident_queue_scan.h"
 #include "resident_worker_mask.h"
 #include "resident_worker_set.h"
 #include "available_parallelism.h"
@@ -798,6 +799,11 @@ private:
       return task;
     }
 
+    bool MayHaveStealableWork() const {
+      return !local_tasks.Empty() || !mailbox.empty() ||
+          resident_deferred.load(std::memory_order_acquire) != nullptr;
+    }
+
     TaskPtr PopBack(bool force) {
       if (resident_deferred.load(std::memory_order_relaxed))
         if (auto task = resident_deferred.exchange(nullptr, std::memory_order_acquire)) {
@@ -1074,54 +1080,14 @@ private:
     if (!published) DiscardPublishedTask(task);
   }
 
-  // One queue permutation is spread over multiple polling intervals.
-  struct ResidentQueueScan {
-    uint64_t epoch;
-    unsigned remaining = 0, victim = 0, stride = 1;
-    bool retry = true;
-  };
-
-  TaskPtr ProbeResidentVictim(unsigned worker, ResidentQueueScan &scan) {
-    auto &source = thread_data_[scan.victim];
-    const bool pending = !source.local_tasks.Empty() || !source.mailbox.empty() ||
-        source.resident_deferred.load(std::memory_order_acquire) != nullptr;
-    scan.retry |= pending;
-    TaskPtr ordinary = pending ? source.PopBack(true) : nullptr;
-    if (ordinary && scan.victim != worker)
-      OOX_SCHED_EVENT("steal_queue", ordinary->trace_id, scan.victim, worker);
-#ifdef OOX_EIGEN_ENABLE_STATS
-    if (ordinary && scan.victim != worker)
-      thread_data_[worker].statistics.successful_steals.fetch_add(1, std::memory_order_relaxed);
-#endif
-    --scan.remaining;
-    scan.victim += scan.stride;
-    if (scan.victim >= static_cast<unsigned>(num_threads_)) scan.victim -= num_threads_;
-    return ordinary;
-  }
-
-  TaskPtr ProbeOrdinaryWork(unsigned worker, ResidentQueueScan &scan) {
+  TaskPtr ProbeOrdinaryWork(unsigned worker, internal::ResidentQueueScan &scan) {
     const uint64_t epoch = resident_publication_epoch_.load(std::memory_order_acquire);
-    if (!scan.remaining) {
-      if (!scan.retry && scan.epoch == epoch) return nullptr;
-      // An epoch is searched only after finishing this permutation.
-      // A later epoch causes another round, even for already-visited queues.
-      scan.epoch = epoch;
-      auto *pt = GetPerThread();
-      const unsigned random = Rand(&pt->rand);
-      scan.victim = (uint64_t{random} * num_threads_) >> 32;
-      const auto &steps = all_coprimes_[num_threads_ - 1];
-      scan.stride = steps[(uint64_t{random} * steps.size()) >> 32];
-      scan.remaining = static_cast<unsigned>(num_threads_);
-      scan.retry = false;
-      OOX_SCHED_EVENT("resident_queue_scan", ::oox::scheduler_trace::Current(), worker);
-    }
-    auto &data = thread_data_[worker];
-    scan.retry |= !data.affinity_mailbox.Empty();
-    if (TaskPtr task = data.PopFront()) return task;
-    if (TaskPtr task = ProbeResidentVictim(worker, scan)) return task;
+    if (!scan.Prepare(worker, epoch, num_threads_, all_coprimes_.back(),
+                      [this] { return Rand(&GetPerThread()->rand); })) return nullptr;
+    if (TaskPtr task = scan.TryTake(worker, thread_data_)) return task;
 #ifdef OOX_EIGEN_ENABLE_STATS
-    if (!scan.remaining && scan.retry)
-      data.statistics.failed_steal_rounds.fetch_add(1, std::memory_order_relaxed);
+    if (scan.RoundFinished() && scan.RetryRequested())
+      thread_data_[worker].statistics.failed_steal_rounds.fetch_add(1, std::memory_order_relaxed);
 #endif
     return nullptr;
   }
@@ -1129,7 +1095,7 @@ private:
   bool WaitResident(unsigned worker) noexcept {
     if (!IsResidentWorker(worker)) return false;
     // Snapshot before advertising and always probe once for earlier publications.
-    ResidentQueueScan scan{resident_publication_epoch_.load(std::memory_order_acquire)};
+    internal::ResidentQueueScan scan{resident_publication_epoch_.load(std::memory_order_acquire)};
     auto &availability = resident_workers_.Word(worker / 64);
     availability.Advertise(worker, num_threads_);
     bool processed = false;
@@ -1141,8 +1107,7 @@ private:
         command.Complete(worker, num_threads_, resident_workers_.Word(worker / 64),
                          thread_data_[worker].resident_finished);
         processed = true;
-        scan.remaining = 0;
-        scan.retry = true;
+        scan.AfterCommand();
         continue;
       }
       if (++polls == kSpinCount) {
