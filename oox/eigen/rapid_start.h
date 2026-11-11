@@ -22,22 +22,13 @@ struct RapidStartGroup {
   DomainId domain;
 
   bool IsEmpty() const noexcept {
-    return pool == nullptr || domain.IsEmpty();
+    return pool == nullptr || domain.start == domain.limit;
   }
 
   void Validate() const {
-    if (pool && !domain.IsValidFor(pool->NumThreads())) {
+    if (pool && (domain.start >= domain.limit || domain.limit > pool->NumThreads())) {
       throw std::invalid_argument("rapid domain is outside its thread pool");
     }
-  }
-
-  RapidStartGroup Subgroup(DomainId child) const {
-    Validate();
-    if (!pool || !child.IsValidFor(pool->NumThreads()) ||
-        child.start < domain.start || child.limit > domain.limit) {
-      throw std::invalid_argument("rapid subgroup is outside its parent");
-    }
-    return {pool, child};
   }
 };
 
