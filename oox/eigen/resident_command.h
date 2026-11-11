@@ -27,14 +27,6 @@ public:
 
 namespace internal {
 
-#if defined(OOX_EIGEN_THREAD_POOL_TESTING) && defined(OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS)
-static_assert(OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS > 0 && OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS <= 56);
-inline constexpr unsigned resident_packed_clock_bits = OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS;
-inline constexpr uint64_t resident_packed_clock_max = (uint64_t{1} << resident_packed_clock_bits) - 1;
-#else
-inline constexpr unsigned resident_packed_clock_bits = 0;
-inline constexpr uint64_t resident_packed_clock_max = 0;
-#endif
 #if defined(OOX_EIGEN_THREAD_POOL_TESTING) && defined(OOX_EIGEN_TEST_GLOBAL_RESIDENT_CLOCK_BITS)
 static_assert(OOX_EIGEN_TEST_GLOBAL_RESIDENT_CLOCK_BITS > 0 && OOX_EIGEN_TEST_GLOBAL_RESIDENT_CLOCK_BITS < 64);
 inline constexpr uint64_t resident_global_clock_max =
