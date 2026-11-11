@@ -60,8 +60,7 @@ template <typename Policy> void GeneratedOracle() {
   uint64_t random = seed;
   for (unsigned workers : {1u, 2u, 3u, 5u, 8u}) {
     ThreadPool pool(workers, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, workers}};
+    RapidStartGroup group{&pool, {0, workers}};
     Policy policy;
     for (unsigned limit : {0u, workers / 2, workers}) {
       pool.SetResidentLimit(limit);
@@ -96,8 +95,7 @@ TEST(EigenRapidPolicy, AffinityMatchesGeneratedSerialOracle) { GeneratedOracle<A
 
 TEST(EigenRapidPolicy, StaticFullCohortNeedsNoOrdinaryTasks) {
   ThreadPool pool(3, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 3}};
+  RapidStartGroup group{&pool, {0, 3}};
   eigen_test_support::WaitForResidentWorkers(group, 5s);
   std::array<unsigned, 100> workers{};
   partitioner_detail::Metrics metrics;
@@ -113,8 +111,7 @@ TEST(EigenRapidPolicy, StaticFullCohortNeedsNoOrdinaryTasks) {
 
 TEST(EigenRapidPolicy, AffinityRoutesCapturedOwnersAndRemembersWorkerZero) {
   ThreadPool pool(3, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 3}};
+  RapidStartGroup group{&pool, {0, 3}};
   AffinityPartitioner policy;
   std::atomic<size_t> *history = nullptr;
   {
@@ -141,8 +138,7 @@ TEST(EigenRapidPolicy, AffinityRoutesCapturedOwnersAndRemembersWorkerZero) {
 
 TEST(EigenRapidPolicy, FallbackRetainsTheSelectedPolicy) {
   ThreadPool pool(3, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 3}};
+  RapidStartGroup group{&pool, {0, 3}};
   pool.SetResidentLimit(0);
   partitioner_detail::Metrics simple, statical;
   size_t activated = 99;
@@ -155,8 +151,7 @@ TEST(EigenRapidPolicy, FallbackRetainsTheSelectedPolicy) {
 
 TEST(EigenRapidPolicy, PartialDomainAndGrainLimitReleaseCapturedHelpers) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {2, 7}};
+  RapidStartGroup group{&pool, {2, 7}};
   for (unsigned repeat = 0; repeat < 16; ++repeat) {
     eigen_test_support::WaitForResidentWorkers(group, 5s);
     std::array<std::atomic<unsigned>, 10> visits{};
@@ -180,8 +175,7 @@ TEST(EigenRapidPolicy, UnusedPrefixSlotsAreExplicitlyEmpty) {
 
 template <typename Policy> void NestedAndConcurrent() {
   ThreadPool pool(5, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 5}};
+  RapidStartGroup group{&pool, {0, 5}};
   Policy policy;
   std::array<std::atomic<unsigned>, 17 * 7> actual{};
   rapid::ParallelFor(group, 0, 17, [&](size_t i) {
@@ -209,8 +203,7 @@ TEST(EigenRapidPolicy, AllPoliciesSupportNestedAndConcurrentCalls) {
 
 template <typename Policy> void FailureContracts() {
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   Policy policy;
   std::atomic<unsigned> active{0}, late{0};
   std::atomic<bool> alive{true};
@@ -244,8 +237,7 @@ TEST(EigenRapidPolicy, ExceptionsAndCancellationJoinAllPolicies) {
 template <typename Policy> void CancelBeforePublication() {
   for (size_t size : {size_t{2}, size_t{257}}) {
     ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, 4}};
+    RapidStartGroup group{&pool, {0, 4}};
     eigen_test_support::WaitForResidentWorkers(group, 5s);
     std::atomic<unsigned> calls{0};
     size_t activated = 0;
@@ -271,9 +263,8 @@ TEST(EigenRapidPolicy, EmptyInvalidAndParkingGroupsRetainTheirContracts) {
   EXPECT_EQ(activated, 0u);
   EXPECT_EQ(calls, 0u);
   ThreadPool pool(2, false, true);
-  RapidDomainState domain(pool);
-  EXPECT_THROW(rapid::ParallelFor({&domain, {0, 3}}, 0, 10, [](size_t) {}, AutoPartitioner{}), std::invalid_argument);
-  EXPECT_THROW(rapid::ParallelFor({&domain, {0, 2}}, 0, 10, [](size_t) {}, StaticPartitioner{}), std::invalid_argument);
+  EXPECT_THROW(rapid::ParallelFor({&pool, {0, 3}}, 0, 10, [](size_t) {}, AutoPartitioner{}), std::invalid_argument);
+  EXPECT_THROW(rapid::ParallelFor({&pool, {0, 2}}, 0, 10, [](size_t) {}, StaticPartitioner{}), std::invalid_argument);
 }
 }
 

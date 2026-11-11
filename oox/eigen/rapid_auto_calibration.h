@@ -71,10 +71,10 @@ inline AutoCalibrationResult CalibrateAutoGroup(RapidStartGroup group,
   AutoCalibrationResult result;
   if (group.IsEmpty()) return result;
   group.Validate();
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   if (!pool.UsesResidentBusyWait() || group.domain.start != 0 || group.domain.limit != pool.NumThreads())
     throw std::invalid_argument("Auto calibration requires the full resident-capable pool");
-  if (pool.IsExecutingTask() || CurrentResidentState())
+  if (pool.IsExecutingTask() || CurrentResidentPool())
     throw std::logic_error("Auto calibration requires a quiet startup/control context");
   if (!(options.relative_tolerance >= 0 && options.relative_tolerance <= 0.25))
     throw std::invalid_argument("Auto calibration tolerance must be between 0 and 0.25");

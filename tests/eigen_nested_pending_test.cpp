@@ -57,16 +57,16 @@ struct Blocker {
 };
 enum class Inner { Generic,Named };
 void FastLeaf(ThreadPool &pool,rapid::RapidStartGroup group,Inner path,bool fail=false) {
-  const auto context=rapid::CurrentResidentState();const bool executing=pool.IsExecutingTask();
+  const auto context=rapid::CurrentResidentPool();const bool executing=pool.IsExecutingTask();
   unsigned calls=0;
   auto body=[&](size_t i){EXPECT_EQ(i,0u);++calls;if(fail)throw std::runtime_error("caught inner fastleaf");};
   try {
     if(path==Inner::Named)rapid::ParallelForAuto(group,0,1,body,8);
     else ParallelFor(pool,0,1,body,8);
   }catch(...) {
-    EXPECT_EQ(calls,1u);EXPECT_EQ(rapid::CurrentResidentState(),context);EXPECT_EQ(pool.IsExecutingTask(),executing);throw;
+    EXPECT_EQ(calls,1u);EXPECT_EQ(rapid::CurrentResidentPool(),context);EXPECT_EQ(pool.IsExecutingTask(),executing);throw;
   }
-  EXPECT_EQ(calls,1u);EXPECT_EQ(rapid::CurrentResidentState(),context);EXPECT_EQ(pool.IsExecutingTask(),executing);
+  EXPECT_EQ(calls,1u);EXPECT_EQ(rapid::CurrentResidentPool(),context);EXPECT_EQ(pool.IsExecutingTask(),executing);
 }
 struct GrownResult {bool progress=false,tail=false;unsigned mask=0;};
 GrownResult Grown(Inner path,bool repeated=false,bool owner_throw=false,bool near_max=false) {
@@ -77,7 +77,7 @@ GrownResult Grown(Inner path,bool repeated=false,bool owner_throw=false,bool nea
   std::atomic<unsigned> private_mask{0},active{0};
   std::atomic<bool> inside{false},foreign_tail{false},running_moved{false},closed{false},after_return{false};
   ThreadPool pool(2,true,true,WorkerIdleMode::ResidentBusy);pool.SetResidentLimit(0);
-  rapid::RapidDomainState state(pool);rapid::RapidStartGroup group{&state,{0,2}};
+  rapid::RapidStartGroup group{&pool,{0,2}};
   Blocker helper(pool);const auto owner=std::this_thread::get_id();
   EXPECT_EQ(helper.worker,1u);EXPECT_NE(helper.thread,owner);
   GrownResult result;unsigned caught=0;
@@ -151,7 +151,7 @@ TEST(EigenNestedPending, FastLeafNotifiesWaitingHelperForWholeTerminalTail) {
     std::array<std::atomic<unsigned>,2> visits{};
     std::atomic<bool> foreign{false},moved_running{false};
     ThreadPool pool(2,false,true,WorkerIdleMode::ResidentBusy);pool.SetResidentLimit(0);
-    rapid::RapidDomainState state(pool);rapid::RapidStartGroup group{&state,{0,2}};
+    rapid::RapidStartGroup group{&pool,{0,2}};
     Blocker helper(pool);
     const auto owner=std::this_thread::get_id();bool parked=false,progress=false;
     EXPECT_EQ(helper.worker,1u);EXPECT_NE(helper.thread,owner);
@@ -188,7 +188,7 @@ TEST(EigenNestedPending, DelayedWholeTerminalTaskJoinsOrRejectsExpiredCallbackAf
     std::atomic<bool> early{false},returned_before_admission{false};
     auto workers=std::make_unique<ThreadPool>(2,true,true,WorkerIdleMode::ResidentBusy);
     auto &pool=*workers;pool.SetResidentLimit(0);
-    rapid::RapidDomainState state(pool);rapid::RapidStartGroup group{&state,{0,2}};
+    rapid::RapidStartGroup group{&pool,{0,2}};
     Blocker helper(pool);const auto owner=std::this_thread::get_id();bool reached=false;
     pending_observer::acquired=[&] {
       if(std::this_thread::get_id()==owner || acquired.exchange(true))return;

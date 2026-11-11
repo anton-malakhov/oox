@@ -32,7 +32,7 @@ public:
   void Run(size_t slot) noexcept final {
     const size_t index = frontier_.ForSlot(slot);
     if (index == frontier_.Size()) return;
-    ScopedResidentState resident(*group_.state);
+    ScopedResidentPool resident(*group_.pool);
     region_.pool.RunInlineWork([&] {
       const auto &seed = frontier_.At(index);
       partitioner_detail::TaskContext<State> context{
@@ -60,7 +60,7 @@ template <size_t Capacity, typename F, typename State>
 void Execute(RapidStartGroup group, size_t begin, size_t end, F &function,
              State state, size_t grain, partitioner_detail::Metrics *metrics,
              size_t *activated, size_t capacity) {
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   OOX_SCHED_EVENT("rapid_begin", ::oox::scheduler_trace::Current());
   const auto release = [](partitioner_detail::Region *region) { region->TaskComplete(); };
   std::unique_ptr<partitioner_detail::Region, decltype(release)> region(
@@ -92,12 +92,12 @@ void ParallelFor(RapidStartGroup group, size_t begin, size_t end, F &&function,
   if (activated) *activated = 0;
   if (group.IsEmpty() || begin >= end) return;
   group.Validate();
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   if (!pool.UsesResidentBusyWait())
     throw std::invalid_argument("Rapid partitioners require a resident-capable pool");
   if (pool.IsCancelled()) return;
   grain = std::max(grain, size_t{1});
-  if (CurrentResidentState() || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
+  if (CurrentResidentPool() || pool.IsExecutingTask() || pool.NumThreads() == 1 ||
       end - begin <= grain || !pool.HasResidentAvailableWorker(group.domain)) {
     OOX_SCHED_EVENT("rapid_fallback", ::oox::scheduler_trace::Current());
     return pool.RunInlineWork([&] {

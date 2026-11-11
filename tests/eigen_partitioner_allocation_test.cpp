@@ -113,14 +113,13 @@ void verify_rapid_auto_allocation_failures() {
   using namespace oox::detail::eigen_pool;
   using namespace oox::detail::eigen_pool::rapid;
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState state(pool);
   unsigned hits = 0;
   for (int ordinal = 0; ordinal < 64; ++ordinal) {
     injected = false;
     fail_after = ordinal % 32;
     bool caught = false;
     try {
-      ParallelForAuto({&state, {0, 4}}, 0, 65537, [](size_t) {},
+      ParallelForAuto({&pool, {0, 4}}, 0, 65537, [](size_t) {},
                          1, nullptr, nullptr);
     } catch (const std::bad_alloc &) { caught = true; }
     fail_after = -1;
@@ -130,7 +129,7 @@ void verify_rapid_auto_allocation_failures() {
     }
     hits += injected;
     std::array<std::atomic<unsigned>, 257> visits{};
-    ParallelForAuto({&state, {0, 4}}, 0, visits.size(), [&](size_t i) { ++visits[i]; });
+    ParallelForAuto({&pool, {0, 4}}, 0, visits.size(), [&](size_t i) { ++visits[i]; });
     for (auto &v : visits) if (v != 1) std::_Exit(11);
   }
   if (!hits) std::_Exit(12);
@@ -140,8 +139,7 @@ void verify_terminal_pairs_do_not_allocate() {
   using namespace oox::detail::eigen_pool;
   using namespace oox::detail::eigen_pool::rapid;
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState state(pool);
-  RapidStartGroup group{&state, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   for (unsigned test = 0; test < 32; ++test) {
     eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(2));
     std::array<std::atomic<unsigned>, 2> visits{};
@@ -165,8 +163,7 @@ void verify_terminal_pairs_do_not_allocate() {
 template <typename Policy> void verify_rapid_policy_allocation_failures() {
   using namespace oox::detail::eigen_pool;
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(pool);
-  rapid::RapidStartGroup group{&state, {0, 4}};
+  rapid::RapidStartGroup group{&pool, {0, 4}};
   unsigned hits = 0;
   for (int ordinal = 0; ordinal < 32; ++ordinal) {
     Policy policy; // Include the first Affinity-history allocation in injection.

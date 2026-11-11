@@ -92,7 +92,6 @@ int main() {
     bool called = false;
     auto body = [&](size_t) { called = true; };
     auto callback = std::make_unique<decltype(body)>(body);
-    rapid::RapidDomainState domain(pool);
     using Launch = rapid::batch_detail::Launch<decltype(body)>;
     using Work = Launch::Work;
     using Join = Launch::Join;
@@ -100,7 +99,7 @@ int main() {
     watched = region;
     Work *held = nullptr;
     {
-      Launch launch(rapid::RapidStartGroup{&domain, {0, 1}}, *region, callback.get());
+      Launch launch(rapid::RapidStartGroup{&pool, {0, 1}}, *region, callback.get());
       launch.Prepare({0, 2, 1}, 1);
       const auto seed = launch.GetSeed(0);
       if (!region->IsComplete() || seed.parent ||
@@ -122,7 +121,6 @@ int main() {
     watched = nullptr;
     regions_destroyed = 0;
     ThreadPool donation_pool(2, false, false);
-    rapid::RapidDomainState domain(donation_pool);
     bool called = false;
     auto body = [&](size_t) { called = true; };
     auto callback = std::make_unique<decltype(body)>(body);
@@ -133,7 +131,7 @@ int main() {
     watched = region;
     Work *held = nullptr;
     {
-      Launch launch(rapid::RapidStartGroup{&domain, {0, 2}}, *region, function);
+      Launch launch(rapid::RapidStartGroup{&donation_pool, {0, 2}}, *region, function);
       launch.Prepare({0, 128, 1}, 1);
       auto seed = launch.GetSeed(0);
       if (!region->IsComplete() || seed.parent ||
@@ -159,7 +157,6 @@ int main() {
     bool called = false;
     auto body = [&](size_t) { called = true; };
     auto callback = std::make_unique<decltype(body)>(body);
-    rapid::RapidDomainState domain(pool);
     using Launch = rapid::batch_detail::Launch<decltype(body)>;
     using Work = Launch::Work;
     using Join = Launch::Join;
@@ -167,7 +164,7 @@ int main() {
     watched = region;
     Work *last = nullptr;
     {
-      Launch launch(rapid::RapidStartGroup{&domain, {0, 1}}, *region, callback.get());
+      Launch launch(rapid::RapidStartGroup{&pool, {0, 1}}, *region, callback.get());
       launch.Prepare({0, 128, 1}, 0);
       const auto seed = launch.GetSeed(0);
       if (!region->IsComplete() || seed.parent) return 13;

@@ -86,7 +86,6 @@ void RapidCompletion(bool remote, bool registered, unsigned trace) {
   internal::completion_notifications = 0;
   internal::completion_waits = 0;
   ThreadPool pool(2, false, registered, WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState domain(pool);
   std::array<std::atomic<unsigned>, 2> visits{};
   std::atomic<bool> started{false}, release{false};
   auto body = [&](size_t i) {
@@ -102,7 +101,7 @@ void RapidCompletion(bool remote, bool registered, unsigned trace) {
   };
   auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
   using Launch = rapid::batch_detail::Launch<decltype(body), 2>;
-  Launch launch(rapid::RapidStartGroup{&domain, {0, 2}}, *region, &body);
+  Launch launch(rapid::RapidStartGroup{&pool, {0, 2}}, *region, &body);
   launch.Prepare({0, 2, 1}, 1);
   if (remote) {
     // Captured commands are joined separately and do not retain Region.

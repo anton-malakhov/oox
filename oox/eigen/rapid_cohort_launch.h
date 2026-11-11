@@ -11,7 +11,7 @@ namespace oox::detail::eigen_pool::rapid::detail {
 template <size_t Participants, class Launch, class Prepare>
 size_t RunCohort(RapidStartGroup group, partitioner_detail::Region &region,
                  Launch &launch, size_t capacity, Prepare prepare) {
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   std::array<unsigned, Participants - 1> workers;
   const size_t helpers = pool.ClaimResidentWorkers(group.domain, workers.data(), capacity);
   OOX_SCHED_EVENT("rapid_claimed", ::oox::scheduler_trace::Current(), helpers, capacity);

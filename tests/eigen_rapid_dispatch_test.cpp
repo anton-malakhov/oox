@@ -26,7 +26,6 @@ TEST(EigenRapidDispatch, OwnerSeedsMatchIndependentOracle) {
   constexpr uint64_t seed = 0x280928;
   uint64_t random = seed;
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   struct Expected {
     size_t begin, end, budget;
     unsigned depth = 5;
@@ -49,7 +48,7 @@ TEST(EigenRapidDispatch, OwnerSeedsMatchIndependentOracle) {
     };
     using Launch = batch_detail::Launch<decltype(body), 8>;
     auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr);
-    std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
+    std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, 8}}, *region, &body);
     launch->Prepare({begin, begin + size, grain}, helpers);
 
     // Deliberately plain serial model: distribute extras and accumulate
@@ -103,7 +102,6 @@ template <size_t Participants> void CheckDirectOrderAndRangeOracle() {
   // Prefix/dispatch can be tested directly on a parking pool: no actual
   // resident capture is involved, and unused test workers need not busy-spin.
   ThreadPool pool(Participants, false, true);
-  RapidDomainState domain(pool);
   for (size_t trace = 0; trace < 256; ++trace) {
     random = random * 6364136223846793005ULL + 1;
     const size_t size = trace < 64 ? trace + 1 : trace >= 252
@@ -125,7 +123,7 @@ template <size_t Participants> void CheckDirectOrderAndRangeOracle() {
     };
     using Launch = batch_detail::Launch<decltype(body), Participants>;
     auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr);
-    std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, Participants}}, *region, &body);
+    std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, Participants}}, *region, &body);
     launch->Prepare({begin, begin + size, grain}, helpers);
     for (size_t owner = 0; owner <= helpers; ++owner) {
       std::vector<size_t> expected_direct, observed;
@@ -198,13 +196,12 @@ TEST(EigenRapidDispatch, AdmittedOwnerKeepsClosingRegionAlive) {
 
 TEST(EigenRapidDispatch, GrainSizedSeedsNeedNoDescendantTasks) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   std::array<std::atomic<unsigned>, 8> visits{};
   auto body = [&](size_t i) { ++visits[i]; };
   using Launch = batch_detail::Launch<decltype(body), 8>;
   partitioner_detail::Metrics metrics;
   auto *region = NewSmallObject<partitioner_detail::Region>(pool, &metrics);
-  std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
+  std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, 8}}, *region, &body);
   launch->Prepare({0, 8, 1}, 7);
   EXPECT_EQ(launch->SeedCount(), 8u);
   for (size_t i = 0; i < launch->SeedCount(); ++i) {
@@ -291,14 +288,13 @@ TEST(EigenRapidDispatch, ClosedAndCancelledStackOwnersRejectExpiredCallbacks) {
   for (bool registered : {false, true}) {
     for (bool cancel : {false, true}) {
       ThreadPool pool(8, true, registered, WorkerIdleMode::ResidentBusy);
-      RapidDomainState domain(pool);
       std::atomic<bool> called{false};
       auto body = [&](size_t) { called = true; };
       auto callback = std::make_unique<decltype(body)>(body);
       auto metrics = std::make_unique<partitioner_detail::Metrics>();
       using Launch = batch_detail::Launch<decltype(body), 8>;
       auto *region = NewSmallObject<partitioner_detail::Region>(pool, metrics.get());
-      std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}},
+      std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, 8}},
                                    *region, callback.get());
       launch->Prepare({0, 65536, 1}, 7);
       region->CloseAndWait();

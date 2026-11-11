@@ -62,8 +62,7 @@ TEST(EigenRapidCancellation, ConcurrentRootsMatchSerialOracleBeforeAndAfterPubli
           std::to_string(test) + " phase=" + std::to_string(phase);
       SCOPED_TRACE(context);
       ThreadPool pool(callers + 1, true, true, WorkerIdleMode::ResidentBusy);
-      RapidDomainState domain(pool);
-      eigen_test_support::WaitForResidentWorkers({&domain, {0, callers + 1}},
+      eigen_test_support::WaitForResidentWorkers({&pool, {0, callers + 1}},
                                                  std::chrono::seconds(10));
       std::vector<std::atomic<unsigned>> actual(callers * size);
       std::vector<std::atomic<size_t>> callback_entries(callers);
@@ -91,7 +90,7 @@ TEST(EigenRapidCancellation, ConcurrentRootsMatchSerialOracleBeforeAndAfterPubli
           // before any root may publish ordinary work.
           const DomainId workers = terminal ? DomainId{0, callers + 1} :
                                                DomainId{root + 1, root + 2};
-          ParallelForAuto({&domain, workers}, begin, begin + size,
+          ParallelForAuto({&pool, workers}, begin, begin + size,
               [&](size_t i) {
                 ++callback_entries[root]; // Count even incorrectly admitted calls.
                 if (pool.IsCancelled()) return; // Cooperative callback policy.
@@ -200,8 +199,7 @@ TEST(EigenRapidCancellation, SharedDomainBatchesAndOrdinaryFallbackMatchSerialOr
           " case=" + std::to_string(test) + " phase=" + std::to_string(phase);
       SCOPED_TRACE(context);
       ThreadPool pool(5, true, true, WorkerIdleMode::ResidentBusy);
-      RapidDomainState domain(pool);
-      RapidStartGroup group{&domain, {0, 5}};
+      RapidStartGroup group{&pool, {0, 5}};
       eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(10));
       HeldWorkers held{pool, context.c_str()};
       held.Start();

@@ -369,7 +369,7 @@ TEST(EigenNestedAncestor, NamedAutoMixedDepthsMatchSerialAndRestoreAfterThrow) {
   for(unsigned workers:{1u,2u,4u})for(unsigned depth:{1u,3u,5u}) {
     SCOPED_TRACE(::testing::Message()<<"workers="<<workers<<" depth="<<depth);
     ThreadPool pool(workers,true,true,WorkerIdleMode::ResidentBusy);
-    RapidDomainState state(pool);RapidStartGroup group{&state,{0,workers}};
+    RapidStartGroup group{&pool,{0,workers}};
     size_t leaves=1;for(unsigned i=0;i<depth;++i)leaves*=3;
     std::vector<std::atomic<unsigned>> visits(leaves),values(leaves);
     std::function<void(unsigned,size_t)> walk;
@@ -382,7 +382,7 @@ TEST(EigenNestedAncestor, NamedAutoMixedDepthsMatchSerialAndRestoreAfterThrow) {
     };
     pool.RunInlineWork([&]{walk(0,0);});
     for(size_t i=0;i<leaves;++i) {EXPECT_EQ(visits[i].load(),1u);EXPECT_EQ(values[i].load(),unsigned(i*31+11));}
-    EXPECT_FALSE(pool.IsExecutingTask());EXPECT_EQ(CurrentResidentState(),nullptr);
+    EXPECT_FALSE(pool.IsExecutingTask());EXPECT_EQ(CurrentResidentPool(),nullptr);
     std::atomic<unsigned> active{0};
     std::function<void(unsigned)> fail;
     fail=[&](unsigned level) {
@@ -395,7 +395,7 @@ TEST(EigenNestedAncestor, NamedAutoMixedDepthsMatchSerialAndRestoreAfterThrow) {
       });
     };
     EXPECT_THROW(pool.RunInlineWork([&]{fail(0);}),std::runtime_error);
-    EXPECT_EQ(active.load(),0u);EXPECT_FALSE(pool.IsExecutingTask());EXPECT_EQ(CurrentResidentState(),nullptr);
+    EXPECT_EQ(active.load(),0u);EXPECT_FALSE(pool.IsExecutingTask());EXPECT_EQ(CurrentResidentPool(),nullptr);
     std::array<std::atomic<unsigned>,31> reuse{};
     ParallelForAuto(group,0,reuse.size(),[&](size_t i){++reuse[i];});
     for(auto &value:reuse)EXPECT_EQ(value.load(),1u);

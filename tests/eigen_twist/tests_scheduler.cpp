@@ -59,8 +59,7 @@ enum class Mode { Fixed, Lazy, Auto, Simple, Static, Affinity };
 template <Mode mode, unsigned threads = 3>
 void ResidentLoops() {
   pool::ThreadPool workers(threads, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, threads}};
+  rapid::RapidStartGroup group{&workers, {0, threads}};
   pool::AffinityPartitioner affinity;
   for (unsigned repeat = 0; repeat < 3; ++repeat) {
     WaitReady(workers);
@@ -86,8 +85,7 @@ void ResidentLoops() {
 
 void LazyRequiresTailSteal() {
   pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, 3}};
+  rapid::RapidStartGroup group{&workers, {0, 3}};
   WaitReady(workers);
   std::array<sync::atomic<unsigned>, 17> visits{};
   pool::partitioner_detail::Metrics metrics;
@@ -104,8 +102,7 @@ void LazyRequiresTailSteal() {
 
 void NestedLazy() {
   pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, 3}};
+  rapid::RapidStartGroup group{&workers, {0, 3}};
   WaitReady(workers);
   std::array<sync::atomic<unsigned>, 15> visits{};
   rapid::ParallelForAuto(group, 0, 5, [&](size_t outer) {
@@ -119,8 +116,7 @@ void NestedLazy() {
 
 void ConcurrentCallers() {
   pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, 3}};
+  rapid::RapidStartGroup group{&workers, {0, 3}};
   WaitReady(workers);
   sync::thread external([&] {
     CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
@@ -131,8 +127,7 @@ void ConcurrentCallers() {
 
 void LazyExceptionAndReuse() {
   pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, 3}};
+  rapid::RapidStartGroup group{&workers, {0, 3}};
   WaitReady(workers);
   bool caught = false;
   try {
@@ -184,8 +179,7 @@ void DelayedCohortFinalize() {
 void LazyWithOutsiders() {
   pool::ThreadPool workers(4, false, true, pool::WorkerIdleMode::ResidentBusy);
   workers.SetResidentLimit(2);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, 2}};
+  rapid::RapidStartGroup group{&workers, {0, 2}};
   WaitReady(workers);
   CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
 }

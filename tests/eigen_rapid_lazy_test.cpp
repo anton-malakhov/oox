@@ -178,8 +178,7 @@ TEST(EigenRapidLazy, BusyOwnersDoNotPublishSpeculativeTasks) {
   uint64_t random = seed;
   for (unsigned workers : {2u, 3u, 8u}) {
     ThreadPool pool(workers, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, workers}};
+    RapidStartGroup group{&pool, {0, workers}};
     for (unsigned test = 0; test < 40; ++test) {
       random = random * 6364136223846793005ULL + 1;
       const size_t size = test < 32 ? workers + test : test < 37
@@ -234,8 +233,7 @@ TEST(EigenRapidLazy, BusyOwnersDoNotPublishSpeculativeTasks) {
 
 TEST(EigenRapidLazy, FinishedResidentReceivesWorkFromAnActiveOwner) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   constexpr size_t size = 4096;
   std::vector<std::atomic<unsigned>> actual(size);
   std::atomic<bool> helper_received{false};
@@ -257,8 +255,7 @@ TEST(EigenRapidLazy, FinishedResidentReceivesWorkFromAnActiveOwner) {
 
 TEST(EigenRapidLazy, FinishedCallerReceivesWorkBeforeResidentCommandCompletes) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   constexpr size_t size = 4096;
   std::vector<std::atomic<unsigned>> actual(size);
   std::atomic<bool> caller_received{false};
@@ -277,8 +274,7 @@ TEST(EigenRapidLazy, FinishedCallerReceivesWorkBeforeResidentCommandCompletes) {
 
 TEST(EigenRapidLazy, AnotherIdleHelperDoesNotWaitForTheFirstDonationToFinish) {
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   constexpr size_t size = 4096;
   std::vector<std::atomic<unsigned>> actual(size);
   std::atomic<bool> first_started{false}, second_received{false};

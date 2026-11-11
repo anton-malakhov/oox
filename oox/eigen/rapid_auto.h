@@ -21,7 +21,7 @@ struct NestedLazyPartitioner {
 template <typename F>
 bool TryTerminalPair(RapidStartGroup group, size_t begin, size_t end, F &function,
                      size_t grain, partitioner_detail::Metrics *metrics, size_t *activated) {
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   partitioner_detail::LoopRange left(begin, end, grain);
   const partitioner_detail::LoopRange right(left, partitioning::Split{});
   assert(!left.IsDivisible() && !right.IsDivisible());
@@ -35,7 +35,7 @@ bool TryTerminalPair(RapidStartGroup group, size_t begin, size_t end, F &functio
       if (metrics) metrics->private_chunks.fetch_add(1, std::memory_order_relaxed);
     });
   };
-  ResidentRegion<decltype(body)> region(*group.state, body, 0, 2, 2, 1);
+  ResidentRegion<decltype(body)> region(pool, body, 0, 2, 2, 1);
   unsigned worker = 0;
   if (!pool.ClaimResidentWorkers(group.domain, &worker, 1)) return false;
 #ifdef OOX_EIGEN_TEST_RAPID_CLAIMED
@@ -81,7 +81,7 @@ public:
 
   void Run(size_t slot) noexcept final {
     if (slot >= seed_count_) return;
-    ScopedResidentState context(*group_.state);
+    ScopedResidentPool context(*group_.pool);
     region_.pool.RunInlineWork([&] {
 #ifdef OOX_EIGEN_TEST_RAPID_DIRECT_SEED
       OOX_EIGEN_TEST_RAPID_DIRECT_SEED(slot, slot);
@@ -126,7 +126,7 @@ template <size_t Participants, typename F>
 void Execute(RapidStartGroup group, size_t begin, size_t end, F &function,
              size_t grain, partitioner_detail::Metrics *metrics,
              size_t *activated, size_t capacity) {
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   const auto release_region = [](partitioner_detail::Region *region) { region->TaskComplete(); };
   OOX_SCHED_EVENT("rapid_begin", ::oox::scheduler_trace::Current());
   std::unique_ptr<partitioner_detail::Region, decltype(release_region)> region(
@@ -159,17 +159,17 @@ void ParallelForAuto(RapidStartGroup group, size_t begin, size_t end,
   if (activated) *activated = 0;
   if (group.IsEmpty() || begin >= end) return;
   group.Validate();
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   if (!pool.UsesResidentBusyWait())
     throw std::invalid_argument("Rapid auto requires a resident-capable pool");
   if (pool.IsCancelled()) return;
   grain = std::max(grain, size_t{1});
   // Snapshot before RunInlineWork establishes this entry's own ancestry.
-  const bool nested = CurrentResidentState() || pool.IsExecutingTask();
+  const bool nested = CurrentResidentPool() || pool.IsExecutingTask();
   if (nested || pool.NumThreads() == 1 ||
       end - begin <= grain || !pool.HasResidentAvailableWorker(group.domain)) {
     OOX_SCHED_EVENT("rapid_fallback", ::oox::scheduler_trace::Current(),
-        (CurrentResidentState() ? 1u : 0u) | (pool.IsExecutingTask() ? 2u : 0u) |
+        (CurrentResidentPool() ? 1u : 0u) | (pool.IsExecutingTask() ? 2u : 0u) |
         (pool.NumThreads() == 1 ? 4u : 0u) | (end - begin <= grain ? 8u : 0u),
         pool.ResidentAvailableWorkers(group.domain));
     // Ordinary Auto executes its root directly on this caller. Preserve the

@@ -45,7 +45,6 @@ TEST(EigenRapidAuto, AutoSplitsPreserveBinaryBudget) {
 
 TEST(EigenRapidAuto, OwnerRangesMatchSerialEqualRangeOracle) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   size_t test = 0;
   for (size_t size : {2u, 3u, 7u, 8u, 17u, 129u, 4097u}) {
     for (size_t grain : {1u, 2u, 7u}) {
@@ -55,7 +54,7 @@ TEST(EigenRapidAuto, OwnerRangesMatchSerialEqualRangeOracle) {
         auto body = [&](size_t i) { ++visits[i]; };
         using Launch = batch_detail::Launch<decltype(body)>;
         auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
-        std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
+        std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, 8}}, *region, &body);
         launch->Prepare({0, size, grain}, helpers);
         struct Expected { size_t begin, end, budget; };
         const size_t owners = std::min(size, helpers + 1);
@@ -101,8 +100,7 @@ TEST(EigenRapidAuto, OwnerRangesMatchSerialEqualRangeOracle) {
 
 TEST(EigenRapidAuto, GrainSizedOwnersNeedNoOrdinaryTaskAllocations) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 8}};
+  RapidStartGroup group{&pool, {0, 8}};
   eigen_test_support::WaitForResidentWorkers(group, 2s);
   partitioner_detail::Metrics metrics;
   size_t activated = 0;
@@ -115,13 +113,12 @@ TEST(EigenRapidAuto, GrainSizedOwnersNeedNoOrdinaryTaskAllocations) {
 
 TEST(EigenRapidAuto, InitialRangesBelongOnlyToCapturedOwners) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   for (size_t helpers : {1u, 7u}) {
     std::vector<std::atomic<unsigned>> visits(4096);
     auto body = [&](size_t i) { ++visits[i]; };
     using Launch = batch_detail::Launch<decltype(body)>;
     auto *region = NewSmallObject<partitioner_detail::Region>(pool, nullptr, true);
-    std::optional<Launch> launch(std::in_place, RapidStartGroup{&domain, {0, 8}}, *region, &body);
+    std::optional<Launch> launch(std::in_place, RapidStartGroup{&pool, {0, 8}}, *region, &body);
     launch->Prepare({0, visits.size(), 1}, helpers);
     EXPECT_TRUE(region->IsComplete());
     EXPECT_EQ(launch->SeedCount(), helpers + 1);
@@ -148,7 +145,6 @@ TEST(EigenRapidAuto, GeneratedRangesMatchSerialOracle) {
   for (unsigned workers : {1u, 3u, 8u}) {
     for (bool caller_registered : {false, true}) {
       ThreadPool pool(workers, true, caller_registered, WorkerIdleMode::ResidentBusy);
-      RapidDomainState domain(pool);
       uint64_t random = seed;
       for (size_t test = 0; test < 100; ++test) {
         random = random * 6364136223846793005ULL + 1;
@@ -164,7 +160,7 @@ TEST(EigenRapidAuto, GeneratedRangesMatchSerialOracle) {
         for (size_t i = 0; i < size; ++i) expected[i] = (begin + i) % 23 + 1;
         std::atomic<bool> outside{false};
         const unsigned start = workers > 1 && test % 3 == 0 ? 1 : 0;
-        ParallelForAuto({&domain, {start, workers}}, begin, begin + size, [&](size_t i) {
+        ParallelForAuto({&pool, {start, workers}}, begin, begin + size, [&](size_t i) {
           if (i < begin || i - begin >= size) { outside = true; return; }
           actual[i - begin].fetch_add(i % 23 + 1, std::memory_order_relaxed);
         }, grain);
@@ -178,8 +174,7 @@ TEST(EigenRapidAuto, GeneratedRangesMatchSerialOracle) {
 
 TEST(EigenRapidAuto, ActivatesExistingAutoTasks) {
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   eigen_test_support::WaitForResidentWorkers(group, 2s);
   partitioner_detail::Metrics metrics;
   size_t activated = 0;
@@ -197,8 +192,7 @@ TEST(EigenRapidAuto, ExpandedFrontierMatchesSerialOracle) {
   constexpr uint64_t seed = 0x240926;
   for (unsigned workers : {2u, 3u, 4u, 8u}) {
     ThreadPool pool(workers, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, workers}};
+    RapidStartGroup group{&pool, {0, workers}};
     uint64_t random = seed;
     for (size_t test = 0; test < 100; ++test) {
       random = random * 6364136223846793005ULL + 1;
@@ -219,14 +213,13 @@ TEST(EigenRapidAuto, ExpandedFrontierMatchesSerialOracle) {
 
 TEST(EigenRapidAuto, CompletedCommandStaysReadyWithoutStealing) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   eigen_test_support::WaitForResidentWorkers(group, 2s);
   const auto before = pool.GetStatistics();
   std::atomic<size_t> visits{0};
   for (size_t launch = 0; launch < 100; ++launch) {
     auto body = [&](size_t, size_t) { ++visits; };
-    ResidentRegion<decltype(body)> region(domain, body, 0, 2, 2, 1);
+    ResidentRegion<decltype(body)> region(pool, body, 0, 2, 2, 1);
     unsigned worker = 0;
     ASSERT_EQ(pool.ClaimResidentWorkers(group.domain, &worker, 1), 1u);
     pool.PublishResident(region, region.CompletionCounter(), worker, 1);
@@ -243,8 +236,7 @@ TEST(EigenRapidAuto, CompletedCommandStaysReadyWithoutStealing) {
 
 TEST(EigenRapidAuto, NestedAndConcurrentRootsMatchSerialOracle) {
   ThreadPool pool(8, true, false, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 8}};
+  RapidStartGroup group{&pool, {0, 8}};
   std::vector<std::atomic<unsigned>> visits(2048);
   const auto run = [&] {
     ParallelForAuto(group, 0, 32, [&](size_t row) {
@@ -263,10 +255,26 @@ TEST(EigenRapidAuto, NestedAndConcurrentRootsMatchSerialOracle) {
   for (const auto &count : visits) EXPECT_EQ(count.load(), 3u);
 }
 
+TEST(EigenRapidAuto, SingletonFixedGroupKeepsWiderAutoLaunchNested) {
+  ThreadPool pool(3, true, true, WorkerIdleMode::ResidentBusy);
+  const RapidStartGroup inner{&pool, {1, 3}};
+  eigen_test_support::WaitForResidentWorkers(inner, 2s);
+  std::array<std::atomic<unsigned>, 17> visits{};
+  size_t activated = 99;
+  ParallelForResidentRanges({&pool, {0, 1}}, 0, 1, [&](size_t, size_t) {
+    // The caller directly runs the fixed range while both helpers are available.
+    EXPECT_FALSE(pool.IsExecutingTask());
+    EXPECT_EQ(pool.ResidentAvailableWorkers(inner.domain), 2u);
+    ParallelForAuto(inner, 0, visits.size(), [&](size_t i) { ++visits[i]; },
+                    1, nullptr, &activated);
+  });
+  EXPECT_EQ(activated, 0u);
+  for (const auto &count : visits) EXPECT_EQ(count.load(), 1u);
+}
+
 TEST(EigenRapidAuto, OrdinaryFallbackKeepsNestedActivationDisabled) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   const auto run = [&](auto &&body, size_t *activated) {
     ParallelForAuto(group, 0, 2,
         std::forward<decltype(body)>(body), 1, nullptr, activated);
@@ -294,8 +302,7 @@ TEST(EigenRapidAuto, OrdinaryFallbackKeepsNestedActivationDisabled) {
 
 TEST(EigenRapidAuto, OrdinaryFallbackRestoresAncestryAfterException) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   auto body = [&](size_t i) {
     EXPECT_TRUE(pool.IsExecutingTask());
     if (i == 0) throw std::runtime_error("fallback root callback");
@@ -312,8 +319,7 @@ TEST(EigenRapidAuto, OrdinaryFallbackRestoresAncestryAfterException) {
 
 TEST(EigenRapidAuto, ExceptionsJoinCallbacksAndAllowReuse) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 8}};
+  RapidStartGroup group{&pool, {0, 8}};
   eigen_test_support::WaitForResidentWorkers(group, 2s);
   std::atomic<unsigned> active{0};
   EXPECT_THROW(ParallelForAuto(group, 0, 65536, [&](size_t i) {
@@ -333,8 +339,7 @@ TEST(EigenRapidAuto, ExceptionsJoinCallbacksAndAllowReuse) {
 TEST(EigenRapidAuto, CancellationJoinsResidentCommands) {
   for (size_t cancel_at : {0u, 31u, 4096u}) {
     ThreadPool pool(8, true, false, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, 8}};
+    RapidStartGroup group{&pool, {0, 8}};
     eigen_test_support::WaitForResidentWorkers(group, 2s);
     ParallelForAuto(group, 0, 65536, [&](size_t i) {
       if (i == cancel_at) pool.Cancel();
@@ -345,11 +350,10 @@ TEST(EigenRapidAuto, CancellationJoinsResidentCommands) {
 
 TEST(EigenRapidAuto, OrdinaryTasksProgressBetweenResidentCommands) {
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   std::atomic<size_t> ordinary{0};
   for (size_t launch = 0; launch < 100; ++launch) {
     pool.Schedule(MakeTask([&] { ++ordinary; }));
-    ParallelForAuto({&domain, {0, 4}}, 0, 1024, [](size_t) {}, 1, nullptr, nullptr);
+    ParallelForAuto({&pool, {0, 4}}, 0, 1024, [](size_t) {}, 1, nullptr, nullptr);
   }
   pool.Wait([&] { return ordinary.load() == 100; });
   EXPECT_EQ(ordinary.load(), 100u);
@@ -357,7 +361,6 @@ TEST(EigenRapidAuto, OrdinaryTasksProgressBetweenResidentCommands) {
 
 TEST(EigenRapidAuto, ClosedAutoTaskDoesNotAccessExpiredCallback) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   bool called = false;
   auto body = [&](size_t) { called = true; };
   auto callback = std::make_unique<decltype(body)>(body);
@@ -380,7 +383,6 @@ TEST(EigenRapidAuto, ClosedAutoTaskDoesNotAccessExpiredCallback) {
 
 TEST(EigenRapidAuto, ReconfigurationDuringWorkMatchesSerialOracle) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   std::atomic<bool> stop{false};
   struct Join {
     std::atomic<bool> &stop;
@@ -397,7 +399,7 @@ TEST(EigenRapidAuto, ReconfigurationDuringWorkMatchesSerialOracle) {
     std::vector<std::atomic<unsigned>> actual(257 + test);
     std::vector<unsigned> expected(actual.size());
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = i % 19 + 1;
-    ParallelForAuto({&domain, {0, 8}}, 0, actual.size(),
+    ParallelForAuto({&pool, {0, 8}}, 0, actual.size(),
         [&](size_t i) { actual[i].fetch_add(i % 19 + 1); }, 1, nullptr, nullptr);
     for (size_t i = 0; i < actual.size(); ++i)
       ASSERT_EQ(actual[i].load(), expected[i]) << "case=" << test << " index=" << i;
@@ -406,10 +408,9 @@ TEST(EigenRapidAuto, ReconfigurationDuringWorkMatchesSerialOracle) {
 
 TEST(EigenRapidAuto, LargePoolsUseBoundedActivationSlots) {
   ThreadPool pool(65, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   std::vector<std::atomic<unsigned>> visits(4097);
   size_t activated = 0;
-  ParallelForAuto({&domain, {0, 65}}, 0, visits.size(), [&](size_t i) { ++visits[i]; },
+  ParallelForAuto({&pool, {0, 65}}, 0, visits.size(), [&](size_t i) { ++visits[i]; },
                      1, nullptr, &activated);
   EXPECT_LE(activated, 63u);
   for (const auto &count : visits) EXPECT_EQ(count.load(), 1u);
@@ -425,7 +426,6 @@ TEST(EigenRapidAuto, CalibrationSelectionUsesToleranceAndSmallerCohort) {
 
 TEST(EigenRapidAuto, CalibrationProbesMatchSerialOracle) {
   ThreadPool pool(3, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   for (size_t limit : {0u, 1u, 3u}) {
     pool.SetResidentLimit(limit);
     for (unsigned kind = 0; kind < 3; ++kind) {
@@ -437,7 +437,7 @@ TEST(EigenRapidAuto, CalibrationProbesMatchSerialOracle) {
           value = (value ^ (value >> 27)) * 0x3c79ac492ba7b653ULL + step;
         expected[i] = value;
       }
-      EXPECT_GT(auto_calibration_detail::Probe({&domain, {0, 3}}, actual, kind), 0u);
+      EXPECT_GT(auto_calibration_detail::Probe({&pool, {0, 3}}, actual, kind), 0u);
       EXPECT_EQ(actual, expected) << "limit=" << limit << " kind=" << kind;
     }
   }
@@ -445,8 +445,7 @@ TEST(EigenRapidAuto, CalibrationProbesMatchSerialOracle) {
 
 TEST(EigenRapidAuto, CalibrationFallbackCancellationAndReuse) {
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   const auto disabled = CalibrateAutoGroup(group, {0ns});
   EXPECT_TRUE(disabled.trials.empty());
   EXPECT_EQ(pool.ResidentLimit(), 0u);
@@ -456,7 +455,7 @@ TEST(EigenRapidAuto, CalibrationFallbackCancellationAndReuse) {
   std::vector<std::atomic<unsigned>> visits(4096);
   ParallelForAuto(group, 0, visits.size(), [&](size_t i) { ++visits[i]; });
   for (const auto &value : visits) EXPECT_EQ(value.load(), 1u);
-  EXPECT_THROW(CalibrateAutoGroup({&domain, {1, 4}}), std::invalid_argument);
+  EXPECT_THROW(CalibrateAutoGroup({&pool, {1, 4}}), std::invalid_argument);
   EXPECT_THROW(CalibrateAutoGroup(group, {100ms, -1}), std::invalid_argument);
   EXPECT_THROW(CalibrateAutoGroup(group,
       {100ms, std::numeric_limits<double>::quiet_NaN()}), std::invalid_argument);
@@ -469,11 +468,10 @@ TEST(EigenRapidAuto, CalibrationFallbackCancellationAndReuse) {
 
 TEST(EigenRapidAuto, CalibrationRejectsTaskContext) {
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
   auto done = std::make_shared<std::promise<void>>();
   auto completed = done->get_future();
   pool.Schedule(MakeTask([&, done] {
-    EXPECT_THROW(CalibrateAutoGroup({&domain, {0, 2}}), std::logic_error);
+    EXPECT_THROW(CalibrateAutoGroup({&pool, {0, 2}}), std::logic_error);
     done->set_value();
   }));
   eigen_test_support::GetReady(completed, "calibration task-context rejection");
@@ -483,8 +481,7 @@ TEST(EigenRapidAuto, CalibrationRejectsTaskContext) {
 TEST(EigenRapidAuto, CalibrationHandlesEmptyAndSingleWorker) {
   EXPECT_TRUE(CalibrateAutoGroup({}).trials.empty());
   ThreadPool pool(1, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  const auto result = CalibrateAutoGroup({&domain, {0, 1}});
+  const auto result = CalibrateAutoGroup({&pool, {0, 1}});
   EXPECT_TRUE(result.trials.empty());
   EXPECT_EQ(pool.ResidentLimit(), 0u);
 }
@@ -492,8 +489,7 @@ TEST(EigenRapidAuto, CalibrationHandlesEmptyAndSingleWorker) {
 TEST(EigenRapidAuto, TerminalPairsMatchSerialOracleAndAutoMidpoint) {
   constexpr uint64_t seed = 0x240930;
   ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 4}};
+  RapidStartGroup group{&pool, {0, 4}};
   size_t test = 0;
   for (size_t grain : {1u, 2u, 3u, 7u, 31u}) {
     for (size_t size = grain + 1; size <= 2 * grain; ++size) {
@@ -525,8 +521,7 @@ TEST(EigenRapidAuto, TerminalPairsMatchSerialOracleAndAutoMidpoint) {
 TEST(EigenRapidAuto, TerminalPairsJoinExceptionsCancellationAndNestedWork) {
   for (unsigned scenario = 0; scenario < 3; ++scenario) {
     ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState domain(pool);
-    RapidStartGroup group{&domain, {0, 2}};
+    RapidStartGroup group{&pool, {0, 2}};
     eigen_test_support::WaitForResidentWorkers(group, 2s);
     std::atomic<unsigned> active{0};
     std::vector<std::atomic<unsigned>> visits(128);
@@ -555,8 +550,7 @@ TEST(EigenRapidAuto, TerminalPairsJoinExceptionsCancellationAndNestedWork) {
 
 TEST(EigenRapidAuto, TerminalPairsPreferReadyRecipientAndDoNotWaitForBusyOne) {
   ThreadPool pool(8, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  RapidStartGroup group{&domain, {0, 8}};
+  RapidStartGroup group{&pool, {0, 8}};
   std::vector<std::atomic<unsigned>> actual(512);
   for (size_t test = 0; test < 256; ++test) {
     SCOPED_TRACE(test);
@@ -595,17 +589,15 @@ TEST(EigenRapidAuto, TerminalPairsPreferReadyRecipientAndDoNotWaitForBusyOne) {
 TEST(EigenRapidAuto, EmptyInvalidAndDisabledGroups) {
   EXPECT_NO_THROW(ParallelForAuto({}, 0, 10, [](size_t) {}));
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState domain(pool);
-  EXPECT_THROW(ParallelForAuto({&domain, {0, 3}}, 0, 10, [](size_t) {}), std::invalid_argument);
+  EXPECT_THROW(ParallelForAuto({&pool, {0, 3}}, 0, 10, [](size_t) {}), std::invalid_argument);
   pool.SetResidentLimit(0);
   size_t activated = 99;
   std::atomic<unsigned> visits{0};
-  ParallelForAuto({&domain, {0, 2}}, 0, 1024, [&](size_t) { ++visits; }, 1, nullptr, &activated);
+  ParallelForAuto({&pool, {0, 2}}, 0, 1024, [&](size_t) { ++visits; }, 1, nullptr, &activated);
   EXPECT_EQ(activated, 0u);
   EXPECT_EQ(visits.load(), 1024u);
   ThreadPool parked(2, true, false);
-  RapidDomainState parked_domain(parked);
-  EXPECT_THROW(ParallelForAuto({&parked_domain, {0, 2}}, 0, 10, [](size_t) {}), std::invalid_argument);
+  EXPECT_THROW(ParallelForAuto({&parked, {0, 2}}, 0, 10, [](size_t) {}), std::invalid_argument);
 }
 } // namespace
 

@@ -13,8 +13,7 @@ namespace rapid = oox::detail::eigen_pool::rapid;
 
 class Runtime {
 public:
-  Runtime() : state_(EigenPool()),
-      group_{&state_, {0, static_cast<unsigned>(GetNumThreads())}} {
+  Runtime() : group_{&EigenPool(), {0, static_cast<unsigned>(GetNumThreads())}} {
     bool automatic = EIGEN_MODE == EIGEN_RAPID_AUTO;
     if (const char *value = std::getenv("OOX_RAPID_AUTOCALIBRATE"))
       automatic = automatic && benchmark_arguments::Number<unsigned>(value,
@@ -42,7 +41,6 @@ public:
 #endif
   }
 private:
-  rapid::RapidDomainState state_;
   rapid::RapidStartGroup group_;
   rapid::AutoCalibrationResult calibration_;
 };

@@ -13,8 +13,7 @@ namespace rapid_policy_eval {
 namespace eigen = oox::detail::eigen_pool;
 class Runtime {
 public:
-  Runtime() : state_(EigenPool()),
-      group_{&state_, {0, static_cast<unsigned>(GetNumThreads())}} {
+  Runtime() : group_{&EigenPool(), {0, static_cast<unsigned>(GetNumThreads())}} {
     if (const char *value = std::getenv("OOX_RAPID_RESIDENT_LIMIT"))
       EigenPool().SetResidentLimit(benchmark_arguments::Number<unsigned>(value,
           "OOX_RAPID_RESIDENT_LIMIT", 0, GetNumThreads()));
@@ -29,7 +28,6 @@ public:
 #endif
   }
 private:
-  eigen::rapid::RapidDomainState state_;
   eigen::rapid::RapidStartGroup group_;
   eigen::OOX_RAPID_POLICY policy_;
 };

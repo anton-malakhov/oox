@@ -22,8 +22,7 @@ void CheckAutomaticPool(size_t expected) {
   Check(pool.ResidentLimit() == expected, "wrong initial resident limit");
   pool.SetResidentLimit(std::numeric_limits<size_t>::max());
   Check(pool.ResidentLimit() == expected, "explicit limit escaped automatic ceiling");
-  rapid::RapidDomainState state(pool);
-  rapid::RapidStartGroup group{&state, {0, 4}};
+  rapid::RapidStartGroup group{&pool, {0, 4}};
   for (size_t limit : {size_t{0}, expected, size_t{1}, expected}) {
     pool.SetResidentLimit(limit);
     std::array<std::atomic<unsigned>, 35> visits{};
@@ -79,8 +78,7 @@ int main() {
       std::thread external([&] { inherited = affinity(); });
       external.join();
       Check(inherited == original, "external client inherited a worker mask");
-      rapid::RapidDomainState state(pool);
-      rapid::RapidStartGroup group{&state, {0, 4}};
+      rapid::RapidStartGroup group{&pool, {0, 4}};
       eigen_test_support::WaitForResidentWorkers(group, std::chrono::seconds(5));
       std::array<std::vector<unsigned long>, 4> masks;
       rapid::ParallelForResidentRanges(group, 0, 4, [&](size_t, size_t) {
