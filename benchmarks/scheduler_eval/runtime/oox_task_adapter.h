@@ -45,7 +45,7 @@ void ParallelFor(std::size_t first, std::size_t last, F &&body,
   // Nested calls rely on the pool's cooperative wait (workers execute queued
   // work), not a passive OS wait. Re-run nested/saturated-pool tests whenever
   // queue order, helping, or completion notification changes.
-  static_cast<void>(oox::wait_and_get(done));
+  [[maybe_unused]] auto result = oox::wait_and_get(done);
 }
 
 inline void InitParallel(std::size_t threads) {
@@ -55,5 +55,5 @@ inline void InitParallel(std::size_t threads) {
         "OOX_TASKS worker count differs from requested threads; configure "
         "-DOOX_EIGEN_THREADS to match --threads");
   auto warmup = oox::run([] { return 0; });
-  static_cast<void>(oox::wait_and_get(warmup));
+  [[maybe_unused]] auto warmup_result = oox::wait_and_get(warmup);
 }

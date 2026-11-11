@@ -34,7 +34,7 @@ public:
     const auto workers = pool.NumThreads();
     const auto current = pool.CurrentThreadId();
     const auto first = current == std::size_t(-1) ? 0 : current;
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<scheduler_sync::mutex> lock(mutex_);
     if (history_ && history_.use_count() != 1) {
       lock.unlock();
       return partitioning::AffinityPartitionState(
@@ -48,7 +48,7 @@ public:
   }
 
 private:
-  std::mutex mutex_;
+  scheduler_sync::mutex mutex_;
   ThreadPool *pool_ = nullptr;
   std::shared_ptr<partitioning::AffinityHistory> history_;
 };
@@ -58,12 +58,12 @@ namespace partitioner_detail {
 inline constexpr unsigned max_depth = std::numeric_limits<size_t>::digits;
 
 struct Metrics {
-  std::atomic<size_t> owner_ranges{0};
-  std::atomic<size_t> range_tasks{0};
-  std::atomic<size_t> initial_tasks{0};
-  std::atomic<size_t> stolen_tasks{0};
-  std::atomic<size_t> donated_ranges{0};
-  std::atomic<size_t> private_chunks{0};
+  scheduler_sync::atomic<size_t> owner_ranges{0};
+  scheduler_sync::atomic<size_t> range_tasks{0};
+  scheduler_sync::atomic<size_t> initial_tasks{0};
+  scheduler_sync::atomic<size_t> stolen_tasks{0};
+  scheduler_sync::atomic<size_t> donated_ranges{0};
+  scheduler_sync::atomic<size_t> private_chunks{0};
 };
 
 class Region final : public SmallObjectAllocated<Region> {
@@ -109,7 +109,7 @@ public:
     return cancelled.load(std::memory_order_relaxed) || pool.IsCancelled();
   }
   void Fail(std::exception_ptr error) noexcept {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    std::lock_guard<scheduler_sync::mutex> lock(error_mutex);
     if (!exception)
       exception = std::move(error);
     cancelled.store(true, std::memory_order_release);
@@ -123,11 +123,11 @@ public:
   Metrics *const metrics;
 
 private:
-  std::atomic<size_t> remaining{1};
+  scheduler_sync::atomic<size_t> remaining{1};
   static constexpr size_t closed = size_t{1} << (max_depth - 1);
-  std::atomic<size_t> active{0};
-  std::atomic<bool> cancelled{false};
-  std::mutex error_mutex;
+  scheduler_sync::atomic<size_t> active{0};
+  scheduler_sync::atomic<bool> cancelled{false};
+  scheduler_sync::mutex error_mutex;
   std::exception_ptr exception;
 };
 
@@ -204,7 +204,7 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
     while (node) {
       // Capture metadata before the RMW can allow FinishExecution to free us.
       PeerJoin *parent = node->parent;
-      std::thread::id caller;
+      scheduler_sync::thread::id caller;
       if constexpr (requires(const Owner &owner) { owner.PublishingThreadId(); }) {
         if (IsRoot(parent))
           caller = static_cast<const Owner *>(node)->PublishingThreadId();
@@ -220,8 +220,8 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
         // cannot be parked while executing this completion; other threads notify.
         auto *region = reinterpret_cast<Region *>(
             reinterpret_cast<uintptr_t>(parent) & ~root_bit);
-        region->TaskComplete(caller == std::thread::id{} ||
-                             caller != std::this_thread::get_id());
+        region->TaskComplete(caller == scheduler_sync::thread::id{} ||
+                             caller != scheduler_sync::this_thread::get_id());
         return;
       }
       node = parent;
@@ -235,8 +235,8 @@ template <typename Owner, bool Enabled = true> struct PeerJoin {
   static constexpr unsigned branch_mask = 3;
   static constexpr unsigned executing = 4;
   PeerJoin *const parent;
-  std::atomic<unsigned> references{executing | 2};
-  std::atomic<bool> stolen{false};
+  scheduler_sync::atomic<unsigned> references{executing | 2};
+  scheduler_sync::atomic<bool> stolen{false};
 };
 
 // Non-adaptive policies already join through Region's task count.
@@ -265,7 +265,7 @@ template <typename Owner> struct Branch<Owner, false> {
 };
 
 template <bool Enabled> struct TaskOwner {};
-template <> struct TaskOwner<true> { std::thread::id owner; };
+template <> struct TaskOwner<true> { scheduler_sync::thread::id owner; };
 template <bool Enabled> struct TaskPlacement {};
 template <> struct TaskPlacement<true> {
   size_t hint = partitioning::no_affinity;
@@ -275,7 +275,7 @@ template <typename State>
 struct TaskContext : TaskOwner<State::adaptive>, TaskPlacement<State::uses_affinity> {
   TaskContext() noexcept {
     if constexpr (State::adaptive)
-      this->owner = std::this_thread::get_id();
+      this->owner = scheduler_sync::this_thread::get_id();
   }
   void SetHint(const State &state) noexcept {
     if constexpr (State::uses_affinity)
@@ -296,6 +296,7 @@ public:
        unsigned depth, Join *parent) noexcept
       : Join(parent), region_(region), function_(function), range_(range),
         state_(state) {
+    OOX_SCHED_EVENT("range_spec", this->trace_id, range.begin, range.end);
     state_.AlignDepth(depth);
     context_.SetHint(state_);
     if constexpr (!State::adaptive)
@@ -304,7 +305,7 @@ public:
       region_.metrics->range_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   ~Work() override = default;
-  std::thread::id PublishingThreadId() const noexcept requires(State::adaptive) {
+  scheduler_sync::thread::id PublishingThreadId() const noexcept requires(State::adaptive) {
     return context_.owner;
   }
   void operator()() final {
@@ -352,6 +353,7 @@ void OfferWork(Region &region, F *function, LoopRange range,
   auto *child = NewSmallObject<Work<F, State>>(
       region, function, range, State(state, split), depth, branch.Parent());
   branch.SetParent(child);
+  OOX_SCHED_EVENT("split", child->trace_id, range.begin, range.end, ::oox::scheduler_trace::Current());
   child->Publish();
 }
 
@@ -361,6 +363,8 @@ template <typename F, typename State>
 void Process(Region &region, F *function, LoopRange range,
              State state, PeerJoin<Work<F, State>, State::adaptive> *parent,
              TaskContext<State> context) noexcept {
+  OOX_SCHED_WORKER(region.pool.CurrentThreadId());
+  OOX_SCHED_SCOPE("range", ::oox::scheduler_trace::NextId(), range.begin, range.end);
   using Join = PeerJoin<Work<F, State>, State::adaptive>;
   // Release callback/metrics access before the branch can complete its tree.
   Branch<Work<F, State>, State::adaptive> branch{parent};
@@ -375,7 +379,7 @@ void Process(Region &region, F *function, LoopRange range,
     }
     if constexpr (State::adaptive) {
       if (state.NeedsStealCheck()) {
-        const bool stolen = std::this_thread::get_id() != context.owner;
+        const bool stolen = scheduler_sync::this_thread::get_id() != context.owner;
         const bool peer_active =
             stolen && parent && !Join::IsRoot(parent) && parent->HasPeer();
         if (state.CheckStolen(stolen, peer_active)) {
@@ -396,6 +400,7 @@ void Process(Region &region, F *function, LoopRange range,
     if (region.metrics)
       region.metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
     const auto run = [&](const LoopRange &chunk) {
+      OOX_SCHED_SCOPE("chunk", ::oox::scheduler_trace::NextId(), chunk.begin, chunk.end);
       for (size_t i = chunk.begin; i < chunk.end; ++i)
         std::invoke(*function, i);
       ++chunks;
@@ -446,6 +451,8 @@ void ParallelFor(ThreadPool &pool, size_t begin, size_t end,
     return;
   grain = std::max<size_t>(grain, 1);
   if (pool.NumThreads() == 1 || end - begin <= grain) {
+    OOX_SCHED_WORKER(pool.CurrentThreadId());
+    OOX_SCHED_SCOPE("chunk", ::oox::scheduler_trace::NextId(), begin, end);
     if (metrics) {
       metrics->owner_ranges.fetch_add(1, std::memory_order_relaxed);
       metrics->private_chunks.fetch_add(1, std::memory_order_relaxed);

@@ -20,6 +20,7 @@
 #include "run_queue.h"
 #include "stl_thread_env.h"
 #include "small_object_pool.h"
+#include "scheduler_trace.h"
 
 #include <atomic>
 #include <cassert>
@@ -42,13 +43,16 @@ namespace oox::detail::eigen_pool {
 
 #ifdef OOX_EIGEN_THREAD_POOL_TESTING
 namespace internal {
-inline std::atomic<size_t> completion_notifications{0};
-inline std::atomic<size_t> completion_waits{0};
+inline scheduler_sync::atomic<size_t> completion_notifications{0};
+inline scheduler_sync::atomic<size_t> completion_waits{0};
 }
 #endif
 
 struct Task {
-  std::atomic<size_t> *outstanding = nullptr;
+#ifdef OOX_SCHEDULER_TRACE
+  const uint64_t trace_id = ::oox::scheduler_trace::NextId();
+#endif
+  scheduler_sync::atomic<size_t> *outstanding = nullptr;
   virtual void operator()() = 0;
   virtual void Discard() noexcept { delete this; }
   virtual ~Task() = default;
@@ -144,6 +148,9 @@ public:
       ComputeCoprimes(i, &all_coprimes_.back());
     }
     thread_data_.resize(num_threads_);
+#ifdef OOX_SCHEDULER_TRACE
+    for (int i = 0; i < num_threads_; ++i) thread_data_[i].trace_worker = i;
+#endif
     const bool needs_fallback_worker = use_main_thread && num_threads_ == 1;
     if (use_main_thread) {
       RegisterCreator(!needs_fallback_worker);
@@ -221,6 +228,7 @@ public:
       auto *proxy = new AffinityProxy(task);
       pending.release();
       AccountTask(task, pt->thread_id);
+      OOX_SCHED_EVENT("offer_affinity", task->trace_id, hint, 0, ::oox::scheduler_trace::Current());
       if (!thread_data_[hint].affinity_mailbox.Push(proxy)) {
         inline_task = proxy->template Extract<AffinityProxy::mailbox_bit>();
         proxy->template Extract<AffinityProxy::local_bit>();
@@ -266,7 +274,7 @@ public:
     if (ActiveCancellation() == this) {
       return;
     }
-    std::call_once(cancellation_once_, [this] {
+    scheduler_sync::call_once(cancellation_once_, [this] {
       ThreadPoolTempl *&active = ActiveCancellation();
       ThreadPoolTempl *previous = std::exchange(active, this);
       struct RestoreCancellation {
@@ -368,8 +376,8 @@ public:
 
 private:
   static ThreadPoolTempl *&ActiveCancellation() noexcept {
-    static thread_local ThreadPoolTempl *active = nullptr;
-    return active;
+    struct Tag {};
+    return scheduler_sync::Local<ThreadPoolTempl *, Tag>();
   }
 
   void CancelOnce() {
@@ -378,7 +386,7 @@ private:
                                          std::memory_order_seq_cst);
     while ((ordinary_publication_state_.load(std::memory_order_acquire) &
             kPublicationPublisherMask) != 0) {
-      std::this_thread::yield();
+      scheduler_sync::this_thread::yield();
     }
     CancelOrdinaryQueues();
     done_.store(true, std::memory_order_release);
@@ -403,7 +411,7 @@ private:
 
   class PublicationGuard {
   public:
-    explicit PublicationGuard(std::atomic<size_t> &state) noexcept
+    explicit PublicationGuard(scheduler_sync::atomic<size_t> &state) noexcept
         : state_(state), admitted_((state.fetch_add(
                                         1, std::memory_order_relaxed) &
                                     kPublicationCancelled) == 0) {}
@@ -416,7 +424,7 @@ private:
     bool IsAdmitted() const noexcept { return admitted_; }
 
   private:
-    std::atomic<size_t> &state_;
+    scheduler_sync::atomic<size_t> &state_;
     bool admitted_;
   };
 
@@ -427,7 +435,7 @@ private:
       // consistency makes either that check or a concurrent notification win.
       const uint64_t epoch = epoch_.load(std::memory_order_seq_cst);
       waiters_.fetch_add(1, std::memory_order_seq_cst);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
+      scheduler_sync::atomic_thread_fence(std::memory_order_seq_cst);
       return epoch;
     }
 
@@ -443,7 +451,7 @@ private:
 
   private:
     void Notify(bool all) {
-      std::atomic_thread_fence(std::memory_order_seq_cst);
+      scheduler_sync::atomic_thread_fence(std::memory_order_seq_cst);
       if (waiters_.load(std::memory_order_seq_cst) == 0) {
         return;
       }
@@ -455,8 +463,8 @@ private:
       }
     }
 
-    std::atomic<uint64_t> epoch_{0};
-    std::atomic<size_t> waiters_{0};
+    scheduler_sync::atomic<uint64_t> epoch_{0};
+    scheduler_sync::atomic<size_t> waiters_{0};
   };
 
   static int ValidateThreadCount(int count) {
@@ -467,6 +475,8 @@ private:
   }
 
   void ExecuteTask(TaskPtr p) {
+    OOX_SCHED_WORKER(CurrentThreadId());
+    OOX_SCHED_SCOPE("task", p->trace_id);
 #ifdef OOX_EIGEN_ENABLE_STATS
     const PerThread *pt = GetPerThread();
     const size_t worker = IsRegistered(pt) ? static_cast<size_t>(pt->thread_id) : 0;
@@ -475,7 +485,7 @@ private:
 #endif
     struct FinishTask {
       ThreadPoolTempl *pool;
-      std::atomic<size_t> *outstanding;
+      scheduler_sync::atomic<size_t> *outstanding;
       ~FinishTask() { pool->TaskFinished(outstanding); }
     } finish{this, p->outstanding};
     try {
@@ -534,7 +544,7 @@ private:
       return reinterpret_cast<TaskPtr>(previous & ~locations);
     }
 
-    std::atomic<uintptr_t> task_and_locations;
+    scheduler_sync::atomic<uintptr_t> task_and_locations;
   };
 
   // A bounded mailbox carries the recipient-side references.
@@ -572,12 +582,12 @@ private:
 
 #ifdef OOX_EIGEN_ENABLE_STATS
   struct AtomicStatistics {
-    std::atomic<uint64_t> scheduled{0};
-    std::atomic<uint64_t> executed{0};
-    std::atomic<uint64_t> successful_steals{0};
-    std::atomic<uint64_t> failed_steal_rounds{0};
-    std::atomic<uint64_t> sleeps{0};
-    std::atomic<uint64_t> idle_nanoseconds{0};
+    scheduler_sync::atomic<uint64_t> scheduled{0};
+    scheduler_sync::atomic<uint64_t> executed{0};
+    scheduler_sync::atomic<uint64_t> successful_steals{0};
+    scheduler_sync::atomic<uint64_t> failed_steal_rounds{0};
+    scheduler_sync::atomic<uint64_t> sleeps{0};
+    scheduler_sync::atomic<uint64_t> idle_nanoseconds{0};
   };
 #endif
 
@@ -586,15 +596,20 @@ private:
         : thread(), outstanding_tasks(0), local_tasks(),
           mailbox(1024) {}
     std::unique_ptr<Thread> thread;
-    std::atomic<size_t> outstanding_tasks;
+    scheduler_sync::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+#ifdef OOX_SCHEDULER_TRACE
+    int trace_worker = -1;
+#endif
 #ifdef OOX_EIGEN_ENABLE_STATS
     AtomicStatistics statistics;
 #endif
 
     bool PushTask(TaskPtr p, bool localThread) {
+      OOX_SCHED_EVENT(localThread ? "offer_deque" : "offer_mailbox", p->trace_id,
+                      trace_worker, 0, ::oox::scheduler_trace::Current());
       if (localThread) {
         return local_tasks.PushFront(reinterpret_cast<QueueEntry>(p));
       } else {
@@ -604,23 +619,31 @@ private:
 
     TaskPtr PopFront() {
       while (auto entry = local_tasks.PopFront())
-        if (auto *task = ExtractEntry(entry))
+        if (auto *task = ExtractEntry(entry)) {
+          OOX_SCHED_EVENT("take_deque", task->trace_id, trace_worker);
           return task;
+        }
       while (auto *proxy = affinity_mailbox.Pop())
-        if (auto *task = proxy->template Extract<AffinityProxy::mailbox_bit>())
+        if (auto *task = proxy->template Extract<AffinityProxy::mailbox_bit>()) {
+          OOX_SCHED_EVENT("take_affinity", task->trace_id, trace_worker);
           return task;
+        }
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
+      if (task) OOX_SCHED_EVENT("take_mailbox", task->trace_id, trace_worker);
       return task;
     }
 
     TaskPtr PopBack(bool force) {
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
+      if (task) OOX_SCHED_EVENT("take_mailbox", task->trace_id, trace_worker);
       if (!task && force) {
         while (auto entry = local_tasks.PopBack())
-          if ((task = ExtractEntry(entry)))
+          if ((task = ExtractEntry(entry))) {
+            OOX_SCHED_EVENT("take_deque", task->trace_id, trace_worker);
             break;
+          }
       }
       return task;
     }
@@ -633,19 +656,19 @@ private:
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   const uint64_t pool_generation_;
 
-  std::once_flag cancellation_once_;
+  scheduler_sync::once_flag cancellation_once_;
   EventCount worker_event_;
   EventCount waiter_event_;
-  std::atomic<bool> done_;
-  std::atomic<bool> cancelled_;
+  scheduler_sync::atomic<bool> done_;
+  scheduler_sync::atomic<bool> cancelled_;
 
   bool creator_registered_ = false;
-  std::thread::id creator_thread_id_;
+  scheduler_sync::thread::id creator_thread_id_;
   PerThread creator_previous_registration_;
   // Generic publication admission is written for every scheduled task. Keep
   // it away from worker-loop counters so submissions do not invalidate a cache
   // line that every worker is reading.
-  alignas(OOX_EIGEN_CACHE_LINE_SIZE) std::atomic<size_t>
+  alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t>
       ordinary_publication_state_{0};
 
 
@@ -679,7 +702,7 @@ private:
             found_work = true;
             break;
           }
-          std::this_thread::yield();
+          scheduler_sync::this_thread::yield();
         }
       }
       if (found_work) {
@@ -715,8 +738,14 @@ private:
   }
 
   static uint64_t NextPoolGeneration() {
-    static std::atomic<uint64_t> next{1};
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+    struct Counter { scheduler_sync::atomic<uint64_t> next{1}; };
+    TWISTED_STATIC(Counter, counter);
+    return counter->next.fetch_add(1, std::memory_order_relaxed);
+#else
+    static scheduler_sync::atomic<uint64_t> next{1};
     return next.fetch_add(1, std::memory_order_relaxed);
+#endif
   }
 
   void RegisterThread(PerThread *pt, int thread_id, bool owns_queue) {
@@ -728,7 +757,7 @@ private:
   }
 
   void RegisterCreator(bool owns_queue) {
-    creator_thread_id_ = std::this_thread::get_id();
+    creator_thread_id_ = scheduler_sync::this_thread::get_id();
     PerThread *pt = GetPerThread();
     creator_previous_registration_ = *pt;
     RegisterThread(pt, 0, owns_queue);
@@ -737,7 +766,7 @@ private:
 
   void RestoreCreatorRegistration() {
     if (!creator_registered_ ||
-        creator_thread_id_ != std::this_thread::get_id()) {
+        creator_thread_id_ != scheduler_sync::this_thread::get_id()) {
       return;
     }
     PerThread *pt = GetPerThread();
@@ -781,6 +810,7 @@ private:
   TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local) {
     AccountTask(task, target);
     if (!thread_data_[target].PushTask(task, local)) {
+      OOX_SCHED_EVENT("inline_queue_full", task->trace_id, target);
       return task;
     }
     WakeOneWorker();
@@ -790,6 +820,7 @@ private:
   TaskPtr TryTakeOne() {
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
+    OOX_SCHED_WORKER(pt->thread_id);
 
     TaskPtr task = nullptr;
     if (pt->owns_queue) {
@@ -810,6 +841,7 @@ private:
 
   static void DiscardPublishedTask(TaskPtr task) noexcept {
     assert(task != nullptr);
+    OOX_SCHED_EVENT("discard", task->trace_id);
     auto *outstanding = task->outstanding;
     assert(outstanding != nullptr);
     task->Discard();
@@ -818,7 +850,7 @@ private:
     assert(previous > 0);
   }
 
-  void TaskFinished(std::atomic<size_t> *outstanding) {
+  void TaskFinished(scheduler_sync::atomic<size_t> *outstanding) {
     assert(outstanding != nullptr);
     const size_t previous = outstanding->fetch_sub(1, std::memory_order_seq_cst);
     assert(previous > 0);
@@ -894,6 +926,7 @@ private:
       assert(start + victim < limit);
       TaskPtr t = thread_data_[start + victim].PopBack(force);
       if (t) {
+        OOX_SCHED_EVENT("steal_queue", t->trace_id, start + victim, pt->thread_id);
 #ifdef OOX_EIGEN_ENABLE_STATS
         if (static_cast<int>(start + victim) != pt->thread_id)
           thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
@@ -917,13 +950,12 @@ private:
   TaskPtr GlobalSteal(bool force) { return Steal(0, num_threads_, force); }
 
   static inline uint64_t GlobalThreadIdHash() {
-    return std::hash<std::thread::id>()(std::this_thread::get_id());
+    return std::hash<scheduler_sync::thread::id>()(scheduler_sync::this_thread::get_id());
   }
 
   inline PerThread *GetPerThread() {
-    static thread_local PerThread per_thread_;
-    PerThread *pt = &per_thread_;
-    return pt;
+    struct Tag {};
+    return &scheduler_sync::Local<PerThread, Tag>();
   }
 
   static inline unsigned Rand(uint64_t *state) {

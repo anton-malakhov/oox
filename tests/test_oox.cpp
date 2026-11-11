@@ -36,7 +36,7 @@ TEST(OOXDeathTest, UnexpectedAllocationFailureFailsFast) {
             std::_Exit(0);
         }).detach();
         auto result = oox::run([]() -> int { throw std::bad_alloc{}; });
-        static_cast<void>(oox::wait_and_get(result));
+        [[maybe_unused]] auto unexpected_value = oox::wait_and_get(result);
     }, testing::ExitedWithCode(86), "");
 }
 #endif
@@ -1093,11 +1093,11 @@ TEST(OOX, ExceptionThrowingValueAssignmentPropagates) {
     oox::var<throwing_var_assignment_value, true> copied(throwing_var_assignment_value{1});
     const throwing_var_assignment_value replacement(2);
     copied = replacement;
-    EXPECT_THROW((void)oox::wait_and_get(copied), oox::cancelled_by_exception);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = oox::wait_and_get(copied), oox::cancelled_by_exception);
 
     oox::var<throwing_var_assignment_value, true> moved(throwing_var_assignment_value{1});
     moved = throwing_var_assignment_value{2};
-    EXPECT_THROW((void)oox::wait_and_get(moved), oox::cancelled_by_exception);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = oox::wait_and_get(moved), oox::cancelled_by_exception);
 }
 
 TEST(OOX, ExceptionFailedVersionCanBeOverwritten) {
