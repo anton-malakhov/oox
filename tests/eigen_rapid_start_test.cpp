@@ -122,6 +122,50 @@ TEST(EigenRapidResident, ClaimMaskMatchesScanningOracle) {
   }
 }
 
+TEST(EigenRapidResident, ClaimWorkersAcrossWordBoundaries) {
+  using oox::detail::eigen_pool::DomainId;
+  using oox::detail::eigen_pool::internal::ResidentWorkerSet;
+  constexpr unsigned size = 130;
+  ResidentWorkerSet workers(size, 0);
+  bool ready[size]{};
+  for (unsigned id : {1u, 62u, 63u, 64u, 65u, 66u, 126u, 127u, 128u, 129u}) {
+    ready[id] = true;
+    workers.Word(id / 64).Advertise(id, size);
+  }
+
+  unsigned ids[size]{};
+  auto check = [&](DomainId domain, size_t capacity, const std::vector<unsigned> &expected) {
+    SCOPED_TRACE(::testing::Message() << "domain=[" << domain.start << ',' << domain.limit
+                                     << ") capacity=" << capacity);
+    size_t available = 0;
+    for (unsigned id = domain.start; id < domain.limit; ++id) available += ready[id];
+    ASSERT_EQ(workers.Count(domain), available);
+    ASSERT_EQ(workers.Claim(domain, ids, capacity), expected.size());
+    EXPECT_EQ(std::vector<unsigned>(ids, ids + expected.size()), expected);
+    for (unsigned id : expected) ready[id] = false;
+    for (unsigned id = 0; id < size; ++id)
+      EXPECT_EQ(workers.Count({id, id + 1}), size_t(ready[id])) << "worker=" << id;
+  };
+
+  check({64, 64}, 8, {});
+  check({62, size}, 0, {});
+  check({63, 66}, 1, {63});
+  check({128, size}, 127, {128, 129});
+  // Rotation starts at 127. Select 127 then 64 and return the word's IDs in order.
+  check({0, size}, 2, {64, 127});
+  // Start in the depleted last word, wrap to the first, then continue in the second.
+  check({0, size}, 3, {1, 62, 65});
+  check({126, size}, 2, {126});
+  check({0, size}, size, {66});
+
+  ResidentWorkerSet caller_only(1, 1);
+  EXPECT_EQ(caller_only.Claim({0, 1}, ids, 2), 0u);
+
+  ResidentWorkerSet disabled(0, 0);
+  EXPECT_EQ(disabled.Count({0, size}), 0u);
+  EXPECT_EQ(disabled.Claim({0, size}, ids, 1), 0u);
+}
+
 TEST(EigenRapidResident, InterleavedPublicationsMatchSerialOracle) {
   constexpr uint64_t seed = 0x220929;
   uint64_t random = seed;

@@ -23,10 +23,10 @@
 #include "scheduler_trace.h"
 #include "resident_command.h"
 #include "resident_worker_mask.h"
+#include "resident_worker_set.h"
 #include "available_parallelism.h"
 
 #include <atomic>
-#include <bit>
 #include <cassert>
 #ifdef OOX_EIGEN_ENABLE_STATS
 #include <chrono>
@@ -49,23 +49,6 @@ namespace oox::detail::eigen_pool {
 // bit and poll a command slot instead of entering the OS parking protocol.
 // ResidentAuto bounds persistent polling by the CPU allowance at construction.
 enum class WorkerIdleMode { Park, ResidentBusy, ResidentAuto };
-
-struct DomainId {
-  unsigned start = 0;
-  unsigned limit = 0;
-
-  bool IsEmpty() const noexcept { return start == limit; }
-  bool IsValidFor(size_t workers) const noexcept {
-    return start < limit && limit <= workers;
-  }
-  size_t Size() const noexcept {
-    return limit >= start ? limit - start : 0;
-  }
-  bool Contains(size_t worker) const noexcept {
-    return worker >= start && worker < limit;
-  }
-};
-
 
 #ifdef OOX_EIGEN_THREAD_POOL_TESTING
 namespace internal {
@@ -167,26 +150,17 @@ public:
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
         pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
-        resident_available_words_(
-            idle_mode_ != WorkerIdleMode::Park
-                ? (static_cast<size_t>(num_threads_) + 63) / 64
-                : 0),
-        resident_available_(resident_available_words_ == 0
-                                ? nullptr
-                                : std::make_unique<internal::ResidentMaskWord[]>(
-                                      resident_available_words_)),
-        resident_broadcasts_(resident_available_words_ == 0
-                                ? nullptr
-                                : std::make_unique<ResidentBroadcast[]>(
-                                      resident_available_words_)),
+        resident_workers_(idle_mode_ == WorkerIdleMode::Park ? 0 : num_threads_,
+                          use_main_thread && num_threads_ > 1 ? 1 : 0),
+        resident_broadcasts_(resident_workers_.WordCount()
+            ? std::make_unique<ResidentBroadcast[]>(resident_workers_.WordCount()) : nullptr),
         done_(false),
         cancelled_(false),
         resident_placement_(idle_mode == WorkerIdleMode::ResidentAuto
             ? DiscoverResidentPlacement(num_threads_)
             : ResidentPlacement{idle_mode == WorkerIdleMode::Park ? 0 : size_t(num_threads_), {}}),
         resident_limit_max_(resident_placement_.limit),
-        resident_limit_(resident_limit_max_),
-        first_background_worker_(use_main_thread && num_threads_ > 1 ? 1 : 0) {
+        resident_limit_(resident_limit_max_) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
     // operations. Iteration is based on the fact that if we take
@@ -206,10 +180,8 @@ public:
     if (use_main_thread) {
       RegisterCreator(!needs_fallback_worker);
     }
-    const int first_background_worker =
-        use_main_thread && !needs_fallback_worker ? 1 : 0;
     try {
-      for (int i = first_background_worker; i < num_threads_; ++i) {
+      for (int i = resident_workers_.FirstBackgroundWorker(); i < num_threads_; ++i) {
         thread_data_[i].thread.reset(env_.CreateThread([this, i]() {
           PerThread *pt = GetPerThread();
           const PerThread previous = *pt;
@@ -392,42 +364,19 @@ public:
   }
 
   size_t ResidentCapacity(DomainId domain) const noexcept {
-    const size_t first = std::max<size_t>(domain.start, first_background_worker_);
-    const size_t last = std::min<size_t>(domain.limit, ResidentLimit());
-    return last > first ? last - first : 0;
+    return resident_workers_.Capacity(domain.LimitedTo(ResidentLimit()));
   }
 
   // A demand hint, not an idle-worker reservation. A waiter cancels its
   // registration before executing acquired work.
   bool HasWaitingHelper() const noexcept { return worker_event_.HasWaiters(); }
   size_t ResidentAvailableWorkers(DomainId domain) const noexcept {
-    domain.limit = static_cast<unsigned>(std::min<size_t>(domain.limit, ResidentLimit()));
-    size_t available = 0;
-    for (size_t word = 0; word < resident_available_words_; ++word) {
-      const uint64_t allowed = internal::ResidentMaskWord::DomainMask(word, domain.start, domain.limit);
-      available += std::popcount(resident_available_[word].Available(allowed));
-    }
-    return available;
+    return resident_workers_.Count(domain.LimitedTo(ResidentLimit()));
   }
 
   size_t ClaimResidentWorkers(DomainId domain, unsigned *workers,
                               size_t capacity) noexcept {
-    domain.limit = static_cast<unsigned>(std::min<size_t>(domain.limit, ResidentLimit()));
-    if (domain.start >= domain.limit || !UsesResidentBusyWait() || !capacity) return 0;
-    const size_t start = ResidentClaimStart(capacity);
-    size_t claimed = 0;
-    for (size_t offset = 0;
-         offset < resident_available_words_ && claimed < capacity; ++offset) {
-      const size_t word = (start / 64 + offset) % resident_available_words_;
-      const uint64_t allowed = internal::ResidentMaskWord::DomainMask(word, domain.start, domain.limit);
-      uint64_t selected = resident_available_[word].ClaimResidentWord(
-          allowed, static_cast<unsigned>(start % 64), capacity - claimed, num_threads_);
-      while (selected != 0) {
-        workers[claimed++] = static_cast<unsigned>(word * 64 + std::countr_zero(selected));
-        selected &= selected - 1;
-      }
-    }
-    return claimed;
+    return resident_workers_.Claim(domain.LimitedTo(ResidentLimit()), workers, capacity);
   }
 
   void PublishResident(ResidentTask &task, scheduler_sync::atomic<size_t> &completion,
@@ -454,7 +403,7 @@ public:
   // claims of any one worker therefore have strictly increasing epochs.
   uint64_t NextResidentEpoch() noexcept {
     if (SupportsPackedResidentCompletion())
-      return resident_available_[0].PackedEpoch(num_threads_, std::memory_order_acquire).value_or(0);
+      return resident_workers_.Word(0).PackedEpoch(num_threads_, std::memory_order_acquire).value_or(0);
     uint64_t observed = resident_dispatch_epoch_.load(std::memory_order_relaxed);
     const uint64_t maximum = internal::resident_global_clock_max;
     while (observed < maximum) {
@@ -486,13 +435,13 @@ public:
     return internal::ResidentMaskWord::DoneBits(mask, num_threads_);
   }
   bool ResidentBatchDone(size_t word, uint64_t mask) const noexcept {
-    return resident_available_[word].Completed(mask);
+    return resident_workers_.Word(word).Completed(mask);
   }
 
   // The selected finished-epoch or packed-done acquire must precede release.
   void ReleaseResidentEpochBatch(size_t word) noexcept {
     if (word == size_t(-1)) return;
-    resident_broadcasts_[word].ReleaseAfterJoin(word, resident_available_[word], num_threads_);
+    resident_broadcasts_[word].ReleaseAfterJoin(word, resident_workers_.Word(word), num_threads_);
   }
 
   template <typename Region> void HelpResidentUntil(Region &region) {
@@ -876,10 +825,8 @@ private:
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   const uint64_t pool_generation_;
   const WorkerIdleMode idle_mode_;
-  const size_t resident_available_words_;
-  std::unique_ptr<internal::ResidentMaskWord[]> resident_available_;
+  internal::ResidentWorkerSet resident_workers_;
   std::unique_ptr<ResidentBroadcast[]> resident_broadcasts_;
-  scheduler_sync::atomic<size_t> resident_claim_cursor_{0};
   alignas(128) scheduler_sync::atomic<uint64_t> resident_dispatch_epoch_{0};
 
   scheduler_sync::once_flag cancellation_once_;
@@ -904,7 +851,6 @@ private:
   ResidentPlacement resident_placement_;
   const size_t resident_limit_max_;
   alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t> resident_limit_;
-  const size_t first_background_worker_;
 
   bool IsResidentWorker(size_t worker) const noexcept {
     return UsesResidentBusyWait() && worker < ResidentLimit();
@@ -1101,18 +1047,8 @@ private:
     return true;
   }
 
-  size_t ResidentClaimStart(size_t capacity) noexcept {
-    // A single-helper launch takes the first ready worker. Larger claims rotate.
-    if (capacity == 1) return 0;
-    if (SupportsPackedResidentCompletion()) {
-      if (auto version = resident_available_[0].PackedEpoch(num_threads_, std::memory_order_relaxed))
-        return first_background_worker_ + *version % (num_threads_ - first_background_worker_);
-    }
-    return resident_claim_cursor_.fetch_add(capacity, std::memory_order_relaxed);
-  }
-
   void HintResidentOrdinaryWork() noexcept {
-    if (!UsesResidentBusyWait() || ResidentLimit() <= first_background_worker_) {
+    if (!UsesResidentBusyWait() || ResidentLimit() <= resident_workers_.FirstBackgroundWorker()) {
       return;
     }
     // Publication is only a probe hint, not a reservation of an idle worker.
@@ -1194,7 +1130,7 @@ private:
     if (!IsResidentWorker(worker)) return false;
     // Snapshot before advertising and always probe once for earlier publications.
     ResidentQueueScan scan{resident_publication_epoch_.load(std::memory_order_acquire)};
-    auto &availability = resident_available_[worker / 64];
+    auto &availability = resident_workers_.Word(worker / 64);
     availability.Advertise(worker, num_threads_);
     bool processed = false;
     unsigned polls = 0;
@@ -1202,7 +1138,7 @@ private:
       const auto command = thread_data_[worker].resident_command.Take(worker, resident_broadcasts_.get());
       if (command.task) {
         thread_data_[worker].resident_command.Run(command, worker);
-        command.Complete(worker, num_threads_, resident_available_[worker / 64],
+        command.Complete(worker, num_threads_, resident_workers_.Word(worker / 64),
                          thread_data_[worker].resident_finished);
         processed = true;
         scan.remaining = 0;
