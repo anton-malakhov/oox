@@ -49,6 +49,8 @@ An opt-in pool using `WorkerIdleMode::ResidentBusy` advertises idle workers.
 available helpers and invokes `callback(first, last)` once per participant,
 partitioning by the captured count rather than the nominal pool size.
 A warm launch uses a stack descriptor and no ordinary task allocation.
+A nested call to this API on the same pool invokes the entire inner range
+on the calling thread, even when the inner group selects different worker IDs.
 
 `WorkerIdleMode::ResidentAuto` bounds resident polling by the CPU allowance
 observed when the pool is constructed. On Linux it reads the creator's allowed CPUs and chooses one

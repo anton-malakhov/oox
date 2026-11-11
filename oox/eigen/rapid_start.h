@@ -17,54 +17,45 @@
 
 namespace oox::detail::eigen_pool::rapid {
 
-class RapidDomainState {
-public:
-  explicit RapidDomainState(ThreadPool &pool) noexcept : pool_(pool) {}
-  ThreadPool &Pool() noexcept { return pool_; }
-
-private:
-  ThreadPool &pool_;
-};
-
 struct RapidStartGroup {
-  RapidDomainState *state = nullptr;
+  ThreadPool *pool = nullptr;
   DomainId domain;
 
   bool IsEmpty() const noexcept {
-    return state == nullptr || domain.IsEmpty();
+    return pool == nullptr || domain.IsEmpty();
   }
 
   void Validate() const {
-    if (state && !domain.IsValidFor(state->Pool().NumThreads())) {
+    if (pool && !domain.IsValidFor(pool->NumThreads())) {
       throw std::invalid_argument("rapid domain is outside its thread pool");
     }
   }
 
   RapidStartGroup Subgroup(DomainId child) const {
     Validate();
-    if (!state || !child.IsValidFor(state->Pool().NumThreads()) ||
+    if (!pool || !child.IsValidFor(pool->NumThreads()) ||
         child.start < domain.start || child.limit > domain.limit) {
       throw std::invalid_argument("rapid subgroup is outside its parent");
     }
-    return {state, child};
+    return {pool, child};
   }
 };
 
-inline RapidDomainState *&CurrentResidentState() noexcept {
+inline ThreadPool *&CurrentResidentPool() noexcept {
   struct Tag {};
-  return scheduler_sync::Local<RapidDomainState *, Tag>();
+  return scheduler_sync::Local<ThreadPool *, Tag>();
 }
 
-class ScopedResidentState {
+class ScopedResidentPool {
 public:
-  explicit ScopedResidentState(RapidDomainState &state) noexcept
-      : previous_(std::exchange(CurrentResidentState(), &state)) {}
-  ScopedResidentState(const ScopedResidentState &) = delete;
-  ScopedResidentState &operator=(const ScopedResidentState &) = delete;
-  ~ScopedResidentState() { CurrentResidentState() = previous_; }
+  explicit ScopedResidentPool(ThreadPool &pool) noexcept
+      : previous_(std::exchange(CurrentResidentPool(), &pool)) {}
+  ScopedResidentPool(const ScopedResidentPool &) = delete;
+  ScopedResidentPool &operator=(const ScopedResidentPool &) = delete;
+  ~ScopedResidentPool() { CurrentResidentPool() = previous_; }
 
 private:
-  RapidDomainState *previous_;
+  ThreadPool *previous_;
 };
 
 using ResidentCohort = internal::ResidentCohort<ThreadPool>;
@@ -72,9 +63,9 @@ using ResidentCohort = internal::ResidentCohort<ThreadPool>;
 template <typename F>
 class ResidentRegion final : public ResidentTask {
 public:
-  ResidentRegion(RapidDomainState &state, F &function, size_t begin, size_t end,
+  ResidentRegion(ThreadPool &pool, F &function, size_t begin, size_t end,
                  size_t slots, size_t helpers) noexcept
-      : state_(state), function_(function), begin_(begin), end_(end),
+      : pool_(pool), function_(function), begin_(begin), end_(end),
         slots_(slots), remaining_(helpers) {}
 
   void RunCaller() noexcept { Run(0); }
@@ -93,7 +84,7 @@ public:
   }
 
   void Run(size_t slot) noexcept final {
-    ScopedResidentState context(state_);
+    ScopedResidentPool context(pool_);
     const size_t work = end_ - begin_;
     const size_t quotient = work / slots_;
     const size_t remainder = work % slots_;
@@ -101,7 +92,7 @@ public:
         begin_ + slot * quotient + std::min(slot, remainder);
     const size_t last = first + quotient + (slot < remainder ? 1 : 0);
     try {
-      if (!state_.Pool().IsCancelled() &&
+      if (!pool_.IsCancelled() &&
           !cancelled_.load(std::memory_order_acquire))
         std::invoke(function_, first, last);
     } catch (...) {
@@ -114,7 +105,7 @@ public:
   }
 
 private:
-  RapidDomainState &state_;
+  ThreadPool &pool_;
   F &function_;
   size_t begin_;
   size_t end_;
@@ -134,13 +125,15 @@ void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
     return;
   }
   group.Validate();
-  ThreadPool &pool = group.state->Pool();
+  ThreadPool &pool = *group.pool;
   if (!pool.UsesResidentBusyWait()) {
     throw std::invalid_argument("resident Rapid requires a resident-busy pool");
   }
-  if (CurrentResidentState() == group.state || group.domain.Size() == 1) {
-    if (!pool.IsCancelled())
+  if (CurrentResidentPool() == group.pool || group.domain.Size() == 1) {
+    if (!pool.IsCancelled()) {
+      ScopedResidentPool context(pool);
       std::invoke(function, begin, end);
+    }
     return;
   }
   constexpr size_t kMaximumParticipants = 64;
@@ -151,7 +144,7 @@ void ParallelForResidentRanges(RapidStartGroup group, size_t begin, size_t end,
   std::array<unsigned, kMaximumParticipants - 1> workers{};
   const size_t helpers = pool.ClaimResidentWorkers(
       group.domain, workers.data(), slots - 1);
-  ResidentRegion region(*group.state, function, begin, end, helpers + 1, helpers);
+  ResidentRegion region(pool, function, begin, end, helpers + 1, helpers);
   ResidentCohort cohort(pool, workers.data(), helpers, region.CompletionCounter());
   cohort.Publish(region);
   region.RunCaller();

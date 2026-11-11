@@ -73,13 +73,12 @@ template <typename Predicate> void Wait(Predicate ready, const char *stage) {
   eigen_test_support::WaitUntil(ready, context);
 }
 struct Runtime {
-  explicit Runtime(unsigned workers) : pool(workers, true, true, WorkerIdleMode::ResidentBusy), state(pool) {
+  explicit Runtime(unsigned workers) : pool(workers, true, true, WorkerIdleMode::ResidentBusy) {
     Hooks::Reset();
-    eigen_test_support::WaitForResidentWorkers({&state, {0, workers}}, 5s);
+    eigen_test_support::WaitForResidentWorkers({&pool, {0, workers}}, 5s);
   }
   ~Runtime() { Hooks::Release(); } // Release gates before the pool joins workers.
   ThreadPool pool;
-  RapidDomainState state;
 };
 struct Command final : ResidentTask {
   explicit Command(ThreadPool &p, bool held = false) : pool(p), held(held) {}
@@ -106,7 +105,7 @@ struct Command final : ResidentTask {
   std::atomic<unsigned> finished{0};
 };
 std::array<unsigned, 2> Claim(Runtime &runtime, DomainId domain) {
-  eigen_test_support::WaitForResidentWorkers({&runtime.state, domain}, 5s);
+  eigen_test_support::WaitForResidentWorkers({&runtime.pool, domain}, 5s);
   std::array<unsigned, 2> workers{};
   const size_t count = runtime.pool.ClaimResidentWorkers(domain, workers.data(), 2);
   if (count != 2) { ADD_FAILURE() << "seed=" << seed << " case=" << case_id; eigen_test_support::FailWait("claim two helpers"); }
@@ -243,7 +242,7 @@ TEST(EigenRapidEpoch, PackedSaturationAndOldLegacyFinalizePreserveNewDescriptor)
       Command single(runtime.pool);
       std::atomic<size_t> remaining{1};
       unsigned worker = 0;
-      eigen_test_support::WaitForResidentWorkers({&runtime.state, {1, 2}}, 5s);
+      eigen_test_support::WaitForResidentWorkers({&runtime.pool, {1, 2}}, 5s);
       if (runtime.pool.ClaimResidentWorkers({1, 2}, &worker, 1) != 1) eigen_test_support::FailWait("single clock advance");
       runtime.pool.PublishResident(single, remaining, worker, 1);
       Wait([&] { return remaining.load(std::memory_order_acquire) == 0; }, "single clock completion");
@@ -253,7 +252,7 @@ TEST(EigenRapidEpoch, PackedSaturationAndOldLegacyFinalizePreserveNewDescriptor)
       runtime.pool.SetResidentLimit(0);
       Wait([&] { return runtime.pool.HasWaitingHelper(); }, "park while preserving packed bits");
       runtime.pool.SetResidentLimit(5);
-      eigen_test_support::WaitForResidentWorkers({&runtime.state, {0, 5}}, 5s);
+      eigen_test_support::WaitForResidentWorkers({&runtime.pool, {0, 5}}, 5s);
       EXPECT_EQ(runtime.pool.NextResidentEpoch(), expected);
     }
     Command first(runtime.pool), held(runtime.pool, true), later(runtime.pool);

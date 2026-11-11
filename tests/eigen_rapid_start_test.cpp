@@ -34,30 +34,57 @@ namespace {
 using oox::detail::eigen_pool::MakeTask;
 using oox::detail::eigen_pool::ThreadPool;
 using oox::detail::eigen_pool::WorkerIdleMode;
-using oox::detail::eigen_pool::rapid::RapidDomainState;
+using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
 using oox::detail::eigen_pool::rapid::RapidStartGroup;
-using oox::detail::eigen_pool::rapid::ScopedResidentState;
-using oox::detail::eigen_pool::rapid::CurrentResidentState;
+using oox::detail::eigen_pool::rapid::ScopedResidentPool;
+using oox::detail::eigen_pool::rapid::CurrentResidentPool;
 using namespace std::chrono_literals;
 
-static_assert(!std::is_copy_constructible_v<ScopedResidentState>);
-static_assert(!std::is_copy_assignable_v<ScopedResidentState>);
+static_assert(!std::is_copy_constructible_v<ScopedResidentPool>);
+static_assert(!std::is_copy_assignable_v<ScopedResidentPool>);
 
-TEST(EigenRapidResident, ScopedStateRestoresNestedContextOnException) {
-  ThreadPool pool(1);
-  RapidDomainState outer(pool), inner(pool);
-  auto *const previous = CurrentResidentState();
-  {
-    ScopedResidentState outer_scope(outer);
-    EXPECT_EQ(CurrentResidentState(), &outer);
-    EXPECT_THROW(([&] {
-      ScopedResidentState inner_scope(inner);
-      EXPECT_EQ(CurrentResidentState(), &inner);
-      throw std::runtime_error("nested resident body");
-    }()), std::runtime_error);
-    EXPECT_EQ(CurrentResidentState(), &outer);
+TEST(EigenRapidResident, NestedDisjointGroupOnSamePoolRunsDirectly) {
+  ThreadPool pool(4, true, true, WorkerIdleMode::ResidentBusy);
+  RapidStartGroup inner{&pool, {2, 4}};
+  for (unsigned outer_width : {1u, 2u}) {
+    SCOPED_TRACE(outer_width);
+    eigen_test_support::WaitForResidentWorkers({&pool, {0, 4}}, 5s);
+    std::atomic<unsigned> calls{0};
+    ParallelForResidentRanges({&pool, {0, outer_width}}, 0, 8, [&](size_t, size_t) {
+      EXPECT_EQ(CurrentResidentPool(), &pool);
+      const auto caller = std::this_thread::get_id();
+      ParallelForResidentRanges(inner, 4, 12, [&](size_t first, size_t last) {
+        EXPECT_EQ(first, 4u);
+        EXPECT_EQ(last, 12u);
+        EXPECT_EQ(std::this_thread::get_id(), caller);
+        ++calls;
+      });
+    });
+    EXPECT_EQ(calls.load(), outer_width);
+    EXPECT_EQ(CurrentResidentPool(), nullptr);
   }
-  EXPECT_EQ(CurrentResidentState(), previous);
+}
+
+TEST(EigenRapidResident, NestedDifferentPoolRecruitsHelperAndRestoresContextOnException) {
+  ThreadPool outer(2, true, false, WorkerIdleMode::ResidentBusy);
+  ThreadPool inner(2, true, false, WorkerIdleMode::ResidentBusy);
+  RapidStartGroup inner_group{&inner, {0, 2}};
+  eigen_test_support::WaitForResidentWorkers(inner_group, 5s);
+  std::atomic<unsigned> calls{0};
+  ParallelForResidentRanges({&outer, {0, 2}}, 0, 1, [&](size_t, size_t) {
+    const auto caller = std::this_thread::get_id();
+    EXPECT_EQ(CurrentResidentPool(), &outer);
+    EXPECT_THROW(ParallelForResidentRanges(inner_group, 0, 8, [&](size_t first, size_t last) {
+      EXPECT_EQ(CurrentResidentPool(), &inner);
+      EXPECT_EQ(last - first, 4u);
+      EXPECT_EQ(std::this_thread::get_id() == caller, first == 0);
+      // Both callbacks must enter before either can cancel the region.
+      if (++calls == 2) throw std::runtime_error("nested resident body");
+    }), std::runtime_error);
+    EXPECT_EQ(CurrentResidentPool(), &outer);
+  });
+  EXPECT_EQ(calls.load(), 2u);
+  EXPECT_EQ(CurrentResidentPool(), nullptr);
 }
 
 template <typename F>
@@ -73,11 +100,9 @@ struct RapidHarness {
   explicit RapidHarness(unsigned workers, bool spinning = false,
                         WorkerIdleMode idle_mode = WorkerIdleMode::Park)
       : pool(static_cast<int>(workers), spinning, false, idle_mode),
-        state(pool),
-        group{&state, {0, workers}} {}
+        group{&pool, {0, workers}} {}
 
   ThreadPool pool;
-  RapidDomainState state;
   RapidStartGroup group;
 };
 
@@ -289,8 +314,7 @@ TEST(EigenRapidResident, CapturedWorkerKeepsStolenTaskAvailableToRapidWait) {
   for (unsigned test = 0; test < 64; ++test) {
     SCOPED_TRACE(::testing::Message() << "seed=240924 case=" << test);
     ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-    RapidDomainState state(pool);
-    eigen_test_support::WaitForResidentWorkers({&state, {0, 2}}, 2s);
+    eigen_test_support::WaitForResidentWorkers({&pool, {0, 2}}, 2s);
     std::atomic<unsigned> executed{0}, discarded{0};
     struct Ordinary final : oox::detail::eigen_pool::Task {
       Ordinary(std::atomic<unsigned> &e, std::atomic<unsigned> &d) : executions(e), discards(d) {}
@@ -463,7 +487,6 @@ TEST(EigenRapidResident, ConcurrentRangeRootsComposeWithDemandPartitioning) {
 TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
   RapidHarness harness(8, true, WorkerIdleMode::ResidentBusy);
   eigen_test_support::WaitForResidentWorkers(harness.group, std::chrono::seconds(5));
-  using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
   EXPECT_THROW(ParallelForResidentRanges(harness.group, 0, 257,
       [](size_t first, size_t last) {
         if (first <= 129 && 129 < last)
@@ -483,14 +506,13 @@ TEST(EigenRapidResident, RangeExceptionsReleaseHelpersBeforeReuse) {
 }
 
 TEST(EigenRapidResident, EmptyGroupsAndInvalidDomains) {
-  using oox::detail::eigen_pool::rapid::ParallelForResidentRanges;
   bool called = false;
   eigen_test_support::WaitForResidentWorkers({}, std::chrono::seconds(5));
   ParallelForResidentRanges({}, 0, 8, [&](size_t, size_t) { called = true; });
   EXPECT_FALSE(called);
   RapidHarness harness(2, true, WorkerIdleMode::ResidentBusy);
   EXPECT_THROW(harness.group.Subgroup({0, 3}), std::invalid_argument);
-  const RapidStartGroup invalid{&harness.state, {1, 3}};
+  const RapidStartGroup invalid{&harness.pool, {1, 3}};
   EXPECT_THROW(ParallelForResidentRanges(invalid, 0, 8,
       [](size_t, size_t) {}), std::invalid_argument);
   RapidHarness parked(2);
@@ -504,8 +526,7 @@ TEST(EigenRapidResident, LaunchDoesNotRequireAllWorkersReady) {
   auto ready = entered.get_future();
   auto unblocked = release.get_future().share();
   ThreadPool pool(2, true, true, WorkerIdleMode::ResidentBusy);
-  RapidDomainState state(pool);
-  RapidStartGroup group{&state, {0, 2}};
+  RapidStartGroup group{&pool, {0, 2}};
   eigen_test_support::WaitForResidentWorkers(group, 5s);
   pool.RunOnThread(MakeTask([&, unblocked] {
     entered.set_value();

@@ -16,7 +16,7 @@ inline void WaitForResidentWorkers(
   if (group.IsEmpty())
     return;
   group.Validate();
-  auto &pool = group.state->Pool();
+  auto &pool = *group.pool;
   if (!pool.UsesResidentBusyWait())
     throw std::invalid_argument("resident warmup requires a resident-busy pool");
   const size_t current = pool.CurrentThreadId();

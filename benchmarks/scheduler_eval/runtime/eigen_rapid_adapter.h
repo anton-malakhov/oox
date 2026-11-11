@@ -19,8 +19,8 @@ namespace rapid = oox::detail::eigen_pool::rapid;
 class Runtime {
 public:
   explicit Runtime(std::size_t threads)
-      : threads_(Validate(threads)), state_(EigenPool()),
-        group_{&state_, {0, static_cast<unsigned>(threads_)}} {
+      : threads_(Validate(threads)),
+        group_{&EigenPool(), {0, static_cast<unsigned>(threads_)}} {
     eigen_test_support::WaitForResidentWorkers(group_, std::chrono::seconds(5));
     Run(0, threads_, [](std::size_t) {});
   }
@@ -47,7 +47,6 @@ private:
   }
 
   std::size_t threads_;
-  rapid::RapidDomainState state_;
   rapid::RapidStartGroup group_;
 };
 

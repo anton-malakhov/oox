@@ -56,8 +56,7 @@ void OrdinaryAuto() {
 template <unsigned threads = 3>
 void ResidentLoops() {
   pool::ThreadPool workers(threads, false, true, pool::WorkerIdleMode::ResidentBusy);
-  rapid::RapidDomainState state(workers);
-  rapid::RapidStartGroup group{&state, {0, threads}};
+  rapid::RapidStartGroup group{&workers, {0, threads}};
   for (unsigned repeat = 0; repeat < 3; ++repeat) {
     WaitReady(workers);
     CheckLoop([&](auto body) {
