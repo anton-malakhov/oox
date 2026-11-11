@@ -433,57 +433,21 @@ public:
   void PublishResident(ResidentTask &task, scheduler_sync::atomic<size_t> &completion,
                        unsigned worker, size_t slot, uint64_t epoch = 0) noexcept {
     assert(worker < static_cast<unsigned>(num_threads_));
-    ThreadData &data = thread_data_[worker];
-    assert(data.resident_task.load(std::memory_order_relaxed) == nullptr);
-    data.resident_slot = slot;
-    data.resident_completion = epoch ? nullptr : &completion;
-    data.resident_epoch = epoch;
-#ifdef OOX_SCHEDULER_TRACE
-    data.resident_trace_id = ::oox::scheduler_trace::NextId();
     OOX_SCHED_WORKER(CurrentThreadId());
-    OOX_SCHED_EVENT("activate", data.resident_trace_id, worker, slot, ::oox::scheduler_trace::Current());
-#endif
-    data.resident_task.store(&task, std::memory_order_release);
+    thread_data_[worker].resident_command.Publish(worker, task, completion, slot, epoch);
   }
 
-  // A shared descriptor handles one word-sized cohort. Other simultaneous
-  // publishers retain the ordinary per-worker publication path.
   size_t PublishResidentBatch(ResidentTask &task, scheduler_sync::atomic<size_t> &completion,
                             const unsigned *workers, size_t count,
                             size_t first_slot = 1, uint64_t epoch = 0,
                             bool packed_completion = false) noexcept {
-    if (!count) return size_t(-1);
-    const size_t word = workers[0] / 64;
-    uint64_t mask = 0;
-    bool ordered = count > 1;
-    for (size_t i = 0; i < count; ++i) {
-      ordered &= workers[i] / 64 == word && (!i || workers[i - 1] < workers[i]);
-      mask |= uint64_t{1} << (workers[i] % 64);
-    }
-    auto &batch = resident_broadcasts_[word];
-    uint64_t generation;
-    if (!ordered || !batch.Begin(word, generation)) {
-      for (size_t i = 0; i < count; ++i)
-        PublishResident(task, completion, workers[i], first_slot + i, epoch);
-      return size_t(-1);
-    }
-    assert(completion.load(std::memory_order_relaxed) == count);
-    batch.task = &task;
-    batch.completion = epoch ? nullptr : &completion;
-    batch.epoch = epoch;
-    batch.packed_completion = packed_completion && epoch && SupportsPackedResidentCompletion();
-    batch.first_slot = first_slot;
-#ifdef OOX_SCHEDULER_TRACE
-    for (size_t i = 0; i < count; ++i) {
-      auto &data = thread_data_[workers[i]];
-      data.resident_trace_id = ::oox::scheduler_trace::NextId();
+    auto slot_for = [this](unsigned worker) -> internal::ResidentCommandSlot & {
+      assert(worker < static_cast<unsigned>(num_threads_));
       OOX_SCHED_WORKER(CurrentThreadId());
-      OOX_SCHED_EVENT("activate", data.resident_trace_id, workers[i], first_slot + i,
-                      ::oox::scheduler_trace::Current());
-    }
-#endif
-    batch.Commit(word, generation, mask);
-    return word;
+      return thread_data_[worker].resident_command;
+    };
+    return internal::PublishResidentCommands(resident_broadcasts_.get(), slot_for, task, completion,
+        workers, count, first_slot, epoch, packed_completion && SupportsPackedResidentCompletion());
   }
 
   // Allocate after all claims and before any command publication. Successive
@@ -528,13 +492,7 @@ public:
   // The selected finished-epoch or packed-done acquire must precede release.
   void ReleaseResidentEpochBatch(size_t word) noexcept {
     if (word == size_t(-1)) return;
-    auto &batch = resident_broadcasts_[word];
-    if (batch.packed_completion) {
-      // Sticky bits belong to this busy-held descriptor, not worker readiness.
-      // Direct commands may reuse a worker, but never modify these done bits.
-      resident_available_[word].ClearDone(batch.mask.load(std::memory_order_relaxed), num_threads_);
-    }
-    batch.Release(word);
+    resident_broadcasts_[word].ReleaseAfterJoin(word, resident_available_[word], num_threads_);
   }
 
   template <typename Region> void HelpResidentUntil(Region &region) {
@@ -840,26 +798,19 @@ private:
   struct ThreadData {
     ThreadData()
         : thread(), outstanding_tasks(0), local_tasks(),
-          mailbox(1024), resident_task(nullptr) {}
+          mailbox(1024) {}
     std::unique_ptr<Thread> thread;
     scheduler_sync::atomic<size_t> outstanding_tasks;
     Queue local_tasks;
     AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
-    scheduler_sync::atomic<ResidentTask *> resident_task;
-    // Last broadcast generation consumed by this worker.
-    uint64_t resident_batch_seen = 0;
-    size_t resident_slot = 0;
-    // Null selects the persistent epoch record; otherwise use a legacy counter.
-    scheduler_sync::atomic<size_t> *resident_completion = nullptr;
-    uint64_t resident_epoch = 0;
+    internal::ResidentCommandSlot resident_command;
     alignas(128) scheduler_sync::atomic<uint64_t> resident_finished{0};
     // One already-accounted task rescued when a Rapid publisher wins capture.
     // It remains stealable, including by waits inside the winning command.
     alignas(128) scheduler_sync::atomic<TaskPtr> resident_deferred{nullptr};
 #ifdef OOX_SCHEDULER_TRACE
     int trace_worker = -1;
-    uint64_t resident_trace_id = 0;
 #endif
 
 #ifdef OOX_EIGEN_ENABLE_STATS
@@ -1187,43 +1138,6 @@ private:
     if (!published) DiscardPublishedTask(task);
   }
 
-  internal::ResidentCommand TakeResidentCommand(unsigned worker) noexcept {
-    auto &data = thread_data_[worker];
-    if (data.resident_task.load(std::memory_order_relaxed)) {
-      if (auto *task = data.resident_task.load(std::memory_order_acquire)) {
-        // A new publisher must claim this worker after it advertises readiness.
-        data.resident_task.store(nullptr, std::memory_order_relaxed);
-        return {task, data.resident_slot, data.resident_completion, data.resident_epoch};
-      }
-    }
-    return resident_broadcasts_[worker / 64].Take(worker, data.resident_batch_seen);
-  }
-
-  void RunResidentCommand(unsigned worker, const internal::ResidentCommand &command) noexcept {
-    ThreadData &data = thread_data_[worker];
-    const size_t word = worker / 64;
-    assert(command.completion || command.epoch);
-    {
-      OOX_SCHED_WORKER(worker);
-      OOX_SCHED_SCOPE("resident", data.resident_trace_id, worker, command.slot);
-      command.task->Run(command.slot);
-    }
-    // Advertise before completion. Packed done bits stay sticky until
-    // the caller releases the descriptor, even if this worker is reused.
-    resident_available_[word].Advertise(worker, num_threads_, command.packed_completion);
-    if (command.completion) {
-      const auto before = command.completion->fetch_sub(1, std::memory_order_release);
-      if (before == 1 && command.batch) {
-        // Join all preceding releases. Only pool-owned state is accessed
-        // after the RMW: the caller may already have destroyed its counter.
-        scheduler_sync::atomic_thread_fence(std::memory_order_acquire);
-        command.batch->Release(word);
-      }
-    } else if (!command.packed_completion) {
-      data.resident_finished.store(command.epoch, std::memory_order_release);
-    }
-  }
-
   // One queue permutation is spread over multiple polling intervals.
   struct ResidentQueueScan {
     uint64_t epoch;
@@ -1285,9 +1199,11 @@ private:
     bool processed = false;
     unsigned polls = 0;
     for (;;) {
-      const auto command = TakeResidentCommand(worker);
+      const auto command = thread_data_[worker].resident_command.Take(worker, resident_broadcasts_.get());
       if (command.task) {
-        RunResidentCommand(worker, command);
+        thread_data_[worker].resident_command.Run(command, worker);
+        command.Complete(worker, num_threads_, resident_available_[worker / 64],
+                         thread_data_[worker].resident_finished);
         processed = true;
         scan.remaining = 0;
         scan.retry = true;

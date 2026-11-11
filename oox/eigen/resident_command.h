@@ -13,9 +13,12 @@
 // the OOX-specific adaptations retained here.
 
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include "resident_worker_mask.h"
 #include "scheduler_sync.h"
+#include "scheduler_trace.h"
 
 namespace oox::detail::eigen_pool {
 
@@ -50,6 +53,9 @@ struct ResidentCommand {
   uint64_t epoch;
   ResidentBroadcast *batch = nullptr;
   bool packed_completion = false;
+
+  void Complete(unsigned worker, unsigned pool_size, ResidentMaskWord &available,
+                scheduler_sync::atomic<uint64_t> &finished) const noexcept;
 };
 
 struct alignas(128) ResidentBroadcast {
@@ -116,6 +122,13 @@ public:
     return {task, slot, completion, epoch, this, packed_completion};
   }
 
+  void ReleaseAfterJoin(size_t word, ResidentMaskWord &available, unsigned pool_size) noexcept {
+    // The caller has acquired completion. Direct commands can reuse a worker
+    // while these done bits still belong to the busy-held descriptor.
+    if (packed_completion) available.ClearDone(mask.load(std::memory_order_relaxed), pool_size);
+    Release(word);
+  }
+
   void Release([[maybe_unused]] size_t word) noexcept {
     mask.store(0, std::memory_order_release);
     busy.clear(std::memory_order_release);
@@ -124,6 +137,116 @@ public:
 #endif
   }
 };
+
+inline void ResidentCommand::Complete(unsigned worker, unsigned pool_size, ResidentMaskWord &available,
+                                      scheduler_sync::atomic<uint64_t> &finished) const noexcept {
+  // A worker can accept another command as soon as it advertises readiness.
+  // Everything used below belongs to this command snapshot or to the pool.
+  available.Advertise(worker, pool_size, packed_completion);
+  if (completion) {
+    const auto before = completion->fetch_sub(1, std::memory_order_release);
+    if (before == 1 && batch) {
+      // The caller may already have destroyed its counter. Join the other
+      // releases before making the pool-owned broadcast reusable.
+      scheduler_sync::atomic_thread_fence(std::memory_order_acquire);
+      batch->Release(worker / 64);
+    }
+  } else if (!packed_completion) {
+    finished.store(epoch, std::memory_order_release);
+  }
+}
+
+// A claimed worker has one direct slot. The word-sized broadcast is the second
+// source of commands, and each worker tracks the last generation it consumed.
+class ResidentCommandSlot {
+public:
+  void Publish([[maybe_unused]] unsigned worker, ResidentTask &task,
+               scheduler_sync::atomic<size_t> &completion, size_t slot, uint64_t epoch) noexcept {
+    assert(!task_.load(std::memory_order_relaxed));
+    slot_ = slot;
+    completion_ = epoch ? nullptr : &completion;
+    epoch_ = epoch;
+#ifdef OOX_SCHEDULER_TRACE
+    TraceActivation(worker, slot);
+#endif
+    task_.store(&task, std::memory_order_release);
+  }
+
+  ResidentCommand Take(unsigned worker, ResidentBroadcast *broadcasts) noexcept {
+    if (task_.load(std::memory_order_relaxed)) {
+      if (auto *task = task_.load(std::memory_order_acquire)) {
+        // The next publisher must claim the worker after it advertises readiness.
+        task_.store(nullptr, std::memory_order_relaxed);
+        return {task, slot_, completion_, epoch_};
+      }
+    }
+    return broadcasts[worker / 64].Take(worker, seen_);
+  }
+
+  void Run(const ResidentCommand &command, [[maybe_unused]] unsigned worker) noexcept {
+    assert(command.completion || command.epoch);
+    OOX_SCHED_WORKER(worker);
+    OOX_SCHED_SCOPE("resident", trace_id_, worker, command.slot);
+    command.task->Run(command.slot);
+  }
+
+#ifdef OOX_SCHEDULER_TRACE
+  void TraceActivation(unsigned worker, size_t slot) noexcept {
+    trace_id_ = ::oox::scheduler_trace::NextId();
+    OOX_SCHED_EVENT("activate", trace_id_, worker, slot, ::oox::scheduler_trace::Current());
+  }
+#endif
+
+private:
+  scheduler_sync::atomic<ResidentTask *> task_{nullptr};
+  uint64_t seen_ = 0;
+  size_t slot_ = 0;
+  scheduler_sync::atomic<size_t> *completion_ = nullptr;
+  uint64_t epoch_ = 0;
+#ifdef OOX_SCHEDULER_TRACE
+  uint64_t trace_id_ = 0;
+#endif
+};
+
+// A broadcast derives each slot from its worker's rank in the mask. Other
+// orders, including single-worker commands, use direct publication.
+inline uint64_t ResidentBroadcastMask(const unsigned *workers, size_t count, size_t word) noexcept {
+  if (count < 2) return 0;
+  uint64_t members = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (workers[i] / 64 != word || (i && workers[i - 1] >= workers[i])) return 0;
+    members |= uint64_t{1} << (workers[i] % 64);
+  }
+  return members;
+}
+
+template <class SlotFor>
+size_t PublishResidentCommands(ResidentBroadcast *broadcasts, SlotFor slot_for, ResidentTask &task,
+                               scheduler_sync::atomic<size_t> &completion, const unsigned *workers,
+                               size_t count, size_t first_slot, uint64_t epoch, bool packed) noexcept {
+  if (!count) return size_t(-1);
+  const size_t word = workers[0] / 64;
+  const uint64_t members = ResidentBroadcastMask(workers, count, word);
+  auto &batch = broadcasts[word];
+  uint64_t generation;
+  if (!members || !batch.Begin(word, generation)) {
+    for (size_t i = 0; i < count; ++i)
+      slot_for(workers[i]).Publish(workers[i], task, completion, first_slot + i, epoch);
+    return size_t(-1);
+  }
+  assert(completion.load(std::memory_order_relaxed) == count);
+  batch.task = &task;
+  batch.completion = epoch ? nullptr : &completion;
+  batch.epoch = epoch;
+  batch.packed_completion = packed && epoch;
+  batch.first_slot = first_slot;
+#ifdef OOX_SCHEDULER_TRACE
+  for (size_t i = 0; i < count; ++i)
+    slot_for(workers[i]).TraceActivation(workers[i], first_slot + i);
+#endif
+  batch.Commit(word, generation, members);
+  return word;
+}
 
 } // namespace internal
 } // namespace oox::detail::eigen_pool
