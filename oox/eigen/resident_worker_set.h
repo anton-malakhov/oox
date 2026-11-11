@@ -29,7 +29,7 @@ struct DomainId {
 namespace internal {
 
 // The pool supplies the current eligibility limit. The set owns the ready
-// words and the rotation cursor used by concurrent group launches.
+// words from which each launch reserves its helpers.
 class ResidentWorkerSet {
 public:
   ResidentWorkerSet(unsigned pool_size, unsigned first_background)
@@ -56,13 +56,12 @@ public:
 
   size_t Claim(DomainId domain, unsigned *workers, size_t capacity) noexcept {
     if (!capacity || !Capacity(domain)) return 0;
-    const size_t start = ClaimStart(capacity);
+    const unsigned first_bit = ClaimStartBit(capacity);
     const size_t words = WordCount();
     size_t claimed = 0;
-    for (size_t offset = 0; offset < words && claimed < capacity; ++offset) {
-      const size_t word = (start / 64 + offset) % words;
+    for (size_t word = 0; word < words && claimed < capacity; ++word) {
       uint64_t selected = words_[word].ClaimResidentWord(
-          Allowed(word, domain), static_cast<unsigned>(start % 64), capacity - claimed, pool_size_);
+          Allowed(word, domain), first_bit, capacity - claimed, pool_size_);
       while (selected) {
         workers[claimed++] = static_cast<unsigned>(word * 64 + std::countr_zero(selected));
         selected &= selected - 1;
@@ -76,20 +75,18 @@ private:
     return ResidentMaskWord::DomainMask(word, domain.start, std::min(domain.limit, pool_size_));
   }
 
-  size_t ClaimStart(size_t capacity) noexcept {
-    // A single-helper launch takes the first ready worker. Larger claims rotate.
-    if (capacity == 1) return 0;
-    if (ResidentMaskWord::SupportsPackedCompletion(pool_size_)) {
+  unsigned ClaimStartBit(size_t capacity) const noexcept {
+    // Small pools can rotate a multi-helper claim using the existing packed clock.
+    if (capacity > 1 && ResidentMaskWord::SupportsPackedCompletion(pool_size_)) {
       if (auto version = words_[0].PackedEpoch(pool_size_, std::memory_order_relaxed))
-        return first_background_ + *version % (pool_size_ - first_background_);
+        return first_background_ + static_cast<unsigned>(*version % (pool_size_ - first_background_));
     }
-    return claim_cursor_.fetch_add(capacity, std::memory_order_relaxed);
+    return 0;
   }
 
   const unsigned pool_size_;
   const unsigned first_background_;
   std::unique_ptr<ResidentMaskWord[]> words_;
-  scheduler_sync::atomic<size_t> claim_cursor_{0};
 };
 
 } // namespace internal

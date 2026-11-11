@@ -177,12 +177,11 @@ TEST(EigenRapidResident, ClaimWorkersAcrossWordBoundaries) {
   check({62, size}, 0, {});
   check({63, 66}, 1, {63});
   check({128, size}, 127, {128, 129});
-  // Rotation starts at 127. Select 127 then 64 and return the word's IDs in order.
-  check({0, size}, 2, {64, 127});
-  // Start in the depleted last word, wrap to the first, then continue in the second.
-  check({0, size}, 3, {1, 62, 65});
-  check({126, size}, 2, {126});
-  check({0, size}, size, {66});
+  // Fill the request across the first word boundary in ascending worker order.
+  check({0, size}, 3, {1, 62, 64});
+  check({0, size}, 2, {65, 66});
+  check({126, size}, 1, {126});
+  check({0, size}, size, {127});
 
   ResidentWorkerSet caller_only(1, 1);
   EXPECT_EQ(caller_only.Claim({0, 1}, ids, 2), 0u);
