@@ -85,6 +85,8 @@ private:
   }
 
   const unsigned pool_size_;
+  // Background worker IDs start at 1 when the pool creator owns slot 0, otherwise at 0.
+  // In a single-slot pool, the background worker always gets ID 0.
   const unsigned first_background_;
   std::unique_ptr<ResidentMaskWord[]> words_;
 };
