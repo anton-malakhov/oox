@@ -118,7 +118,7 @@ if (OOX_ENABLE_EIGEN)
           ${OOX_GTEST_LIB})
   gtest_discover_tests(eigen_pool_test
           DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_small_object_pool_test eigen_small_object_pool_test.cpp)
   target_link_libraries(eigen_small_object_pool_test PRIVATE
@@ -127,11 +127,36 @@ if (OOX_ENABLE_EIGEN)
           OOX_EIGEN_SMALL_OBJECT_POOL_TESTING=1)
   gtest_discover_tests(eigen_small_object_pool_test
           DISCOVERY_MODE PRE_TEST
-          DISCOVERY_TIMEOUT 30)
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_pool_instantiation eigen_pool_instantiation.cpp)
   target_link_libraries(eigen_pool_instantiation PRIVATE ${PROJECT_NAME}::eigen)
   add_test(NAME EigenPoolExplicitInstantiation COMMAND eigen_pool_instantiation)
+  set_tests_properties(EigenPoolExplicitInstantiation PROPERTIES TIMEOUT 120)
+
+  add_executable(eigen_rapid_start_test eigen_rapid_start_test.cpp)
+  target_link_libraries(eigen_rapid_start_test PRIVATE
+          ${PROJECT_NAME}::eigen
+          ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_rapid_start_test
+          DISCOVERY_MODE PRE_TEST
+          DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+
+  foreach(clock IN ITEMS normal tiny)
+    add_executable(eigen_rapid_epoch_${clock}_test eigen_rapid_epoch_test.cpp)
+    target_link_libraries(eigen_rapid_epoch_${clock}_test PRIVATE
+        ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+    target_compile_definitions(eigen_rapid_epoch_${clock}_test PRIVATE
+        OOX_EIGEN_THREAD_POOL_TESTING=1)
+    if(clock STREQUAL "tiny")
+      target_compile_definitions(eigen_rapid_epoch_${clock}_test PRIVATE
+          OOX_EIGEN_TEST_RESIDENT_CLOCK_BITS=2
+          OOX_EIGEN_TEST_GLOBAL_RESIDENT_CLOCK_BITS=2
+          OOX_EIGEN_TEST_RESIDENT_BATCH_GENERATION_BITS=3)
+    endif()
+    gtest_discover_tests(eigen_rapid_epoch_${clock}_test TEST_PREFIX "${clock}."
+        DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+  endforeach()
 
   add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
   target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)

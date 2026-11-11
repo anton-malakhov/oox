@@ -305,3 +305,8 @@ The recorder checks that every iteration was visited once per wave. Recording
 changes timing, particularly with per-iteration callbacks enabled. Use the
 ordinary benchmark executables for timing comparisons. TBB Auto, Eigen stealing
 and Eigen sharing record executed iterations at the callback boundary.
+
+The Eigen `RAPID_GROUP` mode activates available resident workers and assigns
+each participant a fixed iteration range. Its nested and concurrent workloads
+use the same scheduler adapter as its trace recorder. Pass
+`--modes EIGEN_STATIC RAPID_GROUP` to compare their actual range assignments.

@@ -33,7 +33,7 @@ endif()
 
 if(OOX_ENABLE_EIGEN)
   list(APPEND OOX_SCHEDULER_EVAL_MODES
-    OOX_TASKS
+    OOX_TASKS RAPID_GROUP
     EIGEN_STEALING EIGEN_SHARING
     EIGEN_AUTO EIGEN_SIMPLE EIGEN_STATIC EIGEN_AFFINITY
     EIGEN_STEALING_GRAINSIZE EIGEN_SHARING_STEALING)
@@ -67,6 +67,10 @@ function(oox_configure_scheduler_eval_target target mode)
     target_compile_definitions(${target} PRIVATE
       EIGEN_MODE=${mode} OOX_EIGEN_ENABLE_STATS=1)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
+  elseif(mode STREQUAL "RAPID_GROUP")
+    target_compile_definitions(${target} PRIVATE
+      RAPID_GROUP_MODE=1 EIGEN_MODE=EIGEN_RAPID_GROUP OOX_EIGEN_ENABLE_STATS=1)
+    target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
       RAPID_START_MODE=1 TBB_MODE=TBB_RAPID)
@@ -81,7 +85,7 @@ function(oox_configure_scheduler_eval_target target mode)
 endfunction()
 
 foreach(mode IN LISTS OOX_SCHEDULER_EVAL_MODES)
-  if(OOX_SCHEDULER_TRACE_TOOLS AND mode MATCHES "^(EIGEN_AUTO|EIGEN_STATIC|EIGEN_SIMPLE|EIGEN_AFFINITY|EIGEN_STEALING|EIGEN_SHARING|TBB_AUTO)$")
+  if(OOX_SCHEDULER_TRACE_TOOLS AND mode MATCHES "^(RAPID_GROUP|EIGEN_AUTO|EIGEN_STATIC|EIGEN_SIMPLE|EIGEN_AFFINITY|EIGEN_STEALING|EIGEN_SHARING|TBB_AUTO)$")
     add_executable(trace_scheduler_${mode} tracing/trace_scheduler.cpp tracing/recorder.cpp)
     oox_configure_scheduler_eval_target(trace_scheduler_${mode} ${mode})
     target_compile_definitions(trace_scheduler_${mode} PRIVATE OOX_SCHEDULER_TRACE=1)

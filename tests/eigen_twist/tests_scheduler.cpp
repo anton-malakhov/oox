@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "oox/eigen/parallel_for.h"
+#include "oox/eigen/rapid_start.h"
 #include <twist/assist/assert.hpp>
 #include <twist/sim.hpp>
 #include <array>
@@ -8,6 +9,7 @@
 
 namespace {
 namespace pool = oox::detail::eigen_pool;
+namespace rapid = pool::rapid;
 namespace sync = pool::scheduler_sync;
 
 void OrdinaryTasks() {
@@ -21,6 +23,12 @@ void OrdinaryTasks() {
     }));
   workers.Wait([&] { return done.load() == visits.size(); });
   for (auto &value : visits) TWIST_ASSERT(value.load() == 1);
+}
+
+void WaitReady(pool::ThreadPool &workers) {
+  const pool::DomainId domain{0, static_cast<unsigned>(workers.NumThreads())};
+  while (workers.ResidentAvailableWorkers(domain) < workers.ResidentCapacity(domain))
+    sync::this_thread::yield();
 }
 
 template <typename Launch>
@@ -43,6 +51,56 @@ void CheckLoop(Launch launch, size_t count = 17) {
 void OrdinaryAuto() {
   pool::ThreadPool workers(3, false, true);
   CheckLoop([&](auto body) { pool::ParallelFor(workers, 0, 17, body, 1); });
+}
+
+template <unsigned threads = 3>
+void ResidentLoops() {
+  pool::ThreadPool workers(threads, false, true, pool::WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, threads}};
+  for (unsigned repeat = 0; repeat < 3; ++repeat) {
+    WaitReady(workers);
+    CheckLoop([&](auto body) {
+      rapid::ParallelForResidentRanges(group, 0, 17, [&](size_t first, size_t last) {
+        for (auto i = first; i < last; ++i) body(i);
+      });
+    });
+  }
+}
+
+void DelayedCohortFinalize() {
+  pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
+  struct Command final : pool::ResidentTask {
+    sync::atomic<unsigned> calls{0};
+    sync::atomic<bool> hold{false};
+    void Run(size_t slot) noexcept override {
+      TWIST_ASSERT(slot == 1 || slot == 2);
+      calls.fetch_add(1);
+      while (hold.load()) sync::this_thread::yield();
+    }
+  } old_command, new_command;
+  std::array<unsigned, 2> old_workers{}, new_workers{};
+  sync::atomic<size_t> old_remaining{2}, new_remaining{2};
+  WaitReady(workers);
+  TWIST_ASSERT(workers.ClaimResidentWorkers({0, 3}, old_workers.data(), 2) == 2);
+  rapid::ResidentCohort old_cohort(workers, old_workers.data(), 2, old_remaining);
+  old_cohort.Publish(old_command);
+  workers.HelpResidentUntil(old_cohort);
+  TWIST_ASSERT(old_command.calls.load() == 2);
+  // Keep the old batch descriptor retained while its workers start a new epoch.
+  WaitReady(workers);
+  TWIST_ASSERT(workers.ClaimResidentWorkers({0, 3}, new_workers.data(), 2) == 2);
+  new_command.hold.store(true);
+  rapid::ResidentCohort new_cohort(workers, new_workers.data(), 2, new_remaining);
+  new_cohort.Publish(new_command);
+  while (new_command.calls.load() != 2) sync::this_thread::yield();
+  TWIST_ASSERT(old_cohort.IsComplete());
+  TWIST_ASSERT(!new_cohort.IsComplete());
+  old_cohort.Finalize();
+  TWIST_ASSERT(!new_cohort.IsComplete());
+  new_command.hold.store(false);
+  workers.HelpResidentUntil(new_cohort);
+  new_cohort.Finalize();
 }
 
 void CancelAndDrain() {
@@ -81,6 +139,10 @@ int main(int argc, char **argv) {
   struct Scenario { const char *name; void (*run)(); unsigned seeds; };
   const Scenario scenarios[]{
       {"ordinary_tasks", OrdinaryTasks, 32}, {"ordinary_auto", OrdinaryAuto, 32},
+      {"fixed_direct", ResidentLoops<2>, 32},
+      {"fixed_packed", ResidentLoops<>, 32},
+      {"fixed_epoch", ResidentLoops<9>, 8},
+      {"delayed_cohort_finalize", DelayedCohortFinalize, 32},
       {"cancel_drain", CancelAndDrain, 32},
       {"cancel_from_callback", CancelFromCallback, 32}};
   bool selected = false;

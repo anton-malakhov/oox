@@ -21,6 +21,7 @@ reentrant cancellation; arbitrary nested callbacks can still recurse inline.
 | File | Source | License retained |
 | --- | --- | --- |
 | `nonblocking_thread_pool.h` | Eigen `NonBlockingThreadPool.h`, with PBBS and OOX adaptations | MPL-2.0 |
+| `resident_command.h` | Resident command types extracted from the pool | MPL-2.0 |
 | `run_queue.h` | Eigen `RunQueue.h` | MPL-2.0 |
 | `max_size_vector.h` | Eigen `MaxSizeVector.h` | MPL-2.0 |
 | `memory.h` | Eigen `Memory.h` aligned allocation helpers | MPL-2.0 |
@@ -40,3 +41,23 @@ greater than 128, matching the vendored aligned allocator's supported range.
 [ParallelFor and partitioners](PARTITIONERS.md) provide auto, simple, static,
 and affinity policies adapted from oneTBB on the ordinary scheduler. They reuse
 the existing scheduler-evaluation workloads.
+
+## Fast resident groups
+
+An opt-in pool using `WorkerIdleMode::ResidentBusy` advertises idle workers.
+`rapid::ParallelForResidentRanges(group, begin, end, callback)` captures
+available helpers and invokes `callback(first, last)` once per participant,
+partitioning by the captured count rather than the nominal pool size.
+A warm launch uses a stack descriptor and no ordinary task allocation.
+
+`WorkerIdleMode::ResidentAuto` bounds resident polling by the CPU allowance
+observed when the pool is constructed. On Linux it reads the creator's allowed CPUs and chooses one
+logical CPU per physical core from sysfs. Background workers bind themselves
+when entering resident polling and restore their previous affinity on leaving
+resident service at the next idle transition. The creator keeps its affinity.
+Threads spawned by user callbacks on a pinned worker inherit that worker's mask.
+Missing topology or rejected affinity calls allow execution with the OS placement.
+Other platforms use the hardware concurrency estimate. CPU bandwidth quotas
+require separate accounting. `NumThreads()` still reports the requested pool size. Workers above
+the resident limit use ordinary task execution and parking. When the pool exceeds
+the CPU allowance, those workers park immediately after unsuccessful searches.
