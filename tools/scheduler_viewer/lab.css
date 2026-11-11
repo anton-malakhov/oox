@@ -1,0 +1,61 @@
+#lab section,#lab details {margin-block:22px}
+#lab input,#lab select {max-width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--background);color:var(--foreground)}
+#lab .lab-number {width:100px}
+#lab table {width:100%;border-collapse:collapse}
+#lab th,#lab td {padding:6px;text-align:left;border-bottom:1px solid var(--border)}
+#lab .lab-scroll {overflow-x:auto}
+#lab .lab-costs {display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+#lab .lab-pair {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,400px),1fr));gap:16px}
+#lab canvas {width:100%;display:block}
+#lab #lab-graph {display:block;width:100%;height:auto}
+#lab .lab-graph-scroll {overflow-x:auto}
+#lab #lab-graph {min-width:850px;max-width:1180px;margin:auto}
+#lab .warning,#lab-error {color:light-dark(#8b3610,#f5ba8b)}
+#lab #lab-error:empty {display:none}
+#lab .lab-source {padding-block:12px;border-bottom:1px solid var(--border)}
+#lab pre {white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+#lab summary {cursor:pointer}
+#lab a {color:inherit}
+#lab .lab-status {font-variant-numeric:tabular-nums}
+@media(max-width:600px){#lab th,#lab td{padding:4px}#lab input{min-width:70px}}
+#lab {max-width:1380px;padding:28px 32px 70px;--lab-panel:light-dark(#fff,#20232b);--lab-soft:light-dark(#f1f4fb,#272c37);--lab-accent:light-dark(#315ec7,#91afff);--lab-muted:light-dark(#5b6474,#abb4c5)}
+#lab nav {font-size:13px;color:var(--lab-muted);margin-bottom:30px}
+#lab .lab-hero {max-width:850px;margin-bottom:24px}
+#lab .lab-eyebrow {font-size:12px;letter-spacing:.12em;color:var(--lab-accent);font-weight:600}
+#lab h1 {font-size:clamp(26px,3.2vw,40px);line-height:1.15;margin:12px 0}
+#lab h3 {margin:0;font-size:19px}
+#lab .lab-hero p {color:var(--lab-muted);font-size:17px}
+#lab .lab-jump {display:flex;flex-wrap:wrap;gap:16px;margin-top:20px;font-size:13px}
+#lab .lab-jump a {text-decoration:none;color:var(--lab-accent)}
+#lab .lab-notice {padding:12px 16px;border-left:3px solid var(--lab-accent);background:var(--lab-soft);font-size:13px}
+#lab .lab-command {padding:16px;background:var(--lab-panel);border:1px solid var(--border);border-radius:12px;gap:14px}
+#lab .lab-command label {font-size:13px;color:var(--lab-muted)}
+#lab .btn {border-radius:8px;font-size:13px;transition:background .15s,border-color .15s}
+#lab .btn:hover {border-color:var(--lab-accent);background:var(--lab-soft)}
+#lab .btn-primary {background:var(--lab-accent);color:light-dark(#fff,#17213d);border-color:var(--lab-accent);font-weight:600}
+#lab .btn-primary:hover {background:var(--lab-accent);color:light-dark(#fff,#17213d);filter:brightness(1.08)}
+#lab .lab-quick {display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}
+#lab .lab-quick>span {font-size:12px;color:var(--lab-muted);margin-right:4px}
+#lab .lab-caption,#lab-state {font-size:13px;color:var(--lab-muted)}
+#lab .lab-surface {padding:20px;background:var(--lab-panel);border:1px solid var(--border);border-radius:12px}
+#lab .lab-section-heading {display:flex;gap:12px;align-items:flex-start;margin-bottom:18px}
+#lab .lab-section-heading p {margin:5px 0 0;color:var(--lab-muted);font-size:13px}
+#lab .lab-step {display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:34px;border-radius:8px;background:var(--lab-soft);color:var(--lab-accent);font-size:12px;font-weight:600}
+#lab .lab-kpis {display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}
+#lab .lab-kpi {padding:16px;background:var(--lab-soft);border-radius:10px}
+#lab .lab-kpi-label {font-size:12px;color:var(--lab-muted)}
+#lab .lab-kpi-value {font-size:28px;line-height:1.25;font-variant-numeric:tabular-nums;margin:6px 0}
+#lab .lab-kpi-note {font-size:12px;color:var(--lab-muted)}
+#lab .lab-good {color:light-dark(#16703b,#83d3a2)}
+#lab .lab-bad {color:light-dark(#a83b24,#ffa18a)}
+#lab .lab-equations {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:20px}
+#lab .lab-equations h4 {margin:0 0 10px}
+#lab .lab-equations code {font-size:15px;color:var(--lab-accent)}
+#lab .lab-equations p {font-size:13px;color:var(--lab-muted)}
+#lab summary {font-weight:500;padding:3px 0}
+#lab th {font-size:12px;color:var(--lab-muted);font-weight:500}
+#lab td {font-size:13px}
+#lab input,#lab select {border-radius:7px;min-height:34px}
+#lab .lab-badge {display:inline-block;padding:2px 7px;border-radius:4px;background:var(--lab-soft);font-size:11px;color:var(--lab-muted);margin-left:6px}
+#lab #lab-error:not(:empty) {padding:14px;border:1px solid currentColor;border-radius:8px;margin-block:12px}
+@media(max-width:700px){#lab{padding:18px 12px 40px}#lab .lab-surface{padding:14px}#lab .lab-command{padding:12px}#lab h1{font-size:28px}}

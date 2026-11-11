@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "oox/eigen/parallel_for.h"
-#include "oox/eigen/rapid_start.h"
+#include "oox/eigen/rapid_auto.h"
+#include "oox/eigen/rapid_parallel_for.h"
 #include <twist/assist/assert.hpp>
 #include <twist/sim.hpp>
 #include <array>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 
 namespace {
@@ -53,19 +54,96 @@ void OrdinaryAuto() {
   CheckLoop([&](auto body) { pool::ParallelFor(workers, 0, 17, body, 1); });
 }
 
-template <unsigned threads = 3>
+enum class Mode { Fixed, Lazy, Auto, Simple, Static, Affinity };
+
+template <Mode mode, unsigned threads = 3>
 void ResidentLoops() {
   pool::ThreadPool workers(threads, false, true, pool::WorkerIdleMode::ResidentBusy);
   rapid::RapidDomainState state(workers);
   rapid::RapidStartGroup group{&state, {0, threads}};
+  pool::AffinityPartitioner affinity;
   for (unsigned repeat = 0; repeat < 3; ++repeat) {
     WaitReady(workers);
     CheckLoop([&](auto body) {
-      rapid::ParallelForResidentRanges(group, 0, 17, [&](size_t first, size_t last) {
-        for (auto i = first; i < last; ++i) body(i);
-      });
+      if constexpr (mode == Mode::Fixed) {
+        rapid::ParallelForResidentRanges(group, 0, 17, [&](size_t first, size_t last) {
+          for (auto i = first; i < last; ++i) body(i);
+        });
+      } else if constexpr (mode == Mode::Lazy) {
+        rapid::ParallelForAuto(group, 0, 17, body, 1);
+      } else if constexpr (mode == Mode::Auto) {
+        rapid::ParallelFor(group, 0, 17, body, pool::AutoPartitioner{}, 1);
+      } else if constexpr (mode == Mode::Simple) {
+        rapid::ParallelFor(group, 0, 17, body, pool::SimplePartitioner{}, 1);
+      } else if constexpr (mode == Mode::Static) {
+        rapid::ParallelFor(group, 0, 17, body, pool::StaticPartitioner{}, 1);
+      } else {
+        rapid::ParallelFor(group, 0, 17, body, affinity, 1);
+      }
     });
   }
+}
+
+void LazyRequiresTailSteal() {
+  pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, 3}};
+  WaitReady(workers);
+  std::array<sync::atomic<unsigned>, 17> visits{};
+  pool::partitioner_detail::Metrics metrics;
+  rapid::ParallelForAuto(group, 0, 17, [&](size_t i) {
+    // The last initial owner reserves [12,13). Progress requires someone
+    // else to steal its unreserved tail containing iteration 16.
+    if (i == 12)
+      while (visits[16].load() == 0) sync::this_thread::yield();
+    TWIST_ASSERT(visits[i].fetch_add(1) == 0);
+  }, 1, &metrics);
+  for (auto &value : visits) TWIST_ASSERT(value.load() == 1);
+  TWIST_ASSERT(metrics.donated_ranges.load() > 0);
+}
+
+void NestedLazy() {
+  pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, 3}};
+  WaitReady(workers);
+  std::array<sync::atomic<unsigned>, 15> visits{};
+  rapid::ParallelForAuto(group, 0, 5, [&](size_t outer) {
+    rapid::ParallelForAuto(group, 0, 3, [&](size_t inner) {
+      visits[outer * 3 + inner].fetch_add(1);
+      sync::this_thread::yield();
+    }, 1);
+  }, 1);
+  for (auto &value : visits) TWIST_ASSERT(value.load() == 1);
+}
+
+void ConcurrentCallers() {
+  pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, 3}};
+  WaitReady(workers);
+  sync::thread external([&] {
+    CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
+  });
+  CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
+  external.join();
+}
+
+void LazyExceptionAndReuse() {
+  pool::ThreadPool workers(3, false, true, pool::WorkerIdleMode::ResidentBusy);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, 3}};
+  WaitReady(workers);
+  bool caught = false;
+  try {
+    rapid::ParallelForAuto(group, 0, 17, [&](size_t i) {
+      if (i == 12) throw std::runtime_error("expected failure");
+      sync::this_thread::yield();
+    }, 1);
+  } catch (const std::runtime_error &) { caught = true; }
+  TWIST_ASSERT(caught);
+  WaitReady(workers);
+  CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
 }
 
 void DelayedCohortFinalize() {
@@ -101,6 +179,15 @@ void DelayedCohortFinalize() {
   new_command.hold.store(false);
   workers.HelpResidentUntil(new_cohort);
   new_cohort.Finalize();
+}
+
+void LazyWithOutsiders() {
+  pool::ThreadPool workers(4, false, true, pool::WorkerIdleMode::ResidentBusy);
+  workers.SetResidentLimit(2);
+  rapid::RapidDomainState state(workers);
+  rapid::RapidStartGroup group{&state, {0, 2}};
+  WaitReady(workers);
+  CheckLoop([&](auto body) { rapid::ParallelForAuto(group, 0, 17, body, 1); });
 }
 
 void CancelAndDrain() {
@@ -139,10 +226,19 @@ int main(int argc, char **argv) {
   struct Scenario { const char *name; void (*run)(); unsigned seeds; };
   const Scenario scenarios[]{
       {"ordinary_tasks", OrdinaryTasks, 32}, {"ordinary_auto", OrdinaryAuto, 32},
-      {"fixed_direct", ResidentLoops<2>, 32},
-      {"fixed_packed", ResidentLoops<>, 32},
-      {"fixed_epoch", ResidentLoops<9>, 8},
+      {"fixed_direct", ResidentLoops<Mode::Fixed, 2>, 32},
+      {"fixed_packed", ResidentLoops<Mode::Fixed>, 32},
+      {"fixed_epoch", ResidentLoops<Mode::Fixed, 9>, 8},
+      {"lazy", ResidentLoops<Mode::Lazy>, 32},
+      {"native_auto", ResidentLoops<Mode::Auto>, 32},
+      {"native_simple", ResidentLoops<Mode::Simple>, 32},
+      {"native_static", ResidentLoops<Mode::Static>, 32},
+      {"native_affinity", ResidentLoops<Mode::Affinity>, 32},
+      {"lazy_tail_steal", LazyRequiresTailSteal, 32},
+      {"nested_lazy", NestedLazy, 32}, {"concurrent_callers", ConcurrentCallers, 32},
+      {"lazy_exception_reuse", LazyExceptionAndReuse, 32},
       {"delayed_cohort_finalize", DelayedCohortFinalize, 32},
+      {"lazy_outsiders", LazyWithOutsiders, 32},
       {"cancel_drain", CancelAndDrain, 32},
       {"cancel_from_callback", CancelFromCallback, 32}};
   bool selected = false;
