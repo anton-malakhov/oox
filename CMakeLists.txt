@@ -64,13 +64,18 @@ find_package(Threads REQUIRED)
 
 if (OOX_ENABLE_TBB)
   if (NOT OOX_LOCAL_TBB)
-    find_package(TBB 2021 QUIET)  # not REQUIRED
+    find_package(TBB 2022.3 QUIET)  # not REQUIRED
   endif ()
   if (NOT TBB_FOUND)
     execute_process(COMMAND git submodule update --init --depth=1 thirdparty/oneTBB/
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     option(TBB_TEST OFF)
     add_subdirectory(thirdparty/oneTBB onetbb)
+    if (TARGET tbb AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15 AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+      # oneTBB 2022.3 lacks the GCC 15 workaround for notify_one_relaxed (upstream PR #2029).
+      target_compile_options(tbb PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>)
+    endif ()
     set(TBB_FOUND ON)
   endif ()
 endif ()
