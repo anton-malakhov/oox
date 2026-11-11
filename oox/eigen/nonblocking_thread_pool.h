@@ -912,8 +912,8 @@ private:
   alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t>
       ordinary_publication_state_{0};
 
-  // Keep the polled generation off the frequently written claim cursor's
-  // cache line without shifting existing scheduler fields.
+  // Resident workers poll this generation. Keep its cache line separate from
+  // ordinary publication accounting.
   alignas(128) scheduler_sync::atomic<uint64_t> resident_publication_epoch_{0};
   ResidentPlacement resident_placement_;
   const size_t resident_limit_max_;
