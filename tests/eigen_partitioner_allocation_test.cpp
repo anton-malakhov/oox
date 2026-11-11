@@ -48,7 +48,8 @@ void verify_affinity_publication_failure() {
     for (size_t i = 0; i < destroyed.size(); ++i) {
       auto *task = new Tracked(destroyed[i]);
       injected = false;
-      fail_after = 1; // Allow proxy allocation; fail overflow deque growth.
+      // First fail proxy allocation, then forbid any allocation after it.
+      fail_after = i == 0 ? 0 : 1;
       try {
         pool.ScheduleWithAffinity(task, 1);
       } catch (const std::bad_alloc &) {
@@ -61,14 +62,16 @@ void verify_affinity_publication_failure() {
           std::cerr << "failed affinity publication retained useful work\n";
           std::_Exit(4);
         }
-        break;
+      } else if (i == 0 || !destroyed[i].load(std::memory_order_acquire)) {
+        std::cerr << "bounded affinity fallback did not complete inline\n";
+        std::_Exit(4);
       }
     }
     released.store(true, std::memory_order_release);
     released.notify_one();
   }
   if (!caught_publication) {
-    std::cerr << "affinity overflow allocation was not injected\n";
+    std::cerr << "affinity proxy allocation failure was not injected\n";
     std::_Exit(5);
   }
 }

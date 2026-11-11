@@ -413,8 +413,8 @@ exceptions to that layer, not raw to the pool.
 - `docs/design-shared-var.md` — the thread-safe shared handle design
   (thick-handle architecture, atomic multi-state registration,
   waiter-as-graph-edge waits, deferred/forwarding semantics).
-- `oox/eigen/README.md` — provenance, OOX additions (guarded overflow
-  queue, C++20 atomic wait/notify parking), and per-file licenses of the
+- `oox/eigen/README.md` — provenance, OOX additions (bounded queues with
+  inline backpressure, C++20 atomic wait/notify parking), and per-file licenses of the
   vendored Eigen-derived scheduler.
 
 

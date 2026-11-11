@@ -28,7 +28,6 @@
 #endif
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -197,16 +196,12 @@ public:
     PerThread *pt = GetPerThread();
     const bool local = IsRegistered(pt) && pt->owns_queue &&
                        threadIndex == static_cast<size_t>(pt->thread_id);
-    PublishTask(t, static_cast<int>(threadIndex), local);
+    PublishOrdinaryTask(t, static_cast<int>(threadIndex), local);
   }
 
   void ScheduleWithAffinity(TaskPtr task, size_t hint) {
     if (!task)
       return;
-    if (IsCancelled()) {
-      task->Discard();
-      return;
-    }
     PerThread *pt = GetPerThread();
     hint %= num_threads_;
     if (!IsRegistered(pt) || !pt->owns_queue ||
@@ -214,32 +209,31 @@ public:
       RunOnThread(task, hint);
       return;
     }
+    // Discard may reenter Cancel; release publication admission first.
     const auto discard = [](Task *p) { p->Discard(); };
     std::unique_ptr<Task, decltype(discard)> pending(task, discard);
-    auto *proxy = new AffinityProxy(task);
-    pending.release();
-    AccountTask(task, pt->thread_id);
-    // The recipient may claim the work immediately. The local location keeps
-    // the proxy alive until publication below consumes that location.
-    thread_data_[hint].affinity_mailbox.Push(proxy);
-    const QueueEntry entry = reinterpret_cast<QueueEntry>(proxy) | proxy_tag;
-    try {
-      if (!thread_data_[pt->thread_id].local_tasks.PushFront(entry)) {
-        std::lock_guard<std::mutex> lock(overflow_mutex_);
-        overflow_tasks_.push_back(entry);
-        overflow_nonempty_.store(true, std::memory_order_release);
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (!publication.IsAdmitted() || IsCancelled()) {
+        return;
       }
-    } catch (...) {
-      // The recipient may be unavailable. Do not leave useful work reachable
-      // only from its mailbox when the stealable sender location failed.
-      if (TaskPtr unclaimed = proxy->template Extract<AffinityProxy::local_bit>()) {
-        auto *outstanding = unclaimed->outstanding;
-        unclaimed->Discard();
-        TaskFinished(outstanding);
+      auto *proxy = new AffinityProxy(task);
+      pending.release();
+      AccountTask(task, pt->thread_id);
+      if (!thread_data_[hint].affinity_mailbox.Push(proxy)) {
+        inline_task = proxy->template Extract<AffinityProxy::mailbox_bit>();
+        proxy->template Extract<AffinityProxy::local_bit>();
+      } else {
+        const QueueEntry entry = reinterpret_cast<QueueEntry>(proxy) | proxy_tag;
+        if (!thread_data_[pt->thread_id].local_tasks.PushFront(entry))
+          inline_task = proxy->template Extract<AffinityProxy::local_bit>();
       }
-      throw;
+      WakeOneWorker();
     }
-    WakeOneWorker();
+    if (inline_task) {
+      ExecuteTask(inline_task);
+    }
   }
 
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
@@ -256,7 +250,7 @@ public:
     if (IsRegistered(pt) && pt->owns_queue && pt->thread_id >= start &&
         pt->thread_id < limit) {
       // Worker thread of this pool, push onto the thread's queue.
-      PublishTask(t, pt->thread_id, true);
+      PublishOrdinaryTask(t, pt->thread_id, true);
       return;
     }
 
@@ -265,22 +259,23 @@ public:
     }
     const int target =
         start + static_cast<int>(Rand(&pt->rand) % (limit - start));
-    PublishTask(t, target, false);
+    PublishOrdinaryTask(t, target, false);
   }
 
   void Cancel() override {
-    cancelled_.store(true, std::memory_order_release);
-    done_.store(true, std::memory_order_release);
-
-    // Let each thread know it's been cancelled.
-#ifdef OOX_EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
-    for (size_t i = 0; i < thread_data_.size(); i++) {
-      if (thread_data_[i].thread) {
-        thread_data_[i].thread->OnCancel();
-      }
+    if (ActiveCancellation() == this) {
+      return;
     }
-#endif
-    WakeAll();
+    std::call_once(cancellation_once_, [this] {
+      ThreadPoolTempl *&active = ActiveCancellation();
+      ThreadPoolTempl *previous = std::exchange(active, this);
+      struct RestoreCancellation {
+        ThreadPoolTempl *&active;
+        ThreadPoolTempl *previous;
+        ~RestoreCancellation() { active = previous; }
+      } restore{active, previous};
+      CancelOnce();
+    });
   }
 
   size_t NumThreads() const final { return num_threads_; }
@@ -346,8 +341,9 @@ public:
         continue;
       }
       const uint64_t token = event.PrepareWait();
-      if (registered && TryExecuteOne()) {
+      if (TaskPtr task = registered ? TryTakeOne() : nullptr) {
         event.CancelWait();
+        ExecuteTask(task);
         continue;
       }
       if (ready() || cancelled_.load(std::memory_order_acquire)) {
@@ -371,16 +367,58 @@ public:
   }
 
 private:
-  // Create a single atomic<int> that encodes start and limit information for
-  // each thread.
-  // We expect num_threads_ < 65536, so we can store them in a single
-  // std::atomic<unsigned>.
-  // Exposed publicly as static functions so that external callers can reuse
-  // this encode/decode logic for maintaining their own thread-safe copies of
-  // scheduling and steal domain(s).
-  static const int kMaxPartitionBits = 16;
-  static const int kMaxThreads = 1 << kMaxPartitionBits;
-  static const int kSpinCount = 64;
+  static ThreadPoolTempl *&ActiveCancellation() noexcept {
+    static thread_local ThreadPoolTempl *active = nullptr;
+    return active;
+  }
+
+  void CancelOnce() {
+    cancelled_.store(true, std::memory_order_release);
+    ordinary_publication_state_.fetch_or(kPublicationCancelled,
+                                         std::memory_order_seq_cst);
+    while ((ordinary_publication_state_.load(std::memory_order_acquire) &
+            kPublicationPublisherMask) != 0) {
+      std::this_thread::yield();
+    }
+    CancelOrdinaryQueues();
+    done_.store(true, std::memory_order_release);
+
+    // Let each thread know it's been cancelled.
+#ifdef OOX_EIGEN_THREAD_ENV_SUPPORTS_CANCELLATION
+    for (size_t i = 0; i < thread_data_.size(); i++) {
+      if (thread_data_[i].thread) {
+        thread_data_[i].thread->OnCancel();
+      }
+    }
+#endif
+    WakeAll();
+  }
+
+  static constexpr int kMaxThreads = 1 << 16;
+  static constexpr int kSpinCount = 64;
+  static constexpr size_t kPublicationCancelled =
+      size_t{1} << (sizeof(size_t) * 8 - 1);
+  static constexpr size_t kPublicationPublisherMask =
+      kPublicationCancelled - 1;
+
+  class PublicationGuard {
+  public:
+    explicit PublicationGuard(std::atomic<size_t> &state) noexcept
+        : state_(state), admitted_((state.fetch_add(
+                                        1, std::memory_order_relaxed) &
+                                    kPublicationCancelled) == 0) {}
+    PublicationGuard(const PublicationGuard &) = delete;
+    PublicationGuard &operator=(const PublicationGuard &) = delete;
+    ~PublicationGuard() noexcept {
+      state_.fetch_sub(1, std::memory_order_release);
+    }
+
+    bool IsAdmitted() const noexcept { return admitted_; }
+
+  private:
+    std::atomic<size_t> &state_;
+    bool admitted_;
+  };
 
   class EventCount {
   public:
@@ -429,6 +467,12 @@ private:
   }
 
   void ExecuteTask(TaskPtr p) {
+#ifdef OOX_EIGEN_ENABLE_STATS
+    const PerThread *pt = GetPerThread();
+    const size_t worker = IsRegistered(pt) ? static_cast<size_t>(pt->thread_id) : 0;
+    thread_data_[worker].statistics.executed.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     struct FinishTask {
       ThreadPoolTempl *pool;
       std::atomic<size_t> *outstanding;
@@ -491,43 +535,21 @@ private:
     }
 
     std::atomic<uintptr_t> task_and_locations;
-    AffinityProxy *next = nullptr;
   };
 
-  // Multiple publishers; only the queue's owning worker consumes. A detached
-  // batch is reversed to preserve FIFO mailbox order. Thieves use the sender's
-  // local proxy, so they never consume another worker's affinity mailbox.
+  // A bounded mailbox carries the recipient-side references.
   class AffinityMailbox {
   public:
-    void Push(AffinityProxy *proxy) noexcept {
-      auto *head = incoming_.load(std::memory_order_relaxed);
-      do {
-        proxy->next = head;
-      } while (!incoming_.compare_exchange_weak(
-          head, proxy, std::memory_order_release, std::memory_order_relaxed));
-    }
+    bool Push(AffinityProxy *proxy) noexcept { return queue_.try_push(proxy); }
 
     AffinityProxy *Pop() noexcept {
-      if (!ready_) {
-        if (!incoming_.load(std::memory_order_acquire))
-          return nullptr;
-        auto *batch = incoming_.exchange(nullptr, std::memory_order_acquire);
-        while (batch) {
-          auto *next = batch->next;
-          batch->next = ready_;
-          ready_ = batch;
-          batch = next;
-        }
-      }
-      auto *result = ready_;
-      if (result)
-        ready_ = result->next;
+      AffinityProxy *result = nullptr;
+      queue_.try_pop(result);
       return result;
     }
 
   private:
-    std::atomic<AffinityProxy *> incoming_{nullptr};
-    AffinityProxy *ready_ = nullptr;
+    rigtorp::mpmc::Queue<AffinityProxy *> queue_{1024};
   };
 
   static TaskPtr ExtractEntry(QueueEntry entry) noexcept {
@@ -611,9 +633,7 @@ private:
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   const uint64_t pool_generation_;
 
-  std::mutex overflow_mutex_;
-  std::atomic<bool> overflow_nonempty_{false};
-  std::deque<QueueEntry> overflow_tasks_;
+  std::once_flag cancellation_once_;
   EventCount worker_event_;
   EventCount waiter_event_;
   std::atomic<bool> done_;
@@ -622,6 +642,12 @@ private:
   bool creator_registered_ = false;
   std::thread::id creator_thread_id_;
   PerThread creator_previous_registration_;
+  // Generic publication admission is written for every scheduled task. Keep
+  // it away from worker-loop counters so submissions do not invalidate a cache
+  // line that every worker is reading.
+  alignas(OOX_EIGEN_CACHE_LINE_SIZE) std::atomic<size_t>
+      ordinary_publication_state_{0};
+
 
   // Main worker thread loop. Returns true if processed some tasks
   bool WorkerLoop(bool external = false, bool once = false) {
@@ -661,8 +687,9 @@ private:
       }
 
       const uint64_t token = worker_event_.PrepareWait();
-      if (TryExecuteOne()) {
+      if (TaskPtr task = TryTakeOne()) {
         worker_event_.CancelWait();
+        ExecuteTask(task);
         processed_anything = true;
         continue;
       }
@@ -734,42 +761,33 @@ private:
     outstanding.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void PublishTask(TaskPtr task, int target, bool local) {
-    AccountTask(task, target);
-    auto &outstanding = thread_data_[target].outstanding_tasks;
-    try {
-      if (!thread_data_[target].PushTask(task, local)) {
-        std::lock_guard<std::mutex> lock(overflow_mutex_);
-        overflow_tasks_.push_back(reinterpret_cast<QueueEntry>(task));
-        overflow_nonempty_.store(true, std::memory_order_release);
+  void PublishOrdinaryTask(TaskPtr task, int target, bool local) {
+    const auto discard = [](Task *p) { p->Discard(); };
+    std::unique_ptr<Task, decltype(discard)> pending(task, discard);
+    TaskPtr inline_task = nullptr;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (!publication.IsAdmitted() ||
+          cancelled_.load(std::memory_order_acquire)) {
+        return;
       }
-    } catch (...) {
-      outstanding.fetch_sub(1, std::memory_order_relaxed);
-      task->Discard();
-      throw;
+      inline_task = PublishAdmittedTask(pending.release(), target, local);
     }
-    WakeOneWorker();
+    if (inline_task) {
+      ExecuteTask(inline_task);
+    }
   }
 
-  TaskPtr PopOverflow() {
-    while (overflow_nonempty_.load(std::memory_order_acquire)) {
-      QueueEntry entry;
-      {
-        std::lock_guard<std::mutex> lock(overflow_mutex_);
-        if (overflow_tasks_.empty())
-          return nullptr;
-        entry = overflow_tasks_.front();
-        overflow_tasks_.pop_front();
-        overflow_nonempty_.store(!overflow_tasks_.empty(),
-                                 std::memory_order_release);
-      }
-      if (auto *task = ExtractEntry(entry))
-        return task;
+  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local) {
+    AccountTask(task, target);
+    if (!thread_data_[target].PushTask(task, local)) {
+      return task;
     }
+    WakeOneWorker();
     return nullptr;
   }
 
-  bool TryExecuteOne() {
+  TaskPtr TryTakeOne() {
     PerThread *pt = GetPerThread();
     assert(IsRegistered(pt));
 
@@ -778,20 +796,26 @@ private:
       task = thread_data_[pt->thread_id].PopFront();
     }
     if (!task) {
-      task = PopOverflow();
-    }
-    if (!task) {
       task = GlobalSteal(true);
     }
-    if (!task) {
-      return false;
-    }
-#ifdef OOX_EIGEN_ENABLE_STATS
-    thread_data_[pt->thread_id].statistics.executed.fetch_add(
-        1, std::memory_order_relaxed);
-#endif
+    return task;
+  }
+
+  bool TryExecuteOne() {
+    TaskPtr task = TryTakeOne();
+    if (!task) return false;
     ExecuteTask(task);
     return true;
+  }
+
+  static void DiscardPublishedTask(TaskPtr task) noexcept {
+    assert(task != nullptr);
+    auto *outstanding = task->outstanding;
+    assert(outstanding != nullptr);
+    task->Discard();
+    const size_t previous =
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+    assert(previous > 0);
   }
 
   void TaskFinished(std::atomic<size_t> *outstanding) {
@@ -826,6 +850,17 @@ private:
     waiter_event_.NotifyAll();
   }
 
+  void CancelOrdinaryQueues() {
+    // Best-effort drain: a contended local steal may fail before the deque is
+    // empty. Recipient-side affinity proxy references are also left for the
+    // final owner-side FlushQueues after workers join; Cancel is not a join.
+    for (auto &data : thread_data_) {
+      while (TaskPtr task = data.PopBack(true)) {
+        DiscardPublishedTask(task);
+      }
+    }
+  }
+
   void JoinThreads() {
     for (auto &data : thread_data_) {
       data.thread.reset();
@@ -835,22 +870,9 @@ private:
   void FlushQueues() {
     for (auto &data : thread_data_) {
       while (TaskPtr task = data.PopFront()) {
-        auto *outstanding = task->outstanding;
-        task->Discard();
-        outstanding->fetch_sub(1, std::memory_order_relaxed);
+        DiscardPublishedTask(task);
       }
     }
-    std::lock_guard<std::mutex> lock(overflow_mutex_);
-    while (!overflow_tasks_.empty()) {
-      const auto entry = overflow_tasks_.front();
-      overflow_tasks_.pop_front();
-      if (auto *task = ExtractEntry(entry)) {
-        auto *outstanding = task->outstanding;
-        task->Discard();
-        outstanding->fetch_sub(1, std::memory_order_relaxed);
-      }
-    }
-    overflow_nonempty_.store(false, std::memory_order_release);
     assert(NoOutstandingTasks());
   }
 
