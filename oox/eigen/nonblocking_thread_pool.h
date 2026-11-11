@@ -17,6 +17,7 @@
 #define OOX_EIGEN_NONBLOCKING_THREAD_POOL_H
 
 #include "max_size_vector.h"
+#include "queue_traversal.h"
 #include "run_queue.h"
 #include "stl_thread_env.h"
 #include "small_object_pool.h"
@@ -1195,31 +1196,19 @@ private:
   // limit) in best-effort manner.
   TaskPtr Steal(unsigned start, unsigned limit, bool force) {
     PerThread *pt = GetPerThread();
-    const size_t size = limit - start;
-    unsigned r = Rand(&pt->rand);
-    // Reduce r into [0, size) range, this utilizes trick from
-    // https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
-    assert(all_coprimes_[size - 1].size() < (1 << 30));
-    unsigned victim = ((uint64_t)r * (uint64_t)size) >> 32;
-    unsigned index =
-        ((uint64_t)all_coprimes_[size - 1].size() * (uint64_t)r) >> 32;
-    unsigned inc = all_coprimes_[size - 1][index];
-
-    for (unsigned i = 0; i < size; i++) {
-      assert(start + victim < limit);
-      TaskPtr t = thread_data_[start + victim].PopBack(force);
+    const unsigned size = limit - start;
+    internal::QueueTraversal queues(size, all_coprimes_[size - 1], Rand(&pt->rand));
+    while (!queues.Empty()) {
+      const unsigned victim = start + queues.Next();
+      TaskPtr t = thread_data_[victim].PopBack(force);
       if (t) {
-        OOX_SCHED_EVENT("steal_queue", t->trace_id, start + victim, pt->thread_id);
+        OOX_SCHED_EVENT("steal_queue", t->trace_id, victim, pt->thread_id);
 #ifdef OOX_EIGEN_ENABLE_STATS
-        if (static_cast<int>(start + victim) != pt->thread_id)
+        if (static_cast<int>(victim) != pt->thread_id)
           thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
               1, std::memory_order_relaxed);
 #endif
         return t;
-      }
-      victim += inc;
-      if (victim >= size) {
-        victim -= size;
       }
     }
 #ifdef OOX_EIGEN_ENABLE_STATS

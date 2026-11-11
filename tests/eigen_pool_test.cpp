@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -90,6 +91,28 @@ TEST(EigenPoolDeathTest, UnhandledTaskExceptionFailsFast) {
 TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
   EXPECT_THROW(ThreadPool(-1), std::invalid_argument);
+}
+
+TEST(EigenPool, QueueTraversalVisitsEveryOffsetOnce) {
+  using oox::detail::eigen_pool::internal::QueueTraversal;
+  for (unsigned size = 1; size <= 65; ++size) {
+    std::vector<unsigned> strides;
+    for (unsigned step = 1; step <= size; ++step)
+      if (std::gcd(step, size) == 1) strides.push_back(step);
+    for (uint32_t seed : {0u, 0x55555555u, 0x80000000u, 0xffffffffu}) {
+      SCOPED_TRACE(::testing::Message() << "size=" << size << " seed=" << seed);
+      std::vector<bool> visited(size);
+      QueueTraversal queues(size, strides, seed);
+      for (unsigned i = 0; i < size; ++i) {
+        ASSERT_FALSE(queues.Empty());
+        const unsigned victim = queues.Next();
+        ASSERT_LT(victim, size);
+        EXPECT_FALSE(visited[victim]);
+        visited[victim] = true;
+      }
+      EXPECT_TRUE(queues.Empty());
+    }
+  }
 }
 
 #if defined(__linux__) && !(defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST)
