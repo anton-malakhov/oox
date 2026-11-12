@@ -4,12 +4,18 @@
 
 #include <gtest/gtest.h>
 
+#if defined(__linux__) && !(defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST)
+#include <pthread.h>
+#include "eigen_test_wait.h"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -86,6 +92,103 @@ TEST(EigenPool, RejectsNonPositiveThreadCounts) {
   EXPECT_THROW(ThreadPool(0), std::invalid_argument);
   EXPECT_THROW(ThreadPool(-1), std::invalid_argument);
 }
+
+TEST(EigenPool, QueueTraversalVisitsEveryOffsetOnce) {
+  using oox::detail::eigen_pool::internal::QueueTraversal;
+  for (unsigned size = 1; size <= 65; ++size) {
+    std::vector<unsigned> strides;
+    for (unsigned step = 1; step <= size; ++step)
+      if (std::gcd(step, size) == 1) strides.push_back(step);
+    for (uint32_t seed : {0u, 0x55555555u, 0x80000000u, 0xffffffffu}) {
+      SCOPED_TRACE(::testing::Message() << "size=" << size << " seed=" << seed);
+      std::vector<bool> visited(size);
+      QueueTraversal queues(size, strides, seed);
+      for (unsigned i = 0; i < size; ++i) {
+        ASSERT_FALSE(queues.Empty());
+        const unsigned victim = queues.Next();
+        ASSERT_LT(victim, size);
+        EXPECT_FALSE(visited[victim]);
+        visited[victim] = true;
+      }
+      EXPECT_TRUE(queues.Empty());
+    }
+  }
+}
+
+#if defined(__linux__) && !(defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST)
+TEST(EigenPool, ResidentBindingRespectsNarrowerWorkerAffinity) {
+  auto placement = oox::detail::eigen_pool::DiscoverResidentPlacement(2);
+  if (placement.bindings.size() < 2) GTEST_SKIP() << "Need two allowed physical cores";
+  auto &binding = placement.bindings[1];
+  const auto &restricted = placement.bindings[0].target;
+  ASSERT_NE(binding.target, restricted);
+
+  std::vector<unsigned long> observed(restricted.size());
+  int read_error = 0;
+  const auto setup_error = std::async(std::launch::async, [&] {
+    const size_t bytes = restricted.size() * sizeof(unsigned long);
+    // Establish that Linux accepts the target, then give the worker a different mask.
+    if (sched_setaffinity(0, bytes, reinterpret_cast<const cpu_set_t *>(binding.target.data())) ||
+        sched_setaffinity(0, bytes, reinterpret_cast<const cpu_set_t *>(restricted.data())))
+      return errno;
+    binding.Apply();
+    if (sched_getaffinity(0, bytes, reinterpret_cast<cpu_set_t *>(observed.data()))) read_error = errno;
+    return 0;
+  }).get();
+
+  if (setup_error) GTEST_SKIP() << "Cannot set test affinity, errno=" << setup_error;
+  ASSERT_EQ(read_error, 0);
+  EXPECT_EQ(observed, restricted);
+}
+
+TEST(EigenPool, ResidentWorkerRestoresAffinityWhenLimitFallsAndOnExit) {
+  using namespace oox::detail::eigen_pool;
+  using affinity_detail::CpuMask;
+  const auto original = affinity_detail::ReadAllowedMask();
+  const auto placement = DiscoverResidentPlacement(1);
+  if (placement.bindings.empty() || placement.bindings.front().target == original)
+    GTEST_SKIP() << "Need a worker whose allowed mask can be narrowed";
+  const auto &target = placement.bindings.front().target;
+  if (!std::async(std::launch::async, [&] { return affinity_detail::SetThreadMask(target); }).get())
+    GTEST_SKIP() << "Cannot set worker affinity";
+
+  // Observe the same physical thread before it enters and after it leaves the pool loop.
+  struct Observer : StlThreadEnvironment {
+    std::promise<pthread_t> &started;
+    CpuMask &on_exit;
+    EnvThread *CreateThread(std::function<void()> loop) {
+      return new EnvThread([this, loop = std::move(loop)] {
+        started.set_value(pthread_self());
+        loop();
+        on_exit = affinity_detail::ReadAllowedMask();
+      });
+    }
+  };
+  std::promise<pthread_t> started;
+  auto worker = started.get_future();
+  CpuMask on_exit;
+  {
+    ThreadPoolTempl<Observer> pool(1, true, false, WorkerIdleMode::ResidentAuto,
+                                   Observer{{}, started, on_exit});
+    const auto physical = worker.get();
+    CpuMask observed(original.size());
+    auto wait_mask = [&](const CpuMask &expected, const char *operation) {
+      eigen_test_support::WaitUntil([&] {
+        return pthread_getaffinity_np(physical, observed.size() * sizeof(unsigned long),
+                   reinterpret_cast<cpu_set_t *>(observed.data())) == 0 && observed == expected;
+      }, operation);
+    };
+    wait_mask(target, "first resident binding");
+    EXPECT_EQ(affinity_detail::ReadAllowedMask(), original);
+    pool.SetResidentLimit(0);
+    wait_mask(original, "restore worker affinity after limit falls");
+    pool.SetResidentLimit(1);
+    wait_mask(target, "reapply worker affinity after limit rises");
+    pool.Cancel();
+  }
+  EXPECT_EQ(on_exit, original);
+}
+#endif
 
 TEST(EigenPool, OneBackgroundWorkerRunsExternalSubmission) {
   ThreadPool pool(1, false, false);

@@ -7,7 +7,7 @@ Start with the [MR review guide](docs/REVIEW_GUIDE.md) for scope and review orde
 On Debian or Ubuntu with Python 3.8+, curl, and root or sudo access, run:
 
 ```sh
-ref=kkalpha-pool-trace
+ref=kkalpha-resident-groups
 curl -fsSL "https://raw.githubusercontent.com/anton-malakhov/oox/$ref/tools/scheduler_benchmark.py" -o scheduler_benchmark.py &&
 python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
 ```
@@ -323,3 +323,8 @@ The recorder checks that every iteration was visited once per wave. Recording
 changes timing, particularly with per-iteration callbacks enabled. Use the
 ordinary benchmark executables for timing comparisons. TBB Auto, Eigen stealing
 and Eigen sharing record executed iterations at the callback boundary.
+
+The Eigen `RAPID_GROUP` mode activates available resident workers and assigns
+each participant a fixed iteration range. Its nested and concurrent workloads
+use the same scheduler adapter as its trace recorder. Pass
+`--modes EIGEN_STATIC RAPID_GROUP` to compare their actual range assignments.

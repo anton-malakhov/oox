@@ -119,7 +119,9 @@ class TraceTests(unittest.TestCase):
                             # Independent, deliberately simple oracle: each integer
                             # occurs twice, irrespective of scheduler structure.
                             self.assertEqual(sorted(e['a'] for e in calls), sorted(list(range(size)) * 2))
-                            chunks = [e for e in data['events'] if e['kind'] == 'chunk' and e['ph'] == 'B']
+                            # A fixed resident slot executes its callback range in full.
+                            kind = 'range' if mode == 'RAPID_GROUP' else 'chunk'
+                            chunks = [e for e in data['events'] if e['kind'] == kind and e['ph'] == 'B']
                             self.assertEqual(sorted(i for e in chunks for i in range(e['a'], e['b'])),
                                              sorted(list(range(size)) * 2))
 

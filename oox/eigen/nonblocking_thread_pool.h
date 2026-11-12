@@ -17,10 +17,17 @@
 #define OOX_EIGEN_NONBLOCKING_THREAD_POOL_H
 
 #include "max_size_vector.h"
+#include "queue_traversal.h"
 #include "run_queue.h"
 #include "stl_thread_env.h"
 #include "small_object_pool.h"
 #include "scheduler_trace.h"
+#include "resident_command.h"
+#include "resident_cohort.h"
+#include "resident_queue_scan.h"
+#include "resident_worker_mask.h"
+#include "resident_worker_set.h"
+#include "available_parallelism.h"
 
 #include <atomic>
 #include <cassert>
@@ -41,10 +48,16 @@
 
 namespace oox::detail::eigen_pool {
 
+// ResidentBusy is an explicit pool-lifetime policy. Idle workers advertise a
+// bit and poll a command slot instead of entering the OS parking protocol.
+// ResidentAuto bounds persistent polling by the CPU allowance at construction.
+enum class WorkerIdleMode { Park, ResidentBusy, ResidentAuto };
+
 #ifdef OOX_EIGEN_THREAD_POOL_TESTING
 namespace internal {
 inline scheduler_sync::atomic<size_t> completion_notifications{0};
 inline scheduler_sync::atomic<size_t> completion_waits{0};
+
 }
 #endif
 
@@ -131,17 +144,32 @@ public:
 
   ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
                   Environment env = Environment())
+      : ThreadPoolTempl(num_threads, allow_spinning, use_main_thread,
+                        WorkerIdleMode::Park, env) {}
+
+  ThreadPoolTempl(int num_threads, bool allow_spinning, bool use_main_thread,
+                  WorkerIdleMode idle_mode, Environment env = Environment())
       : env_(env), num_threads_(ValidateThreadCount(num_threads)),
         allow_spinning_(allow_spinning), thread_data_(num_threads_),
         all_coprimes_(num_threads_),
-        pool_generation_(NextPoolGeneration()), done_(false),
-        cancelled_(false) {
+        pool_generation_(NextPoolGeneration()), idle_mode_(idle_mode),
+        resident_workers_(idle_mode_ == WorkerIdleMode::Park ? 0 : num_threads_,
+                          use_main_thread && num_threads_ > 1 ? 1 : 0),
+        resident_broadcasts_(resident_workers_.WordCount()
+            ? std::make_unique<ResidentBroadcast[]>(resident_workers_.WordCount()) : nullptr),
+        done_(false),
+        cancelled_(false),
+        resident_placement_(idle_mode == WorkerIdleMode::ResidentAuto
+            ? DiscoverResidentPlacement(num_threads_)
+            : ResidentPlacement{idle_mode == WorkerIdleMode::Park ? 0 : size_t(num_threads_), {}}),
+        resident_limit_max_(resident_placement_.limit),
+        resident_limit_(resident_limit_max_) {
     // Calculate coprimes of all numbers [1, num_threads].
     // Coprimes are used for random walks over all threads in Steal
     // operations. Iteration is based on the fact that if we take
     // a random starting thread index t and calculate num_threads - 1 subsequent
     // indices as (t + coprime) % num_threads, we will cover all threads without
-    // repetitions (effectively getting a presudo-random permutation of thread
+    // repetitions (effectively getting a pseudo-random permutation of thread
     // indices).
     for (int i = 1; i <= num_threads_; ++i) {
       all_coprimes_.emplace_back(i);
@@ -155,15 +183,13 @@ public:
     if (use_main_thread) {
       RegisterCreator(!needs_fallback_worker);
     }
-    const int first_background_worker =
-        use_main_thread && !needs_fallback_worker ? 1 : 0;
     try {
-      for (int i = first_background_worker; i < num_threads_; ++i) {
+      for (int i = resident_workers_.FirstBackgroundWorker(); i < num_threads_; ++i) {
         thread_data_[i].thread.reset(env_.CreateThread([this, i]() {
           PerThread *pt = GetPerThread();
           const PerThread previous = *pt;
           RegisterThread(pt, i, true);
-          WorkerLoop();
+          WorkerLoop(false, false, ResidentWorkerBinding(resident_placement_, i));
           *pt = previous;
         }));
       }
@@ -237,13 +263,13 @@ public:
         if (!thread_data_[pt->thread_id].local_tasks.PushFront(entry))
           inline_task = proxy->template Extract<AffinityProxy::local_bit>();
       }
+      HintResidentOrdinaryWork();
       WakeOneWorker();
     }
     if (inline_task) {
       ExecuteTask(inline_task);
     }
   }
-
   void ScheduleWithHint(TaskPtr t, int start, int limit) override {
     if (t == nullptr) {
       return;
@@ -253,7 +279,6 @@ public:
       t->Discard();
       return;
     }
-
     PerThread *pt = GetPerThread();
     if (IsRegistered(pt) && pt->owns_queue && pt->thread_id >= start &&
         pt->thread_id < limit) {
@@ -318,6 +343,102 @@ public:
     return WorkerLoop(External, JustOnce);
   }
 
+  bool UsesResidentBusyWait() const noexcept {
+    return idle_mode_ == WorkerIdleMode::ResidentBusy ||
+           idle_mode_ == WorkerIdleMode::ResidentAuto;
+  }
+
+  size_t MaxResidentLimit() const noexcept { return resident_limit_max_; }
+
+  size_t ResidentLimit() const noexcept {
+    return resident_limit_.load(std::memory_order_acquire);
+  }
+
+  // In-flight resident commands finish normally. Other workers use parking;
+  // increasing eligibility wakes parked workers to avoid lost transitions.
+  void SetResidentLimit(size_t limit) {
+    if (!UsesResidentBusyWait() && limit != 0)
+      throw std::invalid_argument("resident limit requires a resident-capable pool");
+    resident_limit_.store(std::min(limit, MaxResidentLimit()), std::memory_order_release);
+    WakeAllWorkers();
+  }
+
+  size_t ResidentCapacity(DomainId domain) const noexcept {
+    return resident_workers_.Capacity(domain.LimitedTo(ResidentLimit()));
+  }
+
+  // A demand hint, not an idle-worker reservation. A waiter cancels its
+  // registration before executing acquired work.
+  bool HasWaitingHelper() const noexcept { return worker_event_.HasWaiters(); }
+  size_t ResidentAvailableWorkers(DomainId domain) const noexcept {
+    return resident_workers_.Count(domain.LimitedTo(ResidentLimit()));
+  }
+
+  size_t ClaimResidentWorkers(DomainId domain, unsigned *workers,
+                              size_t capacity) noexcept {
+    return resident_workers_.Claim(domain.LimitedTo(ResidentLimit()), workers, capacity);
+  }
+
+  void PublishResident(ResidentTask &task, scheduler_sync::atomic<size_t> &completion,
+                       unsigned worker, size_t slot, uint64_t epoch = 0) noexcept {
+    assert(worker < static_cast<unsigned>(num_threads_));
+    OOX_SCHED_WORKER(CurrentThreadId());
+    thread_data_[worker].resident_command.Publish(worker, task, completion, slot, epoch);
+  }
+
+  size_t PublishResidentBatch(ResidentTask &task, scheduler_sync::atomic<size_t> &completion,
+                            const unsigned *workers, size_t count,
+                            size_t first_slot = 1, uint64_t epoch = 0,
+                            bool packed_completion = false) noexcept {
+    auto slot_for = [this](unsigned worker) -> internal::ResidentCommandSlot & {
+      assert(worker < static_cast<unsigned>(num_threads_));
+      OOX_SCHED_WORKER(CurrentThreadId());
+      return thread_data_[worker].resident_command;
+    };
+    return internal::PublishResidentCommands(resident_broadcasts_.get(), slot_for, task, completion,
+        workers, count, first_slot, epoch, packed_completion && SupportsPackedResidentCompletion());
+  }
+
+  uint64_t NextResidentEpoch() noexcept {
+    return internal::AllocateResidentEpoch(num_threads_, resident_workers_, resident_dispatch_epoch_);
+  }
+
+  bool ResidentEpochComplete(uint64_t epoch, const unsigned *workers,
+                              size_t count) const noexcept {
+    return internal::CohortEpochComplete(thread_data_, epoch, workers, count);
+  }
+
+  bool SupportsPackedResidentCompletion() const noexcept {
+    return internal::ResidentMaskWord::SupportsPackedCompletion(num_threads_);
+  }
+  uint64_t ResidentBatchDoneMask(size_t word, const unsigned *workers,
+                                size_t count) const noexcept {
+    return internal::CohortDoneMask(word, workers, count, num_threads_);
+  }
+  bool ResidentBatchDone(size_t word, uint64_t mask) const noexcept {
+    return resident_workers_.Word(word).Completed(mask);
+  }
+
+  // The selected finished-epoch or packed-done acquire must precede release.
+  void ReleaseResidentEpochBatch(size_t word) noexcept {
+    if (word == internal::no_resident_batch) return;
+    resident_broadcasts_[word].ReleaseAfterJoin(word, resident_workers_.Word(word), num_threads_);
+  }
+
+  template <typename Region> void HelpResidentUntil(Region &region) {
+    unsigned spins = 0;
+    while (!region.IsComplete()) {
+      if (++spins < kSpinCount) {
+        RelaxResidentWait();
+        continue;
+      }
+      spins = 0;
+      OOX_SCHED_EVENT("caller_help_probe", ::oox::scheduler_trace::Current());
+      if (!TryExecuteSomething())
+        RelaxResidentWait();
+    }
+  }
+
 #ifdef OOX_EIGEN_ENABLE_STATS
   Statistics GetStatistics() const {
     Statistics result;
@@ -353,6 +474,12 @@ public:
         event.CancelWait();
         ExecuteTask(task);
         continue;
+      }
+      if (registered && UsesResidentBusyWait()) {
+        // Keep the caller visible as an idle helper without immediately
+        // parking on a short resident command's completion.
+        for (unsigned spins = 0; spins < kSpinCount && !ready(); ++spins)
+          RelaxResidentWait();
       }
       if (ready() || cancelled_.load(std::memory_order_acquire)) {
         event.CancelWait();
@@ -438,6 +565,8 @@ private:
       scheduler_sync::atomic_thread_fence(std::memory_order_seq_cst);
       return epoch;
     }
+
+    bool HasWaiters() const noexcept { return waiters_.load(std::memory_order_relaxed) != 0; }
 
     void CancelWait() { waiters_.fetch_sub(1, std::memory_order_seq_cst); }
 
@@ -547,7 +676,8 @@ private:
     scheduler_sync::atomic<uintptr_t> task_and_locations;
   };
 
-  // A bounded mailbox carries the recipient-side references.
+  // Bounded recipient references. Thieves use the sender's local proxy;
+  // cancellation can safely drain the mailbox alongside its owner.
   class AffinityMailbox {
   public:
     bool Push(AffinityProxy *proxy) noexcept { return queue_.try_push(proxy); }
@@ -557,6 +687,8 @@ private:
       queue_.try_pop(result);
       return result;
     }
+
+    bool Empty() const noexcept { return queue_.empty(); }
 
   private:
     rigtorp::mpmc::Queue<AffinityProxy *> queue_{1024};
@@ -591,6 +723,8 @@ private:
   };
 #endif
 
+  using ResidentBroadcast = internal::ResidentBroadcast;
+
   struct ThreadData {
     ThreadData()
         : thread(), outstanding_tasks(0), local_tasks(),
@@ -600,9 +734,15 @@ private:
     Queue local_tasks;
     AffinityMailbox affinity_mailbox;
     rigtorp::mpmc::Queue<TaskPtr> mailbox;
+    internal::ResidentCommandSlot resident_command;
+    alignas(128) scheduler_sync::atomic<uint64_t> resident_finished{0};
+    // One already-accounted task rescued when a Rapid publisher wins capture.
+    // It remains stealable, including by waits inside the winning command.
+    alignas(128) scheduler_sync::atomic<TaskPtr> resident_deferred{nullptr};
 #ifdef OOX_SCHEDULER_TRACE
     int trace_worker = -1;
 #endif
+
 #ifdef OOX_EIGEN_ENABLE_STATS
     AtomicStatistics statistics;
 #endif
@@ -618,6 +758,11 @@ private:
     }
 
     TaskPtr PopFront() {
+      if (resident_deferred.load(std::memory_order_relaxed))
+        if (auto task = resident_deferred.exchange(nullptr, std::memory_order_acquire)) {
+          OOX_SCHED_EVENT("take_deferred", task->trace_id, trace_worker);
+          return task;
+        }
       while (auto entry = local_tasks.PopFront())
         if (auto *task = ExtractEntry(entry)) {
           OOX_SCHED_EVENT("take_deque", task->trace_id, trace_worker);
@@ -634,7 +779,17 @@ private:
       return task;
     }
 
+    bool MayHaveStealableWork() const {
+      return !local_tasks.Empty() || !mailbox.empty() ||
+          resident_deferred.load(std::memory_order_acquire) != nullptr;
+    }
+
     TaskPtr PopBack(bool force) {
+      if (resident_deferred.load(std::memory_order_relaxed))
+        if (auto task = resident_deferred.exchange(nullptr, std::memory_order_acquire)) {
+          OOX_SCHED_EVENT("take_deferred", task->trace_id, trace_worker);
+          return task;
+        }
       TaskPtr task = nullptr;
       mailbox.try_pop(task);
       if (task) OOX_SCHED_EVENT("take_mailbox", task->trace_id, trace_worker);
@@ -655,6 +810,10 @@ private:
   MaxSizeVector<ThreadData> thread_data_;
   MaxSizeVector<MaxSizeVector<unsigned>> all_coprimes_;
   const uint64_t pool_generation_;
+  const WorkerIdleMode idle_mode_;
+  internal::ResidentWorkerSet resident_workers_;
+  std::unique_ptr<ResidentBroadcast[]> resident_broadcasts_;
+  alignas(128) scheduler_sync::atomic<uint64_t> resident_dispatch_epoch_{0};
 
   scheduler_sync::once_flag cancellation_once_;
   EventCount worker_event_;
@@ -671,15 +830,32 @@ private:
   alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t>
       ordinary_publication_state_{0};
 
+  // Resident workers poll this generation. Keep its cache line separate from
+  // ordinary publication accounting.
+  alignas(128) scheduler_sync::atomic<uint64_t> resident_publication_epoch_{0};
+  ResidentPlacement resident_placement_;
+  const size_t resident_limit_max_;
+  alignas(OOX_EIGEN_CACHE_LINE_SIZE) scheduler_sync::atomic<size_t> resident_limit_;
+
+  bool IsResidentWorker(size_t worker) const noexcept {
+    return UsesResidentBusyWait() && worker < ResidentLimit();
+  }
+
+  enum class IdleResult { Retry, ExecutedTask, Exit };
 
   // Main worker thread loop. Returns true if processed some tasks
-  bool WorkerLoop(bool external = false, bool once = false) {
+  bool WorkerLoop(bool external = false, bool once = false,
+                  ResidentWorkerBinding binding = {}) {
+    PerThread *pt = GetPerThread();
+    assert(IsRegistered(pt));
     bool processed_anything = false;
     for (;;) {
       if (cancelled_.load(std::memory_order_acquire)) {
         return processed_anything;
       }
 
+      // Recheck an existing CPU binding before probing ordinary queues.
+      if (binding.Requested()) binding.SetResident(IsResidentWorker(pt->thread_id));
       if (TryExecuteOne()) {
         processed_anything = true;
         if (once) {
@@ -691,50 +867,60 @@ private:
         return processed_anything;
       }
 
-      bool found_work = false;
-      if (allow_spinning_) {
-        for (int i = 0; i < kSpinCount; ++i) {
-          if (cancelled_.load(std::memory_order_acquire)) {
-            return processed_anything;
-          }
-          if (TryExecuteOne()) {
-            processed_anything = true;
-            found_work = true;
-            break;
-          }
-          scheduler_sync::this_thread::yield();
+      const bool resident = IsResidentWorker(static_cast<size_t>(pt->thread_id));
+      binding.SetResident(resident);
+      if (resident) {
+        if (WaitResident(static_cast<unsigned>(pt->thread_id))) {
+          processed_anything = true;
         }
-      }
-      if (found_work) {
         continue;
       }
 
-      const uint64_t token = worker_event_.PrepareWait();
-      if (TaskPtr task = TryTakeOne()) {
-        worker_event_.CancelWait();
-        ExecuteTask(task);
-        processed_anything = true;
-        continue;
-      }
-      if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
-        worker_event_.CancelWait();
-        return processed_anything;
-      }
-#ifdef OOX_EIGEN_ENABLE_STATS
-      const auto idle_begin = std::chrono::steady_clock::now();
-#endif
-      worker_event_.Wait(token);
-#ifdef OOX_EIGEN_ENABLE_STATS
-      const auto idle_end = std::chrono::steady_clock::now();
-      auto &statistics = thread_data_[GetPerThread()->thread_id].statistics;
-      statistics.sleeps.fetch_add(1, std::memory_order_relaxed);
-      statistics.idle_nanoseconds.fetch_add(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(idle_end -
-                                                               idle_begin)
-              .count(),
-          std::memory_order_relaxed);
-#endif
+      const IdleResult idle = WaitForOrdinaryWork(pt);
+      if (idle == IdleResult::Exit) return processed_anything;
+      if (idle == IdleResult::ExecutedTask) processed_anything = true;
     }
+  }
+
+  IdleResult WaitForOrdinaryWork(PerThread *pt) {
+    // Extra workers in an oversubscribed automatic pool should park after
+    // the failed search, leaving CPU time to its resident participants.
+    if (allow_spinning_ && (idle_mode_ != WorkerIdleMode::ResidentAuto ||
+                            MaxResidentLimit() == NumThreads())) {
+      for (int i = 0; i < kSpinCount; ++i) {
+        if (cancelled_.load(std::memory_order_acquire)) return IdleResult::Exit;
+        if (TryExecuteOne()) return IdleResult::ExecutedTask;
+        scheduler_sync::this_thread::yield();
+      }
+    }
+
+    // Register before the final checks so a publication racing them wakes us.
+    const uint64_t token = worker_event_.PrepareWait();
+    if (TaskPtr task = TryTakeOne()) {
+      worker_event_.CancelWait();
+      ExecuteTask(task);
+      return IdleResult::ExecutedTask;
+    }
+    if (IsResidentWorker(static_cast<size_t>(pt->thread_id))) {
+      worker_event_.CancelWait();
+      return IdleResult::Retry;
+    }
+    if (cancelled_.load(std::memory_order_acquire) || ShouldExit()) {
+      worker_event_.CancelWait();
+      return IdleResult::Exit;
+    }
+#ifdef OOX_EIGEN_ENABLE_STATS
+    const auto idle_begin = std::chrono::steady_clock::now();
+#endif
+    worker_event_.Wait(token);
+#ifdef OOX_EIGEN_ENABLE_STATS
+    const auto idle = std::chrono::steady_clock::now() - idle_begin;
+    auto &statistics = thread_data_[pt->thread_id].statistics;
+    statistics.sleeps.fetch_add(1, std::memory_order_relaxed);
+    statistics.idle_nanoseconds.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(idle).count(), std::memory_order_relaxed);
+#endif
+    return IdleResult::Retry;
   }
 
   static uint64_t NextPoolGeneration() {
@@ -807,13 +993,13 @@ private:
     }
   }
 
-  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local) {
+  TaskPtr PublishAdmittedTask(TaskPtr task, int target, bool local, bool notify = true) {
     AccountTask(task, target);
     if (!thread_data_[target].PushTask(task, local)) {
       OOX_SCHED_EVENT("inline_queue_full", task->trace_id, target);
       return task;
     }
-    WakeOneWorker();
+    if (notify) { HintResidentOrdinaryWork(); WakeOneWorker(); }
     return nullptr;
   }
 
@@ -839,6 +1025,98 @@ private:
     return true;
   }
 
+  void HintResidentOrdinaryWork() noexcept {
+    if (!UsesResidentBusyWait() || ResidentLimit() <= resident_workers_.FirstBackgroundWorker()) {
+      return;
+    }
+    // Publication is only a probe hint, not a reservation of an idle worker.
+    // A worker withdraws only after it has actually acquired ordinary work.
+    resident_publication_epoch_.fetch_add(1, std::memory_order_release);
+  }
+
+  void DeferResidentTask(ThreadData &data, TaskPtr task) noexcept {
+    // Cancellation closes admission and drains these slots with other queues.
+    // Do not account again: the task retains its original outstanding owner.
+    bool published = false;
+    {
+      PublicationGuard publication(ordinary_publication_state_);
+      if (publication.IsAdmitted()) {
+        assert(data.resident_deferred.load(std::memory_order_relaxed) == nullptr);
+        OOX_SCHED_EVENT("defer", task->trace_id, data.trace_worker);
+        data.resident_deferred.store(task, std::memory_order_release);
+        HintResidentOrdinaryWork();
+        WakeOneWorker();
+        published = true;
+      }
+    }
+    if (!published) DiscardPublishedTask(task);
+  }
+
+  TaskPtr ProbeOrdinaryWork(unsigned worker, internal::ResidentQueueScan &scan) {
+    const uint64_t epoch = resident_publication_epoch_.load(std::memory_order_acquire);
+    if (!scan.Prepare(worker, epoch, num_threads_, all_coprimes_.back(),
+                      [this] { return Rand(&GetPerThread()->rand); })) return nullptr;
+    if (TaskPtr task = scan.TryTake(worker, thread_data_)) return task;
+#ifdef OOX_EIGEN_ENABLE_STATS
+    if (scan.RoundFinished() && scan.RetryRequested())
+      thread_data_[worker].statistics.failed_steal_rounds.fetch_add(1, std::memory_order_relaxed);
+#endif
+    return nullptr;
+  }
+
+  bool WaitResident(unsigned worker) noexcept {
+    if (!IsResidentWorker(worker)) return false;
+    // Snapshot before advertising and always probe once for earlier publications.
+    internal::ResidentQueueScan scan{resident_publication_epoch_.load(std::memory_order_acquire)};
+    auto &availability = resident_workers_.Word(worker / 64);
+    availability.Advertise(worker, num_threads_);
+    bool processed = false;
+    unsigned polls = 0;
+    for (;;) {
+      const auto command = thread_data_[worker].resident_command.Take(worker, resident_broadcasts_.get());
+      if (command.task) {
+        thread_data_[worker].resident_command.Run(command, worker);
+        command.Complete(worker, num_threads_, resident_workers_.Word(worker / 64),
+                         thread_data_[worker].resident_finished);
+        processed = true;
+        scan.AfterCommand();
+        continue;
+      }
+      if (++polls == kSpinCount) {
+        polls = 0;
+        if (!IsResidentWorker(worker) && availability.WithdrawResident(worker)) return processed;
+        if (TaskPtr ordinary = ProbeOrdinaryWork(worker, scan)) {
+#ifdef OOX_EIGEN_TEST_RESIDENT_ACQUIRED
+          OOX_EIGEN_TEST_RESIDENT_ACQUIRED(worker);
+#endif
+          if (availability.WithdrawResident(worker)) {
+            ExecuteTask(ordinary);
+            return true;
+          }
+          // The publisher owns this worker. Its command may need the stolen work to join.
+          DeferResidentTask(thread_data_[worker], ordinary);
+        }
+      }
+      if ((cancelled_.load(std::memory_order_acquire) || ShouldExit()) && availability.WithdrawResident(worker))
+        return processed;
+      RelaxResidentWait();
+    }
+  }
+
+public:
+  static void RelaxResidentWait() noexcept {
+#if defined(OOX_EIGEN_TWIST) && OOX_EIGEN_TWIST
+    scheduler_sync::this_thread::yield();
+#elif defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    asm volatile("isb sy" ::: "memory");
+#else
+    scheduler_sync::this_thread::yield();
+#endif
+  }
+
+private:
   static void DiscardPublishedTask(TaskPtr task) noexcept {
     assert(task != nullptr);
     OOX_SCHED_EVENT("discard", task->trace_id);
@@ -912,31 +1190,19 @@ private:
   // limit) in best-effort manner.
   TaskPtr Steal(unsigned start, unsigned limit, bool force) {
     PerThread *pt = GetPerThread();
-    const size_t size = limit - start;
-    unsigned r = Rand(&pt->rand);
-    // Reduce r into [0, size) range, this utilizes trick from
-    // https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
-    assert(all_coprimes_[size - 1].size() < (1 << 30));
-    unsigned victim = ((uint64_t)r * (uint64_t)size) >> 32;
-    unsigned index =
-        ((uint64_t)all_coprimes_[size - 1].size() * (uint64_t)r) >> 32;
-    unsigned inc = all_coprimes_[size - 1][index];
-
-    for (unsigned i = 0; i < size; i++) {
-      assert(start + victim < limit);
-      TaskPtr t = thread_data_[start + victim].PopBack(force);
+    const unsigned size = limit - start;
+    internal::QueueTraversal queues(size, all_coprimes_[size - 1], Rand(&pt->rand));
+    while (!queues.Empty()) {
+      const unsigned victim = start + queues.Next();
+      TaskPtr t = thread_data_[victim].PopBack(force);
       if (t) {
-        OOX_SCHED_EVENT("steal_queue", t->trace_id, start + victim, pt->thread_id);
+        OOX_SCHED_EVENT("steal_queue", t->trace_id, victim, pt->thread_id);
 #ifdef OOX_EIGEN_ENABLE_STATS
-        if (static_cast<int>(start + victim) != pt->thread_id)
+        if (static_cast<int>(victim) != pt->thread_id)
           thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(
               1, std::memory_order_relaxed);
 #endif
         return t;
-      }
-      victim += inc;
-      if (victim >= size) {
-        victim -= size;
       }
     }
 #ifdef OOX_EIGEN_ENABLE_STATS

@@ -11,7 +11,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 MODES = ('EIGEN_AUTO', 'EIGEN_STATIC', 'EIGEN_SIMPLE', 'EIGEN_AFFINITY',
-         'EIGEN_STEALING', 'EIGEN_SHARING', 'TBB_AUTO')
+         'EIGEN_STEALING', 'EIGEN_SHARING', 'TBB_AUTO', 'RAPID_GROUP')
 
 
 def validate(data):

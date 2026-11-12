@@ -36,7 +36,7 @@ def positive(value):
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default="https://github.com/anton-malakhov/oox.git")
-    parser.add_argument("--ref", default="kkalpha-pool-trace",
+    parser.add_argument("--ref", default="kkalpha-resident-groups",
                         help="branch, tag or commit to benchmark (default: %(default)s)")
     parser.add_argument("--workdir", type=Path, default=Path("scheduler-runs"))
     parser.add_argument("--threads", nargs="+", type=positive, default=[4, 8])

@@ -31,5 +31,7 @@ The queue tests compare accepted and consumed task IDs over 640 seeded schedules
 The allocator tests check cross-thread return and exactly-once destruction over
 512 schedules. Scheduler tests check ordinary work and parallel loops against
 per-index counts and a serial result, including cancellation and pool shutdown.
+The scheduler target also exercises fixed Rapid groups with two, three and nine
+workers and checks that a delayed cohort join cannot complete a newer dispatch.
 
 A failed scenario prints its name and seed. These are bounded simulations.
