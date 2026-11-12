@@ -5,8 +5,10 @@
 #include "common.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace scheduler_eval {
@@ -48,6 +50,117 @@ void DeepNestedFor(std::size_t begin, std::size_t end, std::size_t depth,
                       body);
       },
       1);
+}
+
+// Both shapes have exactly five ParallelFor levels and 16384 output leaves.
+// NarrowAncestors has no nonleaf range wider than eight; BatchedAncestor adds
+// a width-32 nonleaf range, where lazy local batching can reserve siblings.
+// Their different numbers of inner roots make them separate workload cases,
+// rather than a pure measurement of the cost of batching.
+enum class NestedFiveShape { NarrowAncestors, BatchedAncestor };
+enum class NestedFivePattern {
+  Balanced,
+  EarlyInner,
+  LateInner,
+  EarlyLeaf,
+  LateLeaf
+};
+
+struct NestedFiveConfig {
+  NestedFiveShape shape = NestedFiveShape::NarrowAncestors;
+  NestedFivePattern pattern = NestedFivePattern::Balanced;
+  // Only the second level changes grain. All other levels use grain one.
+  std::size_t ancestor_grain = 1;
+};
+
+inline constexpr std::size_t NestedFiveLeafCount = 16384;
+inline constexpr std::size_t NestedFiveWorkSteps = 1 << 20;
+
+inline std::array<std::size_t, 5> NestedFiveExtents(NestedFiveShape shape) {
+  return shape == NestedFiveShape::NarrowAncestors
+             ? std::array<std::size_t, 5>{8, 4, 4, 4, 32}
+             : std::array<std::size_t, 5>{8, 32, 4, 4, 4};
+}
+
+inline std::size_t NestedFiveInnerSpan(NestedFiveShape shape) {
+  const auto extents = NestedFiveExtents(shape);
+  return extents[2] * extents[3] * extents[4];
+}
+
+inline std::size_t NestedFiveEarlyInnerFirst(NestedFiveShape shape) {
+  // On a width-32 owner range, callback three can begin a grown local batch
+  // [3,7): four through six may be reserved while seven and later stay public.
+  // This placement does not force any particular steal or execution order.
+  return shape == NestedFiveShape::BatchedAncestor
+             ? 3 * NestedFiveInnerSpan(shape)
+             : 0;
+}
+
+inline std::size_t NestedFiveLeafSteps(std::size_t index,
+                                     const NestedFiveConfig &config) {
+  assert(index < NestedFiveLeafCount);
+  if (config.pattern == NestedFivePattern::Balanced)
+    return NestedFiveWorkSteps / NestedFiveLeafCount;
+  // The varying base sums to 188416 steps. Every skew placement distributes
+  // the same remaining 860160 steps, so all five patterns do equal total work.
+  constexpr auto extra = NestedFiveWorkSteps - NestedFiveLeafCount * 23 / 2;
+  const auto base = 8 + index % 8;
+  const auto span = NestedFiveInnerSpan(config.shape);
+  const auto first = NestedFiveEarlyInnerFirst(config.shape);
+  switch (config.pattern) {
+  case NestedFivePattern::EarlyInner:
+    return base + (index >= first && index - first < span ? extra / span : 0);
+  case NestedFivePattern::LateInner:
+    return base + (index >= NestedFiveLeafCount - span ? extra / span : 0);
+  case NestedFivePattern::EarlyLeaf:
+    return base + (index == first + 3 ? extra : 0);
+  case NestedFivePattern::LateLeaf:
+    return base + (index == NestedFiveLeafCount - 5 ? extra : 0);
+  case NestedFivePattern::Balanced:
+    break;
+  }
+  return base;
+}
+
+inline std::uint64_t NestedFiveLeafValue(std::size_t index,
+                                       const NestedFiveConfig &config) {
+  std::uint64_t value = (std::uint64_t(index) + 0x9e3779b97f4a7c15ULL) ^
+                        ((std::uint64_t(index / 32) + 1) *
+                         0xd1b54a32d192ed03ULL);
+  for (std::size_t step = 0, steps = NestedFiveLeafSteps(index, config);
+       step < steps; ++step)
+    value = (value ^ (value >> 27)) * 0x3c79ac492ba7b653ULL + step +
+            (index & 31);
+  // Zero is reserved for an output poison value in the benchmark/oracle.
+  return value | 1;
+}
+
+template <typename EmitLeaf>
+void NestedFiveFor(const NestedFiveConfig &config, const EmitLeaf &emit_leaf) {
+  assert(config.ancestor_grain > 0);
+  const auto extents = NestedFiveExtents(config.shape);
+  EvalParallelFor(0, extents[0], [&](std::size_t a) {
+    EvalParallelFor(0, extents[1], [&](std::size_t b) {
+      EvalParallelFor(0, extents[2], [&](std::size_t c) {
+        EvalParallelFor(0, extents[3], [&](std::size_t d) {
+          EvalParallelFor(0, extents[4], [&](std::size_t e) {
+            const auto index =
+                (((a * extents[1] + b) * extents[2] + c) * extents[3] + d) *
+                    extents[4] + e;
+            emit_leaf(index, NestedFiveLeafValue(index, config));
+          }, 1);
+        }, 1);
+      }, 1);
+    }, config.ancestor_grain);
+  }, 1);
+}
+
+inline void NestedFive(const NestedFiveConfig &config,
+                       std::vector<std::uint64_t> &output) {
+  assert(output.size() == NestedFiveLeafCount);
+  NestedFiveFor(config, [&](std::size_t index, std::uint64_t value) {
+    output[index] = value;
+  });
 }
 
 inline void Multiply(const DenseMatrix &left, const DenseMatrix &right,

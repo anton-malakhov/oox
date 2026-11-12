@@ -94,26 +94,31 @@ struct alignas(128) ResidentBroadcast {
   }
 
 private:
+  template <bool Consume>
   uint64_t ReadMembers([[maybe_unused]] unsigned worker, uint64_t &seen) const noexcept {
     const uint64_t version = generation.load(std::memory_order_acquire);
     if ((version & 1) || version == seen) return 0;
 #if defined(OOX_EIGEN_THREAD_POOL_TESTING) && defined(OOX_EIGEN_TEST_RESIDENT_BATCH_READER)
-    OOX_EIGEN_TEST_RESIDENT_BATCH_READER(worker, version);
+    if constexpr (Consume) OOX_EIGEN_TEST_RESIDENT_BATCH_READER(worker, version);
 #endif
     const uint64_t members = mask.load(std::memory_order_acquire);
     if (generation.load(std::memory_order_acquire) != version) {
 #if defined(OOX_EIGEN_THREAD_POOL_TESTING) && defined(OOX_EIGEN_TEST_RESIDENT_BATCH_REJECTED)
-      OOX_EIGEN_TEST_RESIDENT_BATCH_REJECTED(worker);
+      if constexpr (Consume) OOX_EIGEN_TEST_RESIDENT_BATCH_REJECTED(worker);
 #endif
       return 0;
     }
-    seen = version;
+    if constexpr (Consume) seen = version;
     return members;
   }
 
 public:
+  bool Contains(unsigned worker, uint64_t seen) const noexcept {
+    return ReadMembers<false>(worker, seen) & (uint64_t{1} << (worker % 64));
+  }
+
   ResidentCommand Take(unsigned worker, uint64_t &seen) noexcept {
-    const uint64_t members = ReadMembers(worker, seen);
+    const uint64_t members = ReadMembers<true>(worker, seen);
     const uint64_t bit = uint64_t{1} << (worker % 64);
     if (!(members & bit)) return {};
     // Membership holds the descriptor until this worker completes. Only
@@ -170,6 +175,11 @@ public:
     TraceActivation(worker, slot);
 #endif
     task_.store(&task, std::memory_order_release);
+  }
+
+  bool HasCommand(unsigned worker, const ResidentBroadcast *broadcasts) const noexcept {
+    return task_.load(std::memory_order_acquire) != nullptr ||
+        (broadcasts && broadcasts[worker / 64].Contains(worker, seen_));
   }
 
   ResidentCommand Take(unsigned worker, ResidentBroadcast *broadcasts) noexcept {

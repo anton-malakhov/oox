@@ -142,6 +142,17 @@ if (OOX_ENABLE_EIGEN)
           DISCOVERY_MODE PRE_TEST
           DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
 
+  add_executable(eigen_rapid_auto_test eigen_rapid_auto_test.cpp)
+  target_link_libraries(eigen_rapid_auto_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_rapid_auto_test PRIVATE OOX_EIGEN_ENABLE_STATS=1)
+  gtest_discover_tests(eigen_rapid_auto_test
+          DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 90)
+
+  add_executable(eigen_rapid_policy_test eigen_rapid_policy_test.cpp)
+  target_link_libraries(eigen_rapid_policy_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  gtest_discover_tests(eigen_rapid_policy_test
+      DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+
   foreach(clock IN ITEMS normal tiny)
     add_executable(eigen_rapid_epoch_${clock}_test eigen_rapid_epoch_test.cpp)
     target_link_libraries(eigen_rapid_epoch_${clock}_test PRIVATE
@@ -158,6 +169,30 @@ if (OOX_ENABLE_EIGEN)
         DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
   endforeach()
 
+  foreach(kind IN ITEMS rapid_dispatch rapid_cancellation rapid_lazy)
+    add_executable(eigen_${kind}_test eigen_${kind}_test.cpp)
+    target_link_libraries(eigen_${kind}_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+    gtest_discover_tests(eigen_${kind}_test
+        DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+  endforeach()
+
+  add_executable(eigen_resident_limit_test eigen_resident_limit_test.cpp)
+  target_link_libraries(eigen_resident_limit_test PRIVATE ${PROJECT_NAME}::eigen)
+  add_test(NAME EigenResidentAutomaticLimit COMMAND eigen_resident_limit_test)
+  set_tests_properties(EigenResidentAutomaticLimit PROPERTIES TIMEOUT 60)
+
+  add_executable(eigen_nested_ancestor_test eigen_nested_ancestor_test.cpp)
+  target_link_libraries(eigen_nested_ancestor_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_nested_ancestor_test PRIVATE OOX_RAPID_EXPERIMENT_NESTED_LAZY=1)
+  gtest_discover_tests(eigen_nested_ancestor_test
+      DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 60)
+
+  add_executable(eigen_nested_pending_test eigen_nested_pending_test.cpp)
+  target_link_libraries(eigen_nested_pending_test PRIVATE ${PROJECT_NAME}::eigen ${OOX_GTEST_LIB})
+  target_compile_definitions(eigen_nested_pending_test PRIVATE OOX_RAPID_EXPERIMENT_NESTED_LAZY=1)
+  gtest_discover_tests(eigen_nested_pending_test
+      DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30 PROPERTIES TIMEOUT 120)
+
   add_executable(eigen_partitioner_range_test eigen_partitioner_range_test.cpp)
   target_link_libraries(eigen_partitioner_range_test PRIVATE ${PROJECT_NAME}::eigen)
 
@@ -172,6 +207,7 @@ if (OOX_ENABLE_EIGEN)
   target_compile_definitions(eigen_partitioner_lifetime_test PRIVATE
           OOX_EIGEN_SMALL_OBJECT_POOL=0)
   add_test(NAME EigenPartitionerLifetimeOracle COMMAND eigen_partitioner_lifetime_test)
+  set_tests_properties(EigenPartitionerLifetimeOracle PROPERTIES TIMEOUT 120)
 
   add_executable(eigen_partitioner_completion_test eigen_partitioner_completion_test.cpp)
   target_link_libraries(eigen_partitioner_completion_test PRIVATE ${PROJECT_NAME}::eigen)

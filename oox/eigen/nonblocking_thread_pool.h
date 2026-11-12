@@ -21,6 +21,7 @@
 #include "run_queue.h"
 #include "stl_thread_env.h"
 #include "small_object_pool.h"
+#include "stealable_range.h"
 #include "scheduler_trace.h"
 #include "resident_command.h"
 #include "resident_cohort.h"
@@ -232,6 +233,22 @@ public:
     PublishOrdinaryTask(t, static_cast<int>(threadIndex), local);
   }
 
+  bool IsExecutingTask() const noexcept {
+    return GetExecutionContext().execution_pool == this;
+  }
+
+  // The caller owns the range and callback lifetime; this only preserves task
+  // ancestry for nested loops. It does not publish or account an ordinary task.
+  template <typename F> void RunInlineWork(F &&body) {
+    auto &context = GetExecutionContext();
+    struct Restore {
+      ExecutionContext &context;
+      ThreadPoolTempl *previous;
+      ~Restore() { context.execution_pool = previous; }
+    } restore{context, std::exchange(context.execution_pool, this)};
+    body();
+  }
+
   void ScheduleWithAffinity(TaskPtr task, size_t hint) {
     if (!task)
       return;
@@ -370,8 +387,49 @@ public:
   // A demand hint, not an idle-worker reservation. A waiter cancels its
   // registration before executing acquired work.
   bool HasWaitingHelper() const noexcept { return worker_event_.HasWaiters(); }
+  bool HasResidentCommand() noexcept {
+    auto *pt = GetPerThread();
+    if (!IsRegistered(pt) || !pt->owns_queue) return false;
+    const unsigned worker = static_cast<unsigned>(pt->thread_id);
+    return thread_data_[worker].resident_command.HasCommand(worker, resident_broadcasts_.get());
+  }
+
+  void PrepareNestedRange() noexcept {
+    auto *pt = GetPerThread();
+    if (!IsRegistered(pt) || !pt->owns_queue || !UsesResidentBusyWait()) return;
+    auto &data = thread_data_[pt->thread_id];
+    const bool released = data.stealable_range.load(std::memory_order_relaxed)
+        ? StealableRange::PrepareNested(data.stealable_range) : data.concurrent_range.PrepareNested();
+    if (!released) return;
+    // Notify only after the slot is unlocked, using the existing demand hints.
+    NotifyStealableRange();
+  }
+
+  template <class Range> bool PublishStealableRange(Range &range) noexcept {
+    auto *pt = GetPerThread();
+    if (!IsRegistered(pt) || !pt->owns_queue || !UsesResidentBusyWait()) return false;
+    auto &data = thread_data_[pt->thread_id];
+    if (!data.stealable_range.load(std::memory_order_relaxed)) {
+      if constexpr (requires { range.TryPublishConcurrent(data.concurrent_range); }) {
+        if (range.TryPublishConcurrent(data.concurrent_range)) {
+          NotifyStealableRange();
+          return true;
+        }
+      }
+      data.concurrent_range.PrepareNested();
+    }
+    range.Publish(data.stealable_range);
+    NotifyStealableRange();
+    return true;
+  }
+
   size_t ResidentAvailableWorkers(DomainId domain) const noexcept {
     return resident_workers_.Count(domain.LimitedTo(ResidentLimit()));
+  }
+
+  // A demand hint can stop at the first available worker in the domain.
+  bool HasResidentAvailableWorker(DomainId domain) const noexcept {
+    return resident_workers_.Any(domain.LimitedTo(ResidentLimit()));
   }
 
   size_t ClaimResidentWorkers(DomainId domain, unsigned *workers,
@@ -470,6 +528,9 @@ public:
         continue;
       }
       const uint64_t token = event.PrepareWait();
+#ifdef OOX_EIGEN_TEST_WAIT_PREPARED
+      OOX_EIGEN_TEST_WAIT_PREPARED();
+#endif
       if (TaskPtr task = registered ? TryTakeOne() : nullptr) {
         event.CancelWait();
         ExecuteTask(task);
@@ -606,6 +667,12 @@ private:
   void ExecuteTask(TaskPtr p) {
     OOX_SCHED_WORKER(CurrentThreadId());
     OOX_SCHED_SCOPE("task", p->trace_id);
+    auto *context = &GetExecutionContext();
+    struct RestoreExecution {
+      ExecutionContext *context;
+      ThreadPoolTempl *previous;
+      ~RestoreExecution() { context->execution_pool = previous; }
+    } execution{context, std::exchange(context->execution_pool, this)};
 #ifdef OOX_EIGEN_ENABLE_STATS
     const PerThread *pt = GetPerThread();
     const size_t worker = IsRegistered(pt) ? static_cast<size_t>(pt->thread_id) : 0;
@@ -712,6 +779,17 @@ private:
     bool owns_queue;
   };
 
+  // Dynamic call context is independent of thread registration. In particular,
+  // nested pools must restore the enclosing task ancestry.
+  struct ExecutionContext {
+    ThreadPoolTempl *execution_pool = nullptr;
+  };
+
+  static ExecutionContext &GetExecutionContext() noexcept {
+    struct Tag {};
+    return scheduler_sync::Local<ExecutionContext, Tag>();
+  }
+
 #ifdef OOX_EIGEN_ENABLE_STATS
   struct AtomicStatistics {
     scheduler_sync::atomic<uint64_t> scheduled{0};
@@ -739,6 +817,8 @@ private:
     // One already-accounted task rescued when a Rapid publisher wins capture.
     // It remains stealable, including by waits inside the winning command.
     alignas(128) scheduler_sync::atomic<TaskPtr> resident_deferred{nullptr};
+    scheduler_sync::atomic<uintptr_t> stealable_range{0};
+    ConcurrentRangeSlot concurrent_range;
 #ifdef OOX_SCHEDULER_TRACE
     int trace_worker = -1;
 #endif
@@ -781,7 +861,9 @@ private:
 
     bool MayHaveStealableWork() const {
       return !local_tasks.Empty() || !mailbox.empty() ||
-          resident_deferred.load(std::memory_order_acquire) != nullptr;
+          resident_deferred.load(std::memory_order_acquire) != nullptr ||
+          stealable_range.load(std::memory_order_acquire) != 0 ||
+          concurrent_range.range.load(std::memory_order_acquire) != nullptr;
     }
 
     TaskPtr PopBack(bool force) {
@@ -1025,6 +1107,12 @@ private:
     return true;
   }
 
+  void NotifyStealableRange() noexcept {
+    if (HasWaitingHelper()) WakeOneWorker();
+    if (HasResidentAvailableWorker({0, static_cast<unsigned>(num_threads_)}))
+      HintResidentOrdinaryWork();
+  }
+
   void HintResidentOrdinaryWork() noexcept {
     if (!UsesResidentBusyWait() || ResidentLimit() <= resident_workers_.FirstBackgroundWorker()) {
       return;
@@ -1057,11 +1145,14 @@ private:
     if (!scan.Prepare(worker, epoch, num_threads_, all_coprimes_.back(),
                       [this] { return Rand(&GetPerThread()->rand); })) return nullptr;
     if (TaskPtr task = scan.TryTake(worker, thread_data_)) return task;
+    if (!scan.RoundFinished()) return nullptr;
+    OOX_SCHED_EVENT("resident_range_probe", ::oox::scheduler_trace::Current(), worker);
+    TaskPtr task = StealActiveRange();
 #ifdef OOX_EIGEN_ENABLE_STATS
-    if (scan.RoundFinished() && scan.RetryRequested())
+    if (!task && scan.RetryRequested())
       thread_data_[worker].statistics.failed_steal_rounds.fetch_add(1, std::memory_order_relaxed);
 #endif
-    return nullptr;
+    return task;
   }
 
   bool WaitResident(unsigned worker) noexcept {
@@ -1213,7 +1304,31 @@ private:
   }
 
   // Steals work from any other thread in the pool.
-  TaskPtr GlobalSteal(bool force) { return Steal(0, num_threads_, force); }
+  TaskPtr StealActiveRange() {
+    if (!UsesResidentBusyWait() || IsCancelled()) return nullptr;
+    auto *pt = GetPerThread();
+    const unsigned first = (uint64_t{Rand(&pt->rand)} * num_threads_) >> 32;
+    for (unsigned offset = 0; offset < static_cast<unsigned>(num_threads_); ++offset) {
+      const unsigned victim = (first + offset) % static_cast<unsigned>(num_threads_);
+      auto &data = thread_data_[victim];
+      auto *task = StealableRange::TrySteal(data.stealable_range);
+      if (!task) task = data.concurrent_range.TrySteal();
+      if (task) {
+        OOX_SCHED_EVENT("steal_range", task->trace_id, victim, pt->thread_id);
+        AccountTask(task, victim);
+#ifdef OOX_EIGEN_ENABLE_STATS
+        thread_data_[pt->thread_id].statistics.successful_steals.fetch_add(1, std::memory_order_relaxed);
+#endif
+        return task;
+      }
+    }
+    return nullptr;
+  }
+
+  TaskPtr GlobalSteal(bool force) {
+    if (auto *task = Steal(0, num_threads_, force)) return task;
+    return StealActiveRange();
+  }
 
   static inline uint64_t GlobalThreadIdHash() {
     return std::hash<scheduler_sync::thread::id>()(scheduler_sync::this_thread::get_id());

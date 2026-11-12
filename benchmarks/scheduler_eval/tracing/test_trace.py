@@ -9,11 +9,18 @@ import tempfile
 import time
 import unittest
 
-from record import validate, render
+from record import MODES as ALL_MODES, validate, render
 
-BUILD = Path(sys.argv[1]).resolve()
-MODES = sys.argv[2:]
-del sys.argv[1:]
+BUILD = Path(sys.argv.pop(1)).resolve()
+if (BUILD / 'benchmarks/scheduler_eval').is_dir():
+    # Standalone invocation with a project build directory.
+    BUILD = BUILD / 'benchmarks/scheduler_eval'
+    MODES = [mode for mode in ALL_MODES if (BUILD / f'trace_scheduler_{mode}').is_file()]
+    if not MODES:
+        sys.exit('Build the scheduler_trace_all target first')
+else:
+    MODES = sys.argv[1:]
+    del sys.argv[1:]
 
 
 def run_recorder(mode):
@@ -100,6 +107,7 @@ class TraceTests(unittest.TestCase):
             self.assertNotIn('src="model.js"', text)
 
     def test_real_modes_against_visitation_oracle(self):
+        available_cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1
         with tempfile.TemporaryDirectory() as directory:
             case = 0
             for threads in (1, 2, 4):
@@ -107,8 +115,11 @@ class TraceTests(unittest.TestCase):
                     for mode in MODES:
                         case += 1
                         with self.subTest(case=case, threads=threads, size=size, mode=mode):
+                            if mode == 'RAPID_START' and threads > available_cpus:
+                                self.skipTest('bitmask warmup requires every requested TBB worker')
                             path = Path(directory) / f'{case}.json'
-                            env = dict(os.environ, BENCH_NUM_THREADS=str(threads))
+                            env = dict(os.environ, BENCH_NUM_THREADS=str(threads),
+                                       OOX_RAPID_RESIDENT_LIMIT=str(threads), OOX_RAPID_AUTOCALIBRATE='0')
                             subprocess.run([str(BUILD / f'trace_scheduler_{mode}'), '--output', str(path),
                                             '--tasks', str(size), '--iterations', '2', '--work', '2',
                                             '--shape', 'tail', '--callbacks'], env=env, check=True,
@@ -119,11 +130,12 @@ class TraceTests(unittest.TestCase):
                             # Independent, deliberately simple oracle: each integer
                             # occurs twice, irrespective of scheduler structure.
                             self.assertEqual(sorted(e['a'] for e in calls), sorted(list(range(size)) * 2))
-                            # A fixed resident slot executes its callback range in full.
-                            kind = 'range' if mode == 'RAPID_GROUP' else 'chunk'
+                            kind = 'range' if mode in ('RAPID_START', 'RAPID_GROUP') else 'chunk'
                             chunks = [e for e in data['events'] if e['kind'] == kind and e['ph'] == 'B']
                             self.assertEqual(sorted(i for e in chunks for i in range(e['a'], e['b'])),
                                              sorted(list(range(size)) * 2))
+                            if mode == 'RAPID_START':
+                                self.assertFalse(any(e['kind'].startswith('steal') for e in data['events']))
 
 
 if __name__ == '__main__':

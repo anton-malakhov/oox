@@ -10,8 +10,10 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
-MODES = ('EIGEN_AUTO', 'EIGEN_STATIC', 'EIGEN_SIMPLE', 'EIGEN_AFFINITY',
-         'EIGEN_STEALING', 'EIGEN_SHARING', 'TBB_AUTO', 'RAPID_GROUP')
+MODES = ('RAPID_AUTO', 'RAPID_START', 'RAPID_GROUP', 'EIGEN_AUTO', 'EIGEN_STATIC',
+         'EIGEN_AUTO_RESIDENT', 'EIGEN_SIMPLE', 'EIGEN_AFFINITY',
+         'EIGEN_STEALING', 'EIGEN_SHARING', 'TBB_AUTO',
+         'RAPID_NATIVE_AUTO', 'RAPID_NATIVE_SIMPLE', 'RAPID_NATIVE_STATIC', 'RAPID_NATIVE_AFFINITY')
 
 
 def validate(data):
@@ -44,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, help='new directory; never overwritten')
-    parser.add_argument('--modes', choices=MODES, nargs='+', default=list(MODES[:2]))
+    parser.add_argument('--modes', choices=MODES, nargs='+', default=list(MODES[:5]))
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--tasks', type=int, default=256)
     parser.add_argument('--iterations', type=int, default=3)
@@ -65,8 +67,8 @@ def main():
     out = args.output or Path('results') / ('scheduler-trace-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     out = out.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    env = {k: v for k, v in os.environ.items() if not k.startswith('OOX_BENCH_')}
-    env['BENCH_NUM_THREADS'] = str(args.threads)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('OOX_RAPID_', 'OOX_BENCH_'))}
+    env.update(BENCH_NUM_THREADS=str(args.threads), OOX_RAPID_RESIDENT_LIMIT=str(args.threads), OOX_RAPID_AUTOCALIBRATE='0')
     records, runs = [], []
     for mode, binary in binaries.items():
         dest = out / f'{mode}.json'
@@ -84,7 +86,8 @@ def main():
         runs.append(dict(mode=mode, command=command, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), dropped=dropped))
         if dropped:
             print(f'WARNING: {mode} dropped {dropped} events; increase --events-per-thread', file=sys.stderr)
-    manifest = dict(instrumented=True, comparable_speedup=False, callbacks=args.callbacks, runs=runs)
+    manifest = dict(instrumented=True, comparable_speedup=False, resident_limit=args.threads,
+                    autocalibration=False, callbacks=args.callbacks, runs=runs)
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     render(records, out / 'comparison.html')
     print(out / 'comparison.html')

@@ -54,6 +54,12 @@ public:
     return available;
   }
 
+  bool Any(DomainId domain) const noexcept {
+    for (size_t word = 0; word < WordCount(); ++word)
+      if (words_[word].Available(Allowed(word, domain))) return true;
+    return false;
+  }
+
   size_t Claim(DomainId domain, unsigned *workers, size_t capacity) noexcept {
     if (!capacity || !Capacity(domain)) return 0;
     const unsigned first_bit = ClaimStartBit(capacity);

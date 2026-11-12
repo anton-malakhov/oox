@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <utility>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 #ifdef TBB_MODE
 #include "tbb_pinner.h"
@@ -70,7 +72,6 @@ void ParallelFor(size_t from, size_t to, Func &&func, size_t grainSize = 1) {
 #else
   static_assert(false, "Wrong TBB_MODE mode");
 #endif
-  // TODO: grain size?
 #if TBB_MODE == TBB_RAPID
 #if 0
   RapidGroup.parallel_ranges(from, to, [&](auto from, auto to, auto part) {
@@ -81,7 +82,7 @@ void ParallelFor(size_t from, size_t to, Func &&func, size_t grainSize = 1) {
 #endif
 #else
   tbb::parallel_for(
-      tbb::blocked_range(from, to),
+      tbb::blocked_range(from, to, std::max(size_t{1}, grainSize)),
       [&](const tbb::blocked_range<size_t> &range) {
         for (size_t i = range.begin(); i != range.end(); ++i) {
           func(i);
@@ -137,7 +138,22 @@ inline void InitParallel(size_t threadsNum) {
 #endif
 #endif
 #ifdef TBB_MODE
+  {
+    // Validate the requested limit without retaining state if the arena rejects it.
+    tbb::global_control proposedLimit(
+        tbb::global_control::max_allowed_parallelism, threadsNum);
+    // Every warmup iteration blocks until all requested participants enter.
+    // A global control is only a ceiling; it cannot enlarge the active arena.
+    const size_t capacity = std::min(
+        static_cast<size_t>(tbb::this_task_arena::max_concurrency()),
+        tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism));
+    if (threadsNum > capacity)
+      throw std::invalid_argument("TBB warmup requested " + std::to_string(threadsNum) +
+          " participants, but the active arena/control limit is " + std::to_string(capacity));
+  }
+#ifndef OOX_EVAL_UNPINNED
   static PinningObserver pinner; // just init observer
+#endif
   static tbb::global_control threadLimit(
       tbb::global_control::max_allowed_parallelism, threadsNum);
 #endif

@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include "scheduler_trace.h"
+#include "scheduler_sync.h"
+
+namespace oox::detail::eigen_pool {
+struct Task;
+
+// A tagged worker slot pins the owner's LIFO chain of stack ranges during a
+// theft. Publication and unpublication acquire the same tag, so every ancestor
+// stays alive until the thief has finished traversing the chain.
+class StealableRange {
+  friend struct ConcurrentRangeSlot;
+public:
+  virtual ~StealableRange() { assert(!slot_); }
+  virtual Task *Steal() noexcept = 0;
+  void Publish(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
+    assert(!slot_ && !(reinterpret_cast<uintptr_t>(this) & locked));
+    slot_ = &slot;
+    previous_ = reinterpret_cast<StealableRange *>(Lock(slot));
+    if (previous_)
+      previous_->OnNestedEntry();
+    slot.store(reinterpret_cast<uintptr_t>(this), std::memory_order_release);
+  }
+  bool IsPublished() const noexcept { return slot_ != nullptr; }
+  void Unpublish() noexcept {
+    [[maybe_unused]] const auto current = Lock(*slot_);
+    assert(current == reinterpret_cast<uintptr_t>(this));
+    slot_->store(reinterpret_cast<uintptr_t>(previous_), std::memory_order_release);
+    slot_ = nullptr;
+  }
+  void WaitForStealer() const noexcept {
+    // Ordered after the owner's progress store. A later thief observes that
+    // reservation; an earlier thief finishes before the owner uses its bounds.
+#ifdef OOX_SCHEDULER_TRACE
+    uint64_t spins = 0;
+#endif
+    while (slot_->load(std::memory_order_seq_cst) & locked) {
+#ifdef OOX_SCHEDULER_TRACE
+      ++spins;
+#endif
+      scheduler_sync::Relax();
+    }
+    OOX_SCHED_COUNT(OwnerWaitSpins, spins);
+  }
+  // Called only by the slot's physical owner. The hook releases pending work
+  // before an inner operation that may execute without publishing a range.
+  static bool PrepareNested(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
+    if (!slot.load(std::memory_order_acquire)) return false;
+    const uintptr_t current = Lock(slot);
+    const bool released = current &&
+        reinterpret_cast<StealableRange *>(current)->OnNestedEntry();
+    slot.store(current, std::memory_order_release);
+    return released;
+  }
+  static Task *TrySteal(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
+    uintptr_t current = slot.load(std::memory_order_acquire);
+    if (!current) return nullptr;
+    if ((current & locked) || !slot.compare_exchange_strong(current, current | locked,
+            std::memory_order_seq_cst, std::memory_order_relaxed)) {
+      OOX_SCHED_COUNT(RangeTagContended);
+      return nullptr;
+    }
+    OOX_SCHED_COUNT(RangeLockAcquired);
+    Task *task = nullptr;
+    // The slot tag protects the links and the ancestor objects throughout the search.
+    for (auto *range = reinterpret_cast<StealableRange *>(current); range; range = range->previous_) {
+      task = range->Steal();
+      if (task) break;
+    }
+    slot.store(current, std::memory_order_release);
+    return task;
+  }
+
+protected:
+  // Invoked by the owner while the same slot tag pins this range and its
+  // ancestors. The hook must not invoke callbacks or acquire the tag again.
+  virtual bool OnNestedEntry() noexcept { return false; }
+
+private:
+  static constexpr uintptr_t locked = 1;
+  static uintptr_t Lock(scheduler_sync::atomic<uintptr_t> &slot) noexcept {
+    uintptr_t current = slot.load(std::memory_order_acquire);
+    for (;;) {
+      if (!(current & locked) && slot.compare_exchange_weak(current, current | locked,
+              std::memory_order_seq_cst, std::memory_order_acquire)) return current;
+      scheduler_sync::Relax();
+      current = slot.load(std::memory_order_acquire);
+    }
+  }
+  scheduler_sync::atomic<uintptr_t> *slot_ = nullptr;
+  StealableRange *previous_ = nullptr;
+};
+// Pool-owned flat-range lane. Pin before reading the stack descriptor. Retire
+// it before draining readers; a late reader observes null or a new publication.
+struct ConcurrentRangeSlot {
+  scheduler_sync::atomic<StealableRange *> range{nullptr};
+  scheduler_sync::atomic<size_t> readers{0};
+  scheduler_sync::atomic<uint64_t> bounds{0}; // two 32-bit offsets relative to begin
+
+  Task *TrySteal() noexcept {
+    if (!range.load(std::memory_order_relaxed)) return nullptr;
+    readers.fetch_add(1, std::memory_order_seq_cst);
+    auto *live = range.load(std::memory_order_seq_cst);
+    Task *result = live ? live->Steal() : nullptr;
+    readers.fetch_sub(1, std::memory_order_seq_cst);
+    return result;
+  }
+  void Close() noexcept {
+    range.store(nullptr, std::memory_order_seq_cst);
+    while (readers.load(std::memory_order_seq_cst)) scheduler_sync::Relax();
+  }
+  bool PrepareNested() noexcept {
+    auto *owned = range.load(std::memory_order_relaxed);
+    return owned && owned->OnNestedEntry();
+  }
+};
+
+} // namespace oox::detail::eigen_pool

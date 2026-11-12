@@ -63,3 +63,140 @@ Other platforms use the hardware concurrency estimate. CPU bandwidth quotas
 require separate accounting. `NumThreads()` still reports the requested pool size. Workers above
 the resident limit use ordinary task execution and parking. When the pool exceeds
 the CPU allowance, those workers park immediately after unsuccessful searches.
+`SetResidentLimit` and Rapid Auto calibration both respect `MaxResidentLimit()`
+in this mode.
+The scheduler benchmark runtime selects this automatic policy for resident pools.
+
+Launches do not wait for busy workers to become available. Tests and benchmarks
+may explicitly call `eigen_test_support::WaitForResidentWorkers` from
+`test_support/eigen_resident.h`, with a caller-supplied startup timeout.
+That helper observes readiness but reserves nothing; it is not installed with
+the scheduler. Ordinary launches have no readiness barrier or timeout.
+
+The caller joins helpers before returning or rethrowing. Concurrent roots
+reserve disjoint helpers. With no helper
+available, the caller executes the range. One launch uses at most 64 participants;
+larger pools are supported. Default parking pools reject resident-group calls.
+
+An idle resident acquires ordinary work before withdrawing from the group.
+Failed stealing does not deregister it. If a Rapid command wins that race, the
+ordinary task remains visible in a bounded deferred slot for other helpers.
+The caller also helps queued work while joining. Cancellation prevents new
+callback entry but does not interrupt a running body.
+
+Busy residence consumes idle CPU and is not the default policy. The group
+performs initial distribution only; it adds no stealing or grain-size policy.
+
+## Rapid activation and lazy range stealing
+
+`rapid_auto.h` adds `rapid::ParallelForAuto(group, begin, end, callback, grain)`.
+Its execution has four stages:
+
+1. Capture available helpers and divide the range equally among them and the
+   caller. A stack descriptor computes each initial range on demand; it builds
+   no task frontier or join tree.
+2. Registered owners expose their unreserved tail through a protected worker
+   slot. An idle helper can steal half that tail. Only successful theft allocates
+   an ordinary task and attaches a completion tree to `Region`.
+3. Each finished helper advertises availability again. Eligible shared cohorts
+   on pools of at most eight workers combine readiness and completion in one
+   bitmap update; other cohorts use per-worker epochs or a counter.
+4. The caller joins captured commands, then any ordinary descendants. Descendants
+   retain heap-owned `Region`, never the stack descriptor. Cancellation closes
+   callback admission and waits for running callbacks before returning.
+
+This reuses Auto task storage, budgets and lifetime machinery, but local batch
+growth and tail theft are a lazy range policy, not the unmodified Auto buffer
+algorithm. Ordinary Auto retains its private range buffer; on resident pools,
+waiting-helper hints can also trigger donation after a sibling finishes.
+Nested calls and unavailable helpers use ordinary Auto; two grain-sized halves
+have a stack-only single-helper fast path.
+An unregistered caller instead shares work through bounded ordinary publication.
+The general path still allocates `Region`. No unbounded queue is introduced.
+
+See [PARTITIONERS.md](PARTITIONERS.md#runtime-boundary-and-later-adaptation) for
+reservation ordering, descriptor lifetime, callback admission and completion.
+The optional `activated` output counts captured helper commands;
+`Metrics::range_tasks` counts allocated range tasks, not logical splits.
+
+## Rapid with an explicit partitioner
+
+Include `rapid_parallel_for.h` and call
+`rapid::ParallelFor(group, begin, end, callback, policy, grain)` with
+`AutoPartitioner`, `SimplePartitioner`, `StaticPartitioner`, or a persistent
+`AffinityPartitioner`. This is a separate entry point, not a replacement for
+the optimized lazy `ParallelForAuto` above.
+
+The policy creates **one** initial state. Rapid splits a bounded prefix of that
+state's tree and delivers those seeds directly to captured helpers and the
+caller. Each owner continues through the existing `Process` executor. Initial
+activation replaces task publication for that prefix only; it does not give
+each worker a new pool-sized split budget.
+
+| Explicit policy | Prefix and subsequent work |
+| --- | --- |
+| Auto | Binary prefix; remaining budget, range buffer and ordinary task stealing |
+| Simple | Binary prefix; ordinary recursive splitting to grain |
+| Static | Proportional prefix, including odd worker counts; fixed remaining splits |
+| Affinity | Proportional prefix; history-based placement, then adaptive range buffer |
+
+Static/Affinity seeds prefer their recorded worker if that worker was captured;
+unavailable workers are hints, never a reason to wait. Affinity history is shared
+across sequential calls and isolated for overlapping calls, as in ordinary
+execution. Nested calls and unavailable helpers use the **selected** ordinary
+policy. The resident domain limits initial capture, not later ordinary stealing.
+
+Explicit Auto is not upstream Eigen's loop partitioner: it is this backend's
+ported Auto policy. It also is not the lazy-tail policy of `ParallelForAuto`.
+Keep those names separate when interpreting benchmarks. The generic entry has
+additional seed preparation and completion costs; it is not a universal speedup.
+
+## Implementation map
+
+Include `parallel_for.h`, `rapid_auto.h`, or `rapid_parallel_for.h` to execute loops. Supporting headers
+are internal; their standalone syntax does not make them independent loop APIs.
+
+| Header | Responsibility |
+| --- | --- |
+| `rapid_auto.h` | Capture owners, assign initial ranges, join the launch |
+| `rapid_parallel_for.h` | Explicit-policy launch, admission and two-stage join |
+| `rapid_partitioning.h` | Bounded policy prefix and captured-worker placement |
+| `rapid_start.h` | Group API, resident ancestry and captured-command completion |
+| `parallel_for.h` | Policy API, shared `Process` boundary and `RunAdaptiveRange` |
+| `partitioner_region.h` | Callback admission, cancellation and operation lifetime |
+| `partitioner_completion.h` | Completion-tree references and task reclamation |
+| `partitioner_task.h` | Range/task representation and ordinary publication |
+| `lazy_range_executor.h` | Owner batching/tail theft and separate `RunCooperativeRange` fallback |
+| `resident_command.h` | Pool-independent resident command types |
+| `stealable_range.h` | Worker range slots and stack-descriptor lifetime |
+
+For review, start with `ParallelForAuto` and `batch_detail::Execute`, then follow
+`RunLazyRange`, `Process`, and the completion types. Read the pool's claim,
+publication and `WaitResident` paths last, using these contracts as checkpoints:
+
+| Contract | Where it is enforced |
+| --- | --- |
+| Every captured helper receives a command, including during cancellation | Claim followed by non-throwing publication; `WaitResident` cannot exit with a claimed bit |
+| A thief cannot access a destroyed stack descriptor | `RunLazyRange` closes registration before destruction; the concurrent slot drains its readers, and nested slots serialize theft and unpublication |
+| No initial owner can create a tree after the final Region check | `Execute` joins `ResidentCohort` first, then joins or closes `Region` |
+| Callback/metrics access ends before the tree may release Region | `Process` destroys `WorkLease` before `Branch` |
+| Worker reuse does not erase completion of an older cohort | Sticky done bits or monotonic epochs; readiness alone is not completion |
+
+## Automatic hardware calibration
+
+`rapid_auto_calibration.h` provides explicit `rapid::CalibrateAutoGroup` for a
+quiet, serialized startup context. It compares launch, uniform and skew probes
+under a soft 50 ms budget, preferring smaller cohorts within a 5% score band.
+It is not per-loop workload profiling or a performance guarantee. No completed
+trial or cancellation selects zero residents; allocation failure also resets
+residency to zero before propagating.
+
+`ResidentLimit()` selects a logical worker-ID prefix, not CPU affinity. Other
+workers park when idle but can execute ordinary tasks. Reducing the limit does
+not interrupt captured commands. Busy residence consumes CPU and is opt-in.
+
+Benchmark `RAPID_AUTO` enables startup calibration by default;
+`EIGEN_AUTO_RESIDENT` uses ordinary Auto on the same resident-capable pool.
+Set `OOX_RAPID_RESIDENT_LIMIT=N` for a matched fixed-cohort comparison; it disables
+calibration. `OOX_RAPID_AUTOCALIBRATE=0` also keeps fixed settings. `EIGEN_AUTO`
+remains the separate parking-pool baseline.

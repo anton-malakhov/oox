@@ -41,7 +41,7 @@ FetchContent_MakeAvailable(twist)
 
 get_filename_component(OOX_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 enable_testing()
-foreach(component queues scheduler allocator)
+foreach(component queues scheduler allocator ranges completion)
   add_executable(test_eigen_twist_${component} tests_${component}.cpp)
   target_include_directories(test_eigen_twist_${component} PRIVATE "${OOX_SOURCE_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_definitions(test_eigen_twist_${component} PRIVATE OOX_EIGEN_TWIST=1)

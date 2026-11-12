@@ -251,8 +251,16 @@ RemoveDuplicatesParallel(const std::vector<std::uint32_t> &keys,
     while (true) {
       ++probes;
       auto expected = empty;
-      if (table[slot].compare_exchange_weak(expected, key) || expected == key)
+#ifdef OOX_EVAL_TEST_DEDUP_CAS
+      const bool inserted = OOX_EVAL_TEST_DEDUP_CAS(table[slot], expected, key);
+#else
+      const bool inserted = table[slot].compare_exchange_weak(expected, key);
+#endif
+      if (inserted || expected == key)
         break;
+      // A spurious failure must not leave an empty hole in the probe chain.
+      if (expected == empty)
+        continue;
       slot = (slot + 1) & (capacity - 1);
     }
     if (metrics)
