@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scheduler trace laboratory</title>
+<link rel="stylesheet" href="style.css">
+<style>
+:root { color-scheme: light dark; --bg: light-dark(#fafaf8,#171a20); --fg: light-dark(#192b38,#dce6ee); --muted: light-dark(#56616d,#a2aebc); --line: light-dark(#d8dfe4,#343d47); --panel: light-dark(#fff,#20252e); }
+* { box-sizing:border-box } body { margin:0; padding:24px; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg) }
+header { max-width:1500px; margin:auto } h1 { margin:0; font-size:24px; font-weight:600 } p { color:var(--muted); margin:6px 0 14px }
+.toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin:16px 0 }
+button,select,input { font:inherit; color:inherit } button,select { border:1px solid var(--line); padding:6px 12px; background:var(--panel); border-radius:6px } button { cursor:pointer } input[type=file] { max-width:350px }
+label { display:inline-flex; align-items:center; gap:6px } #panels { max-width:1500px; margin:auto } .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin:18px 0; padding:14px; overflow:hidden }
+.heading { display:flex; align-items:baseline; flex-wrap:wrap; gap:12px } h2 { font-size:17px; margin:0 } .stats { color:var(--muted); font-variant-numeric:tabular-nums } canvas { display:block; width:100%; touch-action:none; cursor:crosshair }
+.thread-legend { display:flex; flex-wrap:wrap; gap:12px; margin:8px 0; font-size:12px } .thread-legend span { display:inline-flex; align-items:center; gap:5px } .thread-legend i { width:11px; height:11px; display:inline-block; border-radius:2px }
+#detail { position:sticky; bottom:8px; white-space:pre-wrap; border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:12px; max-height:230px; overflow:auto; max-width:1500px; margin:auto; font:12px/1.5 ui-monospace,monospace }
+#status { color:var(--muted); white-space:pre-wrap } .warning { color:light-dark(#a34310,#ffb678) } .legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--muted) } .empty { padding:60px 24px; text-align:center; border:1px dashed var(--line); border-radius:10px } a { color:inherit }
+#panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px}.panel{min-width:0}[hidden]{display:none!important}
+.heading{display:block}.heading .stats{display:block;min-height:3em}.thread-legend{min-height:3em}
+.trace-help{max-width:1100px}.event-journal{max-height:260px;overflow:auto;margin-top:8px}.journal-event{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);border-radius:0;font-size:12px}.worker-summary{font-size:12px;line-height:1.6}.layer-key{display:inline-block;width:10px;height:10px;margin-right:3px}.layer-count{font-variant-numeric:tabular-nums;font-size:12px}
+.panel details{margin-block:8px}.panel table{width:100%;border-collapse:collapse;font-size:12px}.panel th,.panel td{text-align:left;padding:5px;border-bottom:1px solid var(--line)}
+.paired{padding:12px}.paired header>nav,.paired header>h1,.paired header>p,.paired header>details,.paired #modes,.paired .toolbar:has(#files){display:none}.paired .panel{margin:8px 0;padding:8px}
+</style></head>
+<body>
+<header><nav><a href="/">← Учебная модель</a> · <a href="compare.html">Модель ↔ запись</a> · <a href="lab.html">Редактор схем и оценок</a></nav><h1>Реальные C++ трассы</h1>
+<p>Раздельные процессы, общий относительный ноль — начало выбранного вызова. Повторы последовательные, не поток независимых поступлений.</p>
+<div class="toolbar"><button id="restart">В начало</button><button id="previous">← Событие</button><button id="play">▶ Запустить</button><button id="next">Событие →</button><button id="next-transfer">Следующая передача / деление</button><button id="show-all">Показать весь вызов</button><label>Скорость <select id="rate"><option value="10">10 мкс/с</option><option value="100" selected>100 мкс/с</option><option value="1000">1000 мкс/с</option></select></label></div>
+<label style="display:flex;width:100%;flex-wrap:wrap">Общее время: <output id="clock">0 мкс</output><input id="time" aria-label="Общее время, наносекунды" type="range" min="0" max="1" step="1" value="0" style="flex:1;min-width:200px"></label>
+<p>Колонки — потоки · Y — диапазон итераций · цвет — поток. Насыщенное — активный блок, бледное — завершённый, пунктир — состояние неизвестно. ▶ выполняет, · нет активного блока в записи.</p>
+<div class="toolbar"><input id="files" type="file" accept=".json" multiple aria-label="Открыть записи запусков"><button id="clear">Очистить</button><label>Запуск <select id="wave"><option value="0">0</option></select></label></div>
+<div class="toolbar" id="modes" aria-label="Видимые режимы"></div>
+<button id="compare-native">Только Lazy и Native Auto</button>
+<p class="trace-help"><strong>Это слои одной записи, а не выключатели алгоритма.</strong> Цветные блоки показывают выполненную работу. Галочки ниже добавляют наблюдаемые события. Числа рядом: до курсора / за весь вызов. Пустой слой недоступен.</p>
+<div class="toolbar"><label><input type="checkbox" id="activation" checked><i class="layer-key" style="background:var(--viz-series-1)"></i>Старт группы <span class="layer-count" id="activation-count"></span></label><label><input type="checkbox" id="queues" checked><i class="layer-key" style="background:var(--viz-series-2)"></i>Доставка задач <span class="layer-count" id="queues-count"></span></label><label><input type="checkbox" id="steals" checked><i class="layer-key" style="background:var(--viz-series-3)"></i>Успешные кражи <span class="layer-count" id="steals-count"></span></label><label><input type="checkbox" id="splits"><i class="layer-key" style="background:var(--viz-series-4)"></i>Создание частей <span class="layer-count" id="splits-count"></span></label></div>
+<div class="toolbar"><label>История событий <select id="history"><option value="all" selected>Вся до курсора</option><option value="recent">Последние 5 мкс</option><option value="last">Только последнее событие</option></select></label><label><input type="checkbox" id="callbacks" checked>Отдельные итерации (callbacks)</label></div>
+<details><summary>Управление и обозначения</summary>
+<p class="trace-help">Без callbacks видны локальные порции целиком. В некоторых адаптерах порция в записи совпадает с итерацией. Зелёная стрелка — успешная кража; фиолетовая черта — создание дочерней части. «Доставка задач» показывает подтверждённые offer → take, а не полный состав очередей.</p>
+<p>Клик по блоку или стрелке — детали. Ползунок задаёт общее время в микросекундах относительно начала выбранного вызова. По умолчанию видна вся история до курсора. В журнале под панелью записано, кто, у кого, когда и какой диапазон забрал. Стрелки не означают, что передача ещё продолжается.</p>
+<p>При включённых callbacks видны отдельные итерации, иначе — выполняемые блоки. Активный блок не означает, что каждая его итерация выполняется одновременно. Полный состав очередей и незарезервированные остатки не восстановлены. Не начавшиеся диапазоны не дорисовываются. Пустое место не доказывает сон потока. Hyperbolic — синтетика, не SpMV.</p></details>
+<p class="warning">Трассировка меняет тайминги и порядок работы. Это отладка, не benchmark.</p>
+<div id="status" role="status"></div></header>
+<main id="panels"><div class="empty">Откройте несколько trace JSON для сравнения режимов.</div></main>
+<pre id="detail" aria-live="polite">Выберите задачу или стрелку на временной шкале.</pre>
+<script id="trace-data" type="application/json">[]</script>
+<script src="/trace-model.js"></script>
+<script src="/trace.js"></script>
+</body></html>

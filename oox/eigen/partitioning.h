@@ -7,6 +7,7 @@
 
 #ifndef OOX_EIGEN_TBB_PARTITIONING_H
 #define OOX_EIGEN_TBB_PARTITIONING_H
+#include "scheduler_sync.h"
 
 #include <array>
 #include <atomic>
@@ -110,11 +111,21 @@ struct AutoPartitionState : UnaffinitizedState {
   unsigned max_depth = 5;
 };
 
+// Rapid has already distributed the initial owners. Keep Auto's split state
+// and stolen-peer feedback, but materialize descendants only on idle demand.
+struct LazyAutoPartitionState : AutoPartitionState {
+  explicit constexpr LazyAutoPartitionState(std::size_t workers) noexcept
+      : AutoPartitionState(workers) {}
+  constexpr LazyAutoPartitionState(LazyAutoPartitionState &source, Split split) noexcept
+      : AutoPartitionState(source, split), unpublished(source.unpublished) {}
+  const scheduler_sync::atomic<bool> *unpublished = nullptr;
+};
+
 struct AffinityHistory {
   explicit AffinityHistory(std::size_t count)
-      : workers(count), slots(new std::atomic<std::size_t>[count * 16]{}) {}
+      : workers(count), slots(new scheduler_sync::atomic<std::size_t>[count * 16]{}) {}
   const std::size_t workers;
-  std::unique_ptr<std::atomic<std::size_t>[]> slots;
+  std::unique_ptr<scheduler_sync::atomic<std::size_t>[]> slots;
 };
 
 struct AffinityPartitionState : AutoPartitionState {
@@ -171,15 +182,16 @@ struct AffinityPartitionState : AutoPartitionState {
     if (!divisor)
       return no_affinity;
     const auto saved = slots[head].load(std::memory_order_relaxed);
-    return saved ? saved : head / factor;
+    return saved ? saved - 1 : head / factor;
   }
   void NoteExecution(std::size_t worker, std::size_t hint) noexcept {
     if (divisor && hint != no_affinity && worker != no_affinity && worker != hint)
-      slots[head].store(worker, std::memory_order_relaxed);
+      // Zero is the uninitialized marker; worker zero is a valid destination.
+      slots[head].store(worker + 1, std::memory_order_relaxed);
   }
 
   std::size_t head, slots_count;
-  std::atomic<std::size_t> *slots;
+  scheduler_sync::atomic<std::size_t> *slots;
   Delay delay = Delay::Begin;
   // Only root-state copies own the history. Child states borrow it while their
   // Region lease is active; cancelled queued children never access the map.
