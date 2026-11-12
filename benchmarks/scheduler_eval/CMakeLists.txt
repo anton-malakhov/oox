@@ -2,6 +2,7 @@ set(OOX_SCHEDULER_EVAL_MODES SERIAL_ELISION)
 set(OOX_SCHEDULER_EVAL_NON_REENTRANT_MODES RAPID_START)
 set(OOX_SCHEDULER_EVAL_TESTS)
 
+option(OOX_SCHEDULER_EVAL_STATS "Collect Eigen task and stealing counters" ON)
 option(OOX_SCHEDULER_EVAL_PAPI "Enable optional per-thread PAPI callback counters" OFF)
 option(OOX_SCHEDULER_TRACE_TOOLS "Build opt-in scheduler timeline recorders" OFF)
 if(OOX_SCHEDULER_TRACE_TOOLS)
@@ -61,11 +62,11 @@ function(oox_configure_scheduler_eval_target target mode)
     target_link_libraries(${target} PRIVATE OOX)
   elseif(mode STREQUAL "OOX_TASKS")
     target_compile_definitions(${target} PRIVATE
-      OOX_TASK_MODE=1 OOX_EIGEN_ENABLE_STATS=1)
+      OOX_TASK_MODE=1 $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode MATCHES "^EIGEN")
     target_compile_definitions(${target} PRIVATE
-      EIGEN_MODE=${mode} OOX_EIGEN_ENABLE_STATS=1)
+      EIGEN_MODE=${mode} $<$<BOOL:${OOX_SCHEDULER_EVAL_STATS}>:OOX_EIGEN_ENABLE_STATS=1>)
     target_link_libraries(${target} PRIVATE OOX OOX::eigen)
   elseif(mode STREQUAL "RAPID_START")
     target_compile_definitions(${target} PRIVATE
