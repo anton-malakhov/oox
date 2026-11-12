@@ -12,7 +12,7 @@ python3 tools/scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" -
 Without a checkout, download the same standalone script and run it:
 
 ```sh
-curl -fL https://raw.githubusercontent.com/anton-malakhov/oox/kkalpha-pr37-on-pr35/tools/scheduler_benchmark.py -o scheduler_benchmark.py
+curl -fL https://raw.githubusercontent.com/anton-malakhov/oox/kkalpha-rapid-range-partitioners/tools/scheduler_benchmark.py -o scheduler_benchmark.py
 python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
 ```
 
