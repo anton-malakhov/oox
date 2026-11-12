@@ -7,6 +7,7 @@
 
 #ifndef OOX_EIGEN_TBB_PARTITIONING_H
 #define OOX_EIGEN_TBB_PARTITIONING_H
+#include "scheduler_sync.h"
 
 #include <array>
 #include <atomic>
@@ -112,9 +113,9 @@ struct AutoPartitionState : UnaffinitizedState {
 
 struct AffinityHistory {
   explicit AffinityHistory(std::size_t count)
-      : workers(count), slots(new std::atomic<std::size_t>[count * 16]{}) {}
+      : workers(count), slots(new scheduler_sync::atomic<std::size_t>[count * 16]{}) {}
   const std::size_t workers;
-  std::unique_ptr<std::atomic<std::size_t>[]> slots;
+  std::unique_ptr<scheduler_sync::atomic<std::size_t>[]> slots;
 };
 
 struct AffinityPartitionState : AutoPartitionState {
@@ -179,7 +180,7 @@ struct AffinityPartitionState : AutoPartitionState {
   }
 
   std::size_t head, slots_count;
-  std::atomic<std::size_t> *slots;
+  scheduler_sync::atomic<std::size_t> *slots;
   Delay delay = Delay::Begin;
   // Only root-state copies own the history. Child states borrow it while their
   // Region lease is active; cancelled queued children never access the map.

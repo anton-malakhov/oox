@@ -2,6 +2,24 @@
 
 Start with the [MR review guide](docs/REVIEW_GUIDE.md) for scope and review order.
 
+## Run the benchmarks on a new host
+
+On Debian or Ubuntu with Python 3.8+, curl, and root or sudo access, run:
+
+```sh
+ref=kkalpha-pool-trace
+curl -fsSL "https://raw.githubusercontent.com/anton-malakhov/oox/$ref/tools/scheduler_benchmark.py" -o scheduler_benchmark.py &&
+python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
+```
+
+The downloaded script checks out this branch by default. Pass `--ref` to measure a particular commit.
+From an existing checkout, run `python3 tools/scheduler_benchmark.py` with the same options.
+On hosts with a C++20 compiler, Git, CMake and Ninja already installed, omit `--install-deps`.
+The runner builds the supported comparison modes available in the selected revision, checks correctness and runs
+five fresh processes per mode and thread count. Use `--full` for all registered cases or
+`--mode` to select specific schedulers. Each run prints the path to an archive with
+`metadata.json`, `summary.json`, raw timings and logs.
+
 ## Directory layout
 
 - `bench/`: benchmark registrations and timed entry points.
@@ -285,3 +303,23 @@ amortization, and an observed-versus-predicted SpMV plot to that result. The
 research lineage, publication-time estimator, parameter-selection procedure,
 published foundations, limitations, and next measurements are in
 [*Estimating Rapid Start and choosing scheduler parameters*](docs/PERFORMANCE_MODEL.md).
+
+## Capture a scheduler timeline
+
+Configure the evaluation build with `-DOOX_SCHEDULER_TRACE_TOOLS=ON`. Only the
+trace binaries enable event recording. From the repository root, run:
+
+```sh
+cmake --build build --target scheduler_trace_all -j
+ctest --test-dir build -L scheduler-trace --output-on-failure
+python3 benchmarks/scheduler_eval/tracing/record.py --build build \
+  --modes EIGEN_AUTO EIGEN_STATIC --threads 4 --shape tail --callbacks
+```
+
+Open the printed `comparison.html` locally. Select a time interval to see which
+worker executed each iteration range and how published tasks reached a worker.
+The commands, binary hashes and dropped-event counts are in `manifest.json`.
+The recorder checks that every iteration was visited once per wave. Recording
+changes timing, particularly with per-iteration callbacks enabled. Use the
+ordinary benchmark executables for timing comparisons. TBB Auto, Eigen stealing
+and Eigen sharing record executed iterations at the callback boundary.

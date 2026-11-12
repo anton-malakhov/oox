@@ -141,7 +141,7 @@ inline void par_do(L&& left, R&& right, bool) {
   right();
   // Nested worker waits require cooperative helping; retain nesting coverage
   // when changing the pool or its queue/completion protocol.
-  static_cast<void>(oox::wait_and_get(task));
+  [[maybe_unused]] auto left_result = oox::wait_and_get(task);
 }
 inline void init_plugin_internal() { InitParallel(GetNumThreads()); }
 template <typename... Fs> void execute_with_scheduler(Fs...) {
@@ -181,11 +181,11 @@ def apply_reference_portability(source: Path):
     text = text.replace("#include <sched.h>", "#if defined(__linux__)\n#include <sched.h>\n#endif")
     text = text.replace(
         "inline void PinThread(size_t slot_number) {\n  cpu_set_t mask;",
-        "inline void PinThread(size_t slot_number) {\n#if defined(__linux__)\n  cpu_set_t mask;",
+        "inline void PinThread([[maybe_unused]] size_t slot_number) {\n#if defined(__linux__)\n  cpu_set_t mask;",
     )
     text = text.replace(
         "  }\n}\n\nnamespace detail {",
-        "  }\n#else\n  (void)slot_number;\n#endif\n}\n\nnamespace detail {",
+        "  }\n#endif\n}\n\nnamespace detail {",
         1,
     )
     util.write_text(text)

@@ -13,7 +13,11 @@
 #include <tbb/tbb.h>
 #include "harness.h"
 #undef  TRACE
-#define TRACE !Verbose ? (void)0 : Harness::internal::tracer.set_trace_info(Harness::internal::Tracer::need_lf, HARNESS_TRACE_ORIG_INFO)->trace
+#define TRACE(...) \
+    do { \
+        if (Verbose) Harness::internal::tracer.set_trace_info( \
+            Harness::internal::Tracer::need_lf, HARNESS_TRACE_ORIG_INFO)->trace(__VA_ARGS__); \
+    } while (false)
 
 #define OOX_SERIAL 0
 

@@ -14,7 +14,7 @@
 namespace scheduler_eval {
 
 SchedulerMetrics ReadSchedulerMetrics() {
-#if defined(EIGEN_MODE) || defined(OOX_TASK_MODE)
+#if defined(OOX_EIGEN_ENABLE_STATS) && (defined(EIGEN_MODE) || defined(OOX_TASK_MODE))
 #ifdef OOX_TASK_MODE
   const auto value = oox::internal::get_eigen_pool().GetStatistics();
 #else
@@ -27,10 +27,10 @@ SchedulerMetrics ReadSchedulerMetrics() {
 #endif
 }
 
-void ReportSchedulerMetrics(benchmark::State &state,
-                            const SchedulerMetrics &before,
-                            const SchedulerMetrics &after) {
-#if defined(EIGEN_MODE) || defined(OOX_TASK_MODE)
+void ReportSchedulerMetrics([[maybe_unused]] benchmark::State &state,
+                            [[maybe_unused]] const SchedulerMetrics &before,
+                            [[maybe_unused]] const SchedulerMetrics &after) {
+#if defined(OOX_EIGEN_ENABLE_STATS) && (defined(EIGEN_MODE) || defined(OOX_TASK_MODE))
   state.counters["tasks_scheduled"] = after.scheduled - before.scheduled;
   state.counters["tasks_executed"] = after.executed - before.executed;
   state.counters["successful_steals"] =
@@ -40,10 +40,6 @@ void ReportSchedulerMetrics(benchmark::State &state,
   state.counters["worker_sleeps"] = after.sleeps - before.sleeps;
   state.counters["idle_time_ns"] =
       after.idle_nanoseconds - before.idle_nanoseconds;
-#else
-  static_cast<void>(state);
-  static_cast<void>(before);
-  static_cast<void>(after);
 #endif
 }
 

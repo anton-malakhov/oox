@@ -254,7 +254,7 @@ void ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline() {
     oox::internal::inject_task_spawn_failures(spawn_failures, 2);
     wg.Add(1, [&] {
         try {
-            (void)value.get();
+            [[maybe_unused]] const auto snapshot = value.get();
         } catch (const oox::internal::injected_task_spawn_failure&) {
             publisher_caught.store(true, std::memory_order_release);
         }
@@ -542,7 +542,7 @@ void GetWhileFastWriters() {
     wg.Add(1, [&] {
         for (int i = 0; i < kGets; ++i) {
             twist::assist::PreemptionPoint();
-            (void)value.get(); // must not crash
+            [[maybe_unused]] const auto snapshot = value.get(); // must not crash
         }
     });
 

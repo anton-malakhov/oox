@@ -343,7 +343,7 @@ void SharedVarExceptionWakesWaiter() {
 
     wg.Add(1, [&] {
         twist::assist::PreemptionPoint();
-        ExpectThrows<DummyException>([&] { (void)value.get(); },
+        ExpectThrows<DummyException>([&] { [[maybe_unused]] const auto unexpected_value = value.get(); },
                                      "shared_var waiter must wake and rethrow producer exception");
     });
     wg.Add(1, [&] {
@@ -365,9 +365,9 @@ void SharedVarForwardedProducerExceptionPropagates() {
         return input;
     }, value);
     gate = 1;
-    ExpectThrows<DummyException>([&] { (void)value.get(); },
+    ExpectThrows<DummyException>([&] { [[maybe_unused]] const auto unexpected_value = value.get(); },
                                  "forwarded shared_var producer must rethrow before resolving storage");
-    ExpectThrows<DummyException>([&] { (void)oox::wait_and_get(dependent); },
+    ExpectThrows<DummyException>([&] { [[maybe_unused]] const auto unexpected_value = oox::wait_and_get(dependent); },
                                  "forwarded producer failure propagates to a registered dependent");
     TWIST_ASSERT_M(!dependent_ran.load(std::memory_order_relaxed),
                    "dependent body must not run after forwarded producer failure");
@@ -391,13 +391,13 @@ void ForwardedProducerFailureCanBeRecovered() {
 void ThrowingValueAssignmentPropagates() {
     oox::var<throwing_assignment_value, true> plain(throwing_assignment_value{1});
     plain = throwing_assignment_value{2};
-    ExpectThrows<oox::cancelled_by_exception>([&] { (void)oox::wait_and_get(plain); },
+    ExpectThrows<oox::cancelled_by_exception>([&] { [[maybe_unused]] const auto unexpected_value = oox::wait_and_get(plain); },
                                               "throwing var assignment must cancel its output");
 
     oox::shared_var<throwing_assignment_value, true> shared(throwing_assignment_value{1});
     const throwing_assignment_value replacement(2);
     shared = replacement;
-    ExpectThrows<oox::cancelled_by_exception>([&] { (void)shared.get(); },
+    ExpectThrows<oox::cancelled_by_exception>([&] { [[maybe_unused]] const auto unexpected_value = shared.get(); },
                                               "throwing shared_var assignment must cancel its output");
 }
 
@@ -409,7 +409,7 @@ void SharedVarCancellationPropagates() {
     twist::test::body::WaitGroup wg;
     wg.Add(1, [&] {
         twist::assist::PreemptionPoint();
-        ExpectThrows<oox::cancelled_by_user>([&] { (void)value.get(); },
+        ExpectThrows<oox::cancelled_by_user>([&] { [[maybe_unused]] const auto unexpected_value = value.get(); },
                                             "shared_var must preserve explicit cancellation");
     });
     wg.Add(1, [&] {
@@ -425,7 +425,7 @@ void WaitStatusNoThrowRethrowsOriginalForProducer() {
     });
 
     ExpectThrows<DummyException>([&] {
-        (void)oox::wait_for_all_status<false>(bad);
+        [[maybe_unused]] const auto unexpected_status = oox::wait_for_all_status<false>(bad);
     }, "wait_for_all_status<false> on producer must rethrow original exception");
 }
 

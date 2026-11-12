@@ -94,7 +94,7 @@ public:
   Token execute_point(int graph_id, int row, int col, std::span<const Token> inputs) const {
     const auto expected = deps(row, col);
     if (cfg_.validate) {
-      validate_inputs(graph_id, row, col, expected, inputs);
+      validate_inputs(graph_id, row, expected, inputs);
     }
 
     std::array<std::uint64_t, OOX_TASKBENCH_MAX_DEPS> checksums{};
@@ -134,7 +134,6 @@ public:
 private:
   void validate_inputs(int graph_id,
                        int row,
-                       int col,
                        const std::vector<int>& expected,
                        std::span<const Token> inputs) const {
     if (inputs.size() != expected.size()) {
@@ -149,7 +148,6 @@ private:
         throw std::runtime_error("wrong payload");
       }
     }
-    (void)col;
   }
 
   Config cfg_;

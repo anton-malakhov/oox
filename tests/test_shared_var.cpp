@@ -347,7 +347,7 @@ TEST(SharedVar, ConsecutiveSpawnFailuresCompleteMaterializerAndWaiterInline) {
     oox::internal::inject_task_spawn_failures(spawn_failures, 2);
     auto publisher = std::async(std::launch::async, [&] {
         try {
-            (void)value.get();
+            [[maybe_unused]] auto observed = value.get();
         } catch (const oox::internal::injected_task_spawn_failure&) {
             return true;
         }
@@ -624,7 +624,7 @@ TEST(SharedVar, ThrowingDeferredMaterializationPropagates) {
     auto done = oox::run<true>([](throwing_default_value&) noexcept {}, value);
 
     EXPECT_THROW(oox::wait_for_all(done), std::runtime_error);
-    EXPECT_THROW((void)value.get(), oox::cancelled_by_exception);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = value.get(), oox::cancelled_by_exception);
 }
 
 TEST(SharedVar, CrossTypeConversionBecomesGraphFailure) {
@@ -667,7 +667,7 @@ TEST(SharedVar, ExceptionWakesWaiterAndRethrows) {
     auto result = std::async(std::launch::async, [&] { return value.get(); });
     std::this_thread::sleep_for(20ms);
     gate = 1;
-    EXPECT_THROW((void)result.get(), shared_var_test_error);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = result.get(), shared_var_test_error);
 #endif
 }
 
@@ -683,8 +683,8 @@ TEST(SharedVar, ForwardedProducerExceptionRethrows) {
         return input;
     }, value);
     gate = 1;
-    EXPECT_THROW((void)value.get(), shared_var_test_error);
-    EXPECT_THROW((void)oox::wait_and_get(dependent), shared_var_test_error);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = value.get(), shared_var_test_error);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = oox::wait_and_get(dependent), shared_var_test_error);
     EXPECT_FALSE(dependent_ran.load(std::memory_order_relaxed));
 }
 
@@ -709,11 +709,11 @@ TEST(SharedVar, ThrowingValueAssignmentPropagates) {
     oox::shared_var<throwing_assignment_value, true> copied(throwing_assignment_value{1});
     const throwing_assignment_value replacement(2);
     copied = replacement;
-    EXPECT_THROW((void)copied.get(), oox::cancelled_by_exception);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = copied.get(), oox::cancelled_by_exception);
 
     oox::shared_var<throwing_assignment_value, true> moved(throwing_assignment_value{1});
     moved = throwing_assignment_value{2};
-    EXPECT_THROW((void)moved.get(), oox::cancelled_by_exception);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = moved.get(), oox::cancelled_by_exception);
 }
 
 TEST(SharedVar, CancellationPropagatesThroughWaiter) {
@@ -723,12 +723,12 @@ TEST(SharedVar, CancellationPropagatesThroughWaiter) {
     value.cancel();
 #if defined(OOX_USING_SERIAL)
     gate = 1;
-    EXPECT_THROW((void)value.get(), oox::cancelled_by_user);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = value.get(), oox::cancelled_by_user);
 #else
     auto result = std::async(std::launch::async, [&] { return value.get(); });
     std::this_thread::sleep_for(20ms);
     gate = 1;
-    EXPECT_THROW((void)result.get(), oox::cancelled_by_user);
+    EXPECT_THROW([[maybe_unused]] auto unexpected_value = result.get(), oox::cancelled_by_user);
 #endif
 }
 #endif
@@ -953,14 +953,13 @@ TEST(SharedVar, GetWhileFastWriters) {
             ++i;
         }
     });
-    volatile std::uint32_t sink = 0;
+    [[maybe_unused]] volatile std::uint32_t sink = 0;
     for (int i = 0; i < kGets; ++i) {
         sink = value.get(); // must not crash
     }
     registrations.store(kRegistrations, std::memory_order_relaxed);
     writer.join();
-    (void)value.get(); // the chain drains; read the final value
-    (void)sink;
+    sink = value.get(); // Wait for the last registered writer and read its value.
 }
 
 int main(int argc, char** argv) {

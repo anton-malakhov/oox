@@ -622,12 +622,10 @@ public:
     // Wait and report the completion status (failure-aware overloads use this).
     template <bool ThrowOnCancellation = true>
     wait_status wait_for_all_status() const {
-        return with_ready_slot([](internal::task_node* task, void*, int port) -> wait_status {
+        return with_ready_slot([]([[maybe_unused]] internal::task_node* task, void*, [[maybe_unused]] int port) -> wait_status {
 #if OOX_EXCEPTIONS_ENABLED
             return internal::failure_wait_status<ThrowOnCancellation>(task, port);
 #else
-            (void)task;
-            (void)port;
             return wait_status::ready;
 #endif
         });

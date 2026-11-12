@@ -59,7 +59,7 @@ inline void CpuRelax() {
 #endif
 }
 
-inline void PinThread(size_t slot_number) {
+inline void PinThread([[maybe_unused]] size_t slot_number) {
 #if defined(__linux__) && !defined(OOX_EVAL_UNPINNED)
   cpu_set_t mask;
   auto mask_size = sizeof(mask);
@@ -84,8 +84,6 @@ inline void PinThread(size_t slot_number) {
     std::cerr << "Error in sched_setaffinity, slot_number = " << slot_number
               << ", err = " << err << std::endl;
   }
-#else
-  (void)slot_number;
 #endif
 }
 

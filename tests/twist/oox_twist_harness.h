@@ -98,7 +98,6 @@ void RunRandomSeeds(const char* /*name*/, Scenario scenario, std::size_t seeds =
     static_assert(twist::build::kTwisted, "Twist tests must use a twisted runtime build");
 
     for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-        (void)seed;
         DrainSpawnedTasks(scenario)();
     }
 }

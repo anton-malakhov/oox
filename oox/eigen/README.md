@@ -4,16 +4,17 @@ This directory contains OOX's private scheduler port. Its immediate source is
 [`EgorkaZ/pbbsbench`](https://github.com/EgorkaZ/pbbsbench/tree/396a299f03c58dbe9e7604daab38a65781227b75/parlaylib/include/parlay/internal/scheduler_plugins/eigen),
 pinned at commit `396a299f03c58dbe9e7604daab38a65781227b75`.
 The mailbox changes first appeared there in commit `e857cdd`, although OOX now
-adds a guarded overflow queue when the copied bounded publication paths fill.
+uses inline backpressure when bounded publication paths fill.
 
 All implementation symbols live in `oox::detail::eigen_pool`; none are part of
 Eigen's namespace or OOX's public API. Workers briefly spin only when requested,
 then park with C++20 atomic wait/notify. Queue publication advances a worker
 generation without taking a global mutex, and task completion only notifies
 registered waiters. Published-task accounting keeps workers alive during
-destructor draining and nested waits. Full local deques and mailboxes spill to an
-unbounded guarded queue, so nested spawning never falls back to recursive inline
-execution.
+destructor draining and nested waits. Local queues and affinity mailboxes are
+bounded. A rejected task runs inline after publication admission is released.
+Cancellation closes publication before draining, including concurrent or
+reentrant cancellation; arbitrary nested callbacks can still recurse inline.
 
 ## File provenance and license
 

@@ -92,12 +92,16 @@ jobs:
     - uses: actions/checkout@v5
     - name: Dependencies
       run: sudo apt update && sudo apt install cmake clang-19 libbenchmark-dev libtbb-dev libomp-19-dev
+    - name: Test standalone benchmark runner
+      if: matrix.external-backends == 'OFF'
+      run: python3 -m unittest discover -s tools -p test_scheduler_benchmark.py -v
     - name: Configure scheduler evaluations
       run: >
         cmake -S . -B build-scheduler-eval
         -DCMAKE_CXX_COMPILER=clang++-19
         -DOOX_BUILD_TESTS=OFF -DOOX_BUILD_BENCHMARKS=ON
         -DOOX_BUILD_TASKBENCH=OFF -DOOX_BUILD_SCHEDULER_EVALS=ON
+        -DOOX_SCHEDULER_TRACE_TOOLS=${{ matrix.external-backends }}
         -DOOX_ENABLE_TBB=${{ matrix.external-backends }} -DOOX_ENABLE_TF=OFF
         -DOOX_ENABLE_FOLLY=OFF -DOOX_ENABLE_OMP=${{ matrix.external-backends }}
         -DOOX_EIGEN_THREADS=2
@@ -110,6 +114,11 @@ jobs:
       run: >
         python3 benchmarks/scheduler_eval/tools/ctest_ci.py
         --test-dir build-scheduler-eval --output-on-failure -L scheduler-eval --timeout 120
+    - name: Build and test scheduler tracing
+      if: matrix.external-backends == 'ON'
+      run: |
+        cmake --build build-scheduler-eval --target scheduler_trace_all -j 8
+        ctest --test-dir build-scheduler-eval --output-on-failure -L scheduler-trace --no-tests=error
     - name: Require external backend targets
       if: matrix.external-backends == 'ON'
       run: >
