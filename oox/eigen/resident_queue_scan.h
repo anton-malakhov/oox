@@ -61,8 +61,11 @@ public:
   }
 
 private:
+  // Ordinary-work publication epoch at round start. A change triggers another round.
   uint64_t epoch_;
   QueueTraversal traversal_;
+  // Request a round even at the same epoch: on entry, after a Rapid command,
+  // or when a queue looked nonempty (a contended steal can leave work behind).
   bool retry_ = true;
 };
 
