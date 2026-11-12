@@ -2,6 +2,24 @@
 
 Start with the [MR review guide](docs/REVIEW_GUIDE.md) for scope and review order.
 
+## Run the benchmarks on a new host
+
+On Debian or Ubuntu with Python 3.8+, curl, and root or sudo access, run:
+
+```sh
+ref=kkalpha-resident-groups
+curl -fsSL "https://raw.githubusercontent.com/anton-malakhov/oox/$ref/tools/scheduler_benchmark.py" -o scheduler_benchmark.py &&
+python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
+```
+
+The downloaded script checks out this branch by default. Pass `--ref` to measure a particular commit.
+From an existing checkout, run `python3 tools/scheduler_benchmark.py` with the same options.
+On hosts with a C++20 compiler, Git, CMake and Ninja already installed, omit `--install-deps`.
+The runner builds the supported comparison modes available in the selected revision, checks correctness and runs
+five fresh processes per mode and thread count. Use `--full` for all registered cases or
+`--mode` to select specific schedulers. Each run prints the path to an archive with
+`metadata.json`, `summary.json`, raw timings and logs.
+
 ## Directory layout
 
 - `bench/`: benchmark registrations and timed entry points.
