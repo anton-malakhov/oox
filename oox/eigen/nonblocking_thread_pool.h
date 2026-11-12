@@ -515,7 +515,7 @@ private:
             kPublicationPublisherMask) != 0) {
       scheduler_sync::this_thread::yield();
     }
-    DrainCancelledOrdinaryQueues();
+    CancelOrdinaryQueues();
     done_.store(true, std::memory_order_release);
 
     // Let each thread know it's been cancelled.
@@ -816,7 +816,6 @@ private:
   alignas(128) scheduler_sync::atomic<uint64_t> resident_dispatch_epoch_{0};
 
   scheduler_sync::once_flag cancellation_once_;
-  scheduler_sync::mutex ordinary_cancellation_mutex_;
   EventCount worker_event_;
   EventCount waiter_event_;
   scheduler_sync::atomic<bool> done_;
@@ -1170,11 +1169,6 @@ private:
         DiscardPublishedTask(task);
       }
     }
-  }
-
-  void DrainCancelledOrdinaryQueues() {
-    std::lock_guard<scheduler_sync::mutex> lock(ordinary_cancellation_mutex_);
-    CancelOrdinaryQueues();
   }
 
   void JoinThreads() {
