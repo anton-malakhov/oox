@@ -53,6 +53,13 @@ class BenchmarkRunnerTests(unittest.TestCase):
             runner.run([sys.executable, "-c", "import time; time.sleep(30)"],
                        self.root / "timeout.log", timeout=0.1)
 
+    def test_modes_follow_the_configured_ref(self):
+        listing = "bench_scheduler_eval_EIGEN_AUTO: phony\nbench_scheduler_eval_RAPID_GROUP: phony"
+        self.assertEqual(runner.select_modes(None, listing), ["RAPID_GROUP", "EIGEN_AUTO"])
+        self.assertEqual(runner.select_modes(["EIGEN_AUTO"], listing), ["EIGEN_AUTO"])
+        with self.assertRaisesRegex(ValueError, "Unavailable modes: RAPID_AUTO"):
+            runner.select_modes(["RAPID_AUTO"], listing)
+
     def test_nested_build_preserves_environment_compiler_flags(self):
         configurations = []
 
@@ -66,7 +73,7 @@ class BenchmarkRunnerTests(unittest.TestCase):
             args = runner.arguments()
         with patch.dict(os.environ, {"CXXFLAGS": "-fPIC -O2"}), \
                 patch.object(runner, "run", run), \
-                patch.object(runner, "capture", return_value="test"), \
+                patch.object(runner, "capture", return_value="bench_scheduler_eval_RAPID_AUTO: phony"), \
                 patch.object(runner.shutil, "which", return_value="tool"), \
                 patch.object(runner.shutil, "copy2"), \
                 self.assertRaises(InterruptedError):

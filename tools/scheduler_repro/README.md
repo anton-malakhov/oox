@@ -16,6 +16,8 @@ curl -fL https://raw.githubusercontent.com/anton-malakhov/oox/kkalpha-pr37-on-pr
 python3 scheduler_benchmark.py --install-deps --workdir "$HOME/oox-runs" --threads 4 8
 ```
 
+The downloaded script benchmarks this branch by default. When using `--ref`, the runner selects the supported comparison modes available in the chosen revision.
+
 The default campaign runs the 27 focused launch, nested, matrix, SpMV and
 variable-cost cases, where supported by each mode, with five fresh-process
 repetitions in seeded shuffled order. It includes a separate nested-Lazy build.

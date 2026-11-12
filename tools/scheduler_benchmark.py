@@ -36,10 +36,12 @@ def positive(value):
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default="https://github.com/anton-malakhov/oox.git")
-    parser.add_argument("--ref", default="kkalpha-pr37-on-pr35")
+    parser.add_argument("--ref", default="kkalpha-pr37-on-pr35",
+                        help="branch, tag or commit to benchmark (default: %(default)s)")
     parser.add_argument("--workdir", type=Path, default=Path("scheduler-runs"))
     parser.add_argument("--threads", nargs="+", type=positive, default=[4, 8])
-    parser.add_argument("--mode", nargs="+", choices=MODES, default=MODES)
+    parser.add_argument("--mode", nargs="+", choices=MODES,
+                        help="default: all supported modes from this list in the selected ref")
     parser.add_argument("--repetitions", type=positive, default=5)
     parser.add_argument("--jobs", type=positive, default=4)
     parser.add_argument("--seed", type=int, default=20261104)
@@ -105,6 +107,17 @@ def benchmark_records(path, threads, variant, mode):
     return records
 
 
+def select_modes(requested, ninja_targets):
+    targets = {line.partition(":")[0] for line in ninja_targets.splitlines()}
+    available = [mode for mode in MODES if "bench_scheduler_eval_" + mode in targets]
+    if not available:
+        raise ValueError("No supported scheduler benchmarks in the configured build")
+    missing = [mode for mode in (requested or ()) if mode not in available]
+    if missing:
+        raise ValueError(f"Unavailable modes: {', '.join(missing)}. Available: {', '.join(available)}")
+    return list(dict.fromkeys(requested or available))
+
+
 def execute(args, directory, metadata):
     logs = directory / "logs"
     logs.mkdir()
@@ -153,11 +166,10 @@ def execute(args, directory, metadata):
     run(["git", "-C", source, "submodule", "update", "--init", "thirdparty/oneTBB"],
         logs / "submodule.log")
     metadata["submodules"] = capture(["git", "-C", str(source), "submodule", "status"])
-    variants = {"default": list(dict.fromkeys(args.mode))}
-    if not args.skip_nested_lazy and "RAPID_AUTO" in args.mode:
-        variants["nested-lazy"] = ["RAPID_AUTO"]
     binaries = {}
-    for variant, modes in variants.items():
+    for variant in ("default", "nested-lazy"):
+        if variant == "nested-lazy" and (args.skip_nested_lazy or ("default", "RAPID_AUTO") not in binaries):
+            break
         build = directory / ("build-" + variant)
         options = ["-DOOX_BUILD_TESTS=OFF", "-DOOX_BUILD_EXAMPLES=OFF",
                    "-DOOX_BUILD_BENCHMARKS=ON", "-DOOX_BUILD_TASKBENCH=OFF",
@@ -170,6 +182,13 @@ def execute(args, directory, metadata):
             options.append(f"-DCMAKE_CXX_FLAGS={flags} -DOOX_RAPID_EXPERIMENT_NESTED_LAZY=1")
         run(["cmake", "-S", source, "-B", build, "-G", "Ninja",
              "-DCMAKE_BUILD_TYPE=Release"] + options, logs / (variant + "-configure.log"))
+        if variant == "default":
+            listing = capture(["ninja", "-C", str(build), "-t", "targets", "all"])
+            modes = select_modes(args.mode, listing)
+            metadata["modes"] = modes
+            print("Benchmark modes: " + ", ".join(modes), flush=True)
+        else:
+            modes = ["RAPID_AUTO"]
         targets = [prefix + mode for mode in modes
                    for prefix in ["bench_scheduler_eval_", "test_scheduler_eval_"]]
         targets += ["test_scheduler_eval_nested_" + mode for mode in modes if mode != "RAPID_START"]
